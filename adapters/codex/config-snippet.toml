@@ -1,0 +1,5 @@
+# Add to ~/.codex/config.toml
+[plugins.cluxion_preprocess]
+enabled = true
+command = ["cluxion-runtime", "plan", "--json-stdin", "--surface", "codex"]
+description = "Cluxion preprocessing: honesty, clarification, Rust queue"

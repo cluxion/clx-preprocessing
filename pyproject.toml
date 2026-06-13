@@ -1,0 +1,96 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cluxion-agentplugin-preprocessing"
+version = "0.3.1"
+description = "Universal agent plugin for Cluxion preprocessing, honesty contracts, clarification, Rust work queue, and resource-aware harness handoff."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [
+    { name = "cluxion", email = "algocean1204@users.noreply.github.com" },
+]
+keywords = [
+    "cluxion",
+    "hermes-agent",
+    "claude-code",
+    "codex",
+    "ai-agent",
+    "preprocessing",
+    "plugin",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Plugins",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "psutil>=5.9",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+browser = [
+    "playwright>=1.49",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.8",
+    "build>=1.2",
+    "twine>=6.0",
+    "wheel>=0.45",
+]
+
+[project.scripts]
+cluxion-preprocess = "cluxion_agentplugin_preprocessing.cli:main"
+cluxion-runtime = "cluxion_runtime.cli:main"
+hermes-cluxion = "cluxion_agentplugin_preprocessing.cli:main"
+
+[project.entry-points."hermes_agent.plugins"]
+cluxion-agentplugin-preprocessing = "cluxion_agentplugin_preprocessing.plugin"
+
+[project.urls]
+Homepage = "https://github.com/cluxion/cluxion-Agentplugin-preprocessing"
+Repository = "https://github.com/cluxion/cluxion-Agentplugin-preprocessing"
+Issues = "https://github.com/cluxion/cluxion-Agentplugin-preprocessing/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cluxion_agentplugin_preprocessing", "src/cluxion_runtime"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"cluxion-Docs" = "cluxion_agentplugin_docs/cluxion-Docs"
+".github/profile/README.md" = "cluxion_agentplugin_docs/github-profile/README.md"
+"adapters" = "cluxion_agentplugin_adapters"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/cluxion_agentplugin_preprocessing",
+    "src/cluxion_runtime",
+    "rust/cluxion_queue",
+    "adapters",
+    "tests",
+    "cluxion-Docs",
+    ".github/profile",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["F", "I", "UP", "B", "SIM", "RUF"]

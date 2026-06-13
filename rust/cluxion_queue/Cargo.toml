@@ -1,0 +1,26 @@
+[package]
+name = "cluxion_queue"
+version = "0.2.0"
+edition = "2021"
+description = "Durable work queue and dispatch store for Cluxion agent preprocessing"
+
+[lib]
+name = "cluxion_queue_native"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "cluxion-queue"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sysinfo = "0.33"
+thiserror = "2"
+pyo3 = { version = "0.23", features = ["abi3-py311"], optional = true }
+
+[features]
+default = []
+python = ["dep:pyo3", "pyo3/extension-module"]

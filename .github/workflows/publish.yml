@@ -1,0 +1,109 @@
+name: Publish
+
+on:
+  release:
+    types: ["published"]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.3
+      - uses: astral-sh/setup-uv@v8.2.0
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Install
+        run: uv sync --extra dev --python 3.12
+      - name: Lint
+        run: uv run ruff check .
+      - name: Test
+        run: uv run pytest
+      - name: Cargo test
+        run: cargo test --manifest-path rust/cluxion_queue/Cargo.toml
+
+  # sdist + pure py3-none-any wheel: the fallback pip selects on platforms
+  # without a matching native wheel.
+  build-pure:
+    needs: checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.3
+      - uses: astral-sh/setup-uv@v8.2.0
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Install build tooling
+        run: uv sync --extra dev --python 3.12
+      - name: Build sdist and pure wheel
+        run: uv run python -m build
+      - name: Check package
+        run: uv run twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-pure
+          path: dist/
+
+  # Platform wheels of the SAME project: the abi3 native module is merged
+  # into the pure wheel and the wheel is retagged. One PyPI project total.
+  build-native:
+    needs: build-pure
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+          - os: ubuntu-latest
+            target: aarch64
+          - os: macos-14
+            target: universal2-apple-darwin
+          - os: windows-latest
+            target: x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6.0.3
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: rust/cluxion_queue
+          target: ${{ matrix.target }}
+          args: --release --strip --out dist
+          manylinux: auto
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-pure
+          path: dist-pure/
+      - uses: astral-sh/setup-uv@v8.2.0
+      - name: Merge native module into project wheel
+        shell: bash
+        run: |
+          uv run --no-project --python 3.12 --with wheel \
+            python scripts/repack_native_wheel.py \
+            --pure-wheel dist-pure/*-py3-none-any.whl \
+            --native-wheel rust/cluxion_queue/dist/*.whl \
+            --out dist-merged/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-merged-${{ matrix.os }}-${{ matrix.target }}
+          path: dist-merged/
+
+  publish:
+    name: Publish cluxion-agentplugin-preprocessing
+    needs: [build-pure, build-native]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-pure
+          path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-merged-*
+          merge-multiple: true
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

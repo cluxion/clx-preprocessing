@@ -1,0 +1,19 @@
+name: cluxion-agentplugin-preprocessing
+version: 0.2.0
+description: "Universal agent preprocessing plugin: honesty, clarification, Rust work queue, resource admission."
+author: cluxion
+kind: standalone
+surfaces:
+  - hermes
+  - claude
+  - codex
+  - grok_build
+provides_tools:
+  - cluxion_plan
+  - cluxion_clarify
+  - cluxion_bootstrap
+  - cluxion_serve_local
+  - cluxion_hermes_config
+  - cluxion_queue_next
+  - cluxion_queue_record
+  - cluxion_queue_brief

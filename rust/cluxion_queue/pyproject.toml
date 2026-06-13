@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "cluxion-queue-native"
+version = "0.2.0"
+description = "In-process Rust queue engine for cluxion-agentplugin-preprocessing"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+
+[tool.maturin]
+features = ["python"]
+module-name = "cluxion_queue_native"
+bindings = "pyo3"
