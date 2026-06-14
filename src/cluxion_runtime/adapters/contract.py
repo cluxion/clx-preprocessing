@@ -25,7 +25,7 @@ def work_item_from_adapter_payload(payload: Mapping[str, object], *, default_sur
         model_route=str(payload.get("model_route", "host/default")),
         expected_ram_mb=max(0, int(payload.get("expected_ram_mb", 0))),
         context_tokens=max(0, int(payload.get("context_tokens", 0))),
-        metadata=_metadata(payload.get("metadata"), payload.get("cwd")),
+        metadata=_metadata(payload.get("metadata"), payload.get("cwd"), payload.get("clarification_answers")),
     )
 
 
@@ -70,12 +70,18 @@ def _priority(value: object) -> WorkPriority:
     return WorkPriority[str(value).upper()]
 
 
-def _metadata(value: object, cwd: object) -> dict[str, str]:
+def _metadata(value: object, cwd: object, clarification_answers: object = None) -> dict[str, str]:
     metadata: dict[str, str] = {}
     if isinstance(value, dict):
         metadata.update({str(key): str(val) for key, val in value.items()})
     if cwd is not None and cwd != "":
         metadata["cwd"] = str(cwd)
+    # Top-level clarification_answers is the documented way the host answers a
+    # clarification gate; without merging it here the gate stays blocked and the
+    # work queue never engages, even for very long prompts. A nested
+    # metadata.clarification_answers (if present) is not overwritten by an empty top-level value.
+    if clarification_answers is not None and str(clarification_answers) != "":
+        metadata["clarification_answers"] = str(clarification_answers)
     return metadata
 
 

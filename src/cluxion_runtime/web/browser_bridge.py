@@ -10,6 +10,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import os
+import signal
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -400,7 +401,15 @@ def _close_session() -> None:
     _session["mode"] = None
 
 
+def _handle_sigterm(signum: int, _frame: object) -> None:
+    # SIGKILL is uncatchable; SIGTERM cleanup is best-effort before exit.
+    _close_session()
+    raise SystemExit(128 + signum)
+
+
 atexit.register(_close_session)
+with contextlib.suppress(AttributeError, OSError, ValueError):
+    signal.signal(signal.SIGTERM, _handle_sigterm)
 
 
 __all__ = [

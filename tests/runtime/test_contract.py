@@ -50,6 +50,23 @@ def test_metadata_merges_cwd() -> None:
     assert item.metadata == {"repo": "demo", "cwd": "/tmp/project"}
 
 
+def test_top_level_clarification_answers_reaches_metadata() -> None:
+    # Regression: the adapter dropped a top-level clarification_answers field, so
+    # the clarification gate stayed blocked and the work queue never engaged even
+    # for very long prompts. It must reach WorkItem.metadata.
+    item = work_item_from_adapter_payload(
+        {"prompt": "x", "clarification_answers": "fix src/app.py in order", "cwd": "/tmp/p"},
+        default_surface=AgentSurface.HERMES,
+    )
+    assert item.metadata["clarification_answers"] == "fix src/app.py in order"
+    # An empty top-level value must not clobber a nested metadata answer.
+    nested = work_item_from_adapter_payload(
+        {"prompt": "x", "metadata": {"clarification_answers": "nested"}, "clarification_answers": ""},
+        default_surface=AgentSurface.HERMES,
+    )
+    assert nested.metadata["clarification_answers"] == "nested"
+
+
 def test_negative_budgets_clamped_to_zero() -> None:
     item = work_item_from_adapter_payload(
         {"prompt": "x", "expected_ram_mb": -512, "context_tokens": -10},

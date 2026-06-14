@@ -53,6 +53,11 @@ PLAN_SCHEMA = {
             "expected_ram_mb": {"type": "integer", "minimum": 0, "default": 0},
             "context_tokens": {"type": "integer", "minimum": 0, "default": 0},
             "cwd": {"type": "string", "default": ""},
+            "clarification_answers": {
+                "type": "string",
+                "default": "",
+                "description": "Answers that resolve a prior clarification gate; required to enqueue an ambiguous or large task.",
+            },
         },
         "required": ["prompt"],
     },

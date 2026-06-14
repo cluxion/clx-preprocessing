@@ -51,23 +51,27 @@ def post_tool_call(**_: Any) -> None:
     let the existing owned-only fail-closed enforcement path terminate
     candidates.
     """
-    global _last_watch_at
+    global _last_warning_at, _last_watch_at
 
     now = time.monotonic()
-    with _lock:
-        if _last_watch_at is not None and now - _last_watch_at < _watch_interval_seconds():
-            return
-        _last_watch_at = now
-
     try:
-        result = guard_bridge.auto_enforce([os.getpid()], dry_run=not _auto_apply_enabled())
+        with _lock:
+            if _last_watch_at is not None and now - _last_watch_at < _watch_interval_seconds():
+                return
+            _last_watch_at = now
+            result = guard_bridge.auto_enforce([os.getpid()], dry_run=not _auto_apply_enabled())
+            should_warn = (
+                bool(result.get("triggered", False))
+                and bool(result.get("dry_run", True))
+                and (_last_warning_at is None or now - _last_warning_at >= WARNING_INTERVAL_SECONDS)
+            )
+            if should_warn:
+                _last_warning_at = now
     except Exception as exc:
         _warn(f"cluxion guard watch failed: {exc}")
         return
-    if not result.get("triggered", False) or not result.get("dry_run", True):
-        return
-
-    _warn_triggered(result, now)
+    if should_warn:
+        _warn_triggered(result)
 
 
 def _autostart_enabled() -> bool:
@@ -88,14 +92,7 @@ def _watch_interval_seconds() -> float:
         return DEFAULT_WATCH_INTERVAL_SECONDS
 
 
-def _warn_triggered(result: dict[str, Any], now: float) -> None:
-    global _last_warning_at
-
-    with _lock:
-        if _last_warning_at is not None and now - _last_warning_at < WARNING_INTERVAL_SECONDS:
-            return
-        _last_warning_at = now
-
+def _warn_triggered(result: dict[str, Any]) -> None:
     pids = [str(entry.get("pid")) for entry in result.get("candidates", []) if isinstance(entry, dict)]
     reasons = [str(reason) for reason in result.get("trigger_reasons", [])]
     _warn(
