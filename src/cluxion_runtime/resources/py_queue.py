@@ -290,7 +290,7 @@ def _exclusive_bundle_lock(path: Path) -> Iterator[None]:
         # Non-POSIX platforms keep atomic rename but skip advisory locking.
         yield
         return
-    lock_path = path.with_name(f"{path.name}.lock")
+    lock_path = path.parent / ".dispatch.lock"
     with lock_path.open("a+b") as lock_file:
         _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
         try:

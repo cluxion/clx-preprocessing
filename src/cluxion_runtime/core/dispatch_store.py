@@ -146,15 +146,19 @@ def build_briefing_payload(work_id: str, *, dispatch_dir: Path | None = None) ->
     """Bundle all segment results into a final synthesis prompt."""
     bundle = load_dispatch_bundle(work_id, dispatch_dir=dispatch_dir)
     steps = _steps(bundle)
-    missing = [str(step.get("step_id", "")) for step in steps if step.get("status") != "succeeded"]
+    missing: list[str] = []
+    briefing_blocks: list[str] = []
+    for step in steps:
+        if step.get("status") != "succeeded":
+            missing.append(str(step.get("step_id", "")))
+        briefing_blocks.append(_briefing_step_block(step))
     if missing:
         return {"work_id": work_id, "ready": False, "missing_steps": missing, "briefing_prompt": ""}
-    prompt = _briefing_prompt(bundle, steps)
     return {
         "work_id": work_id,
         "ready": True,
         "missing_steps": [],
-        "briefing_prompt": prompt,
+        "briefing_prompt": _briefing_prompt(bundle, briefing_blocks),
         "result_count": len(steps),
     }
 
@@ -204,7 +208,7 @@ def _public_step(step: dict[str, object]) -> dict[str, object]:
     }
 
 
-def _briefing_prompt(bundle: dict[str, object], steps: list[dict[str, object]]) -> str:
+def _briefing_prompt(bundle: dict[str, object], briefing_blocks: list[str]) -> str:
     lines = [
         "[cluxion_final_briefing]",
         f"work_id={bundle.get('work_id', '')}",
@@ -212,18 +216,19 @@ def _briefing_prompt(bundle: dict[str, object], steps: list[dict[str, object]]) 
         "Separate verified facts, tool results, inferences, missing checks, and remaining risks.",
         "[segment_results]",
     ]
-    for step in steps:
-        lines.append(
-            "\n".join(
-                [
-                    f"step_id={step.get('step_id', '')}",
-                    f"segment_id={step.get('segment_id', '')}",
-                    f"checksum={step.get('checksum', '')}",
-                    str(step.get("result", "")),
-                ]
-            )
-        )
+    lines.extend(briefing_blocks)
     return "\n\n".join(lines)
+
+
+def _briefing_step_block(step: dict[str, object]) -> str:
+    return "\n".join(
+        [
+            f"step_id={step.get('step_id', '')}",
+            f"segment_id={step.get('segment_id', '')}",
+            f"checksum={step.get('checksum', '')}",
+            str(step.get("result", "")),
+        ]
+    )
 
 
 def _steps(bundle: dict[str, object]) -> list[dict[str, object]]:
@@ -269,7 +274,7 @@ def _exclusive_bundle_lock(path: Path) -> Iterator[None]:
         # Non-POSIX platforms keep atomic rename but skip advisory locking.
         yield
         return
-    lock_path = path.with_name(f"{path.name}.lock")
+    lock_path = path.parent / ".dispatch.lock"
     with lock_path.open("a+b") as lock_file:
         _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
         try:

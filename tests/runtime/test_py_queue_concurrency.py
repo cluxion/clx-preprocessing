@@ -117,6 +117,18 @@ def test_python_queue_concurrent_record_steps_preserve_both_updates(
     assert steps[step_ids[1]]["result"] == "done:1"
 
 
+def test_python_queue_uses_shared_lock_instead_of_per_bundle_locks(tmp_path: Path) -> None:
+    store_dir = tmp_path / "queue"
+    py_queue.run("persist", _store_payload(store_dir, work_id="py-race", bundle=_bundle(1)))
+    payload = py_queue.run("next", _store_payload(store_dir, work_id="py-race"))
+    py_queue.run("record", _store_payload(store_dir, work_id="py-race", step_id=payload["step"]["step_id"]))
+
+    dispatch_dir = store_dir / "dispatch"
+    assert not (dispatch_dir / "py-race.json.lock").exists()
+    if py_queue._fcntl is not None:
+        assert (dispatch_dir / ".dispatch.lock").exists()
+
+
 def test_python_queue_concurrent_dequeue_serializes_select_update(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

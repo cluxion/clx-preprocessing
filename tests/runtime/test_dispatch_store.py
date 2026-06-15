@@ -108,6 +108,16 @@ def test_next_marks_step_running_on_disk(tmp_path: Path, queued_plan: HarnessPla
     assert statuses.count("running") == 1
 
 
+def test_dispatch_store_uses_shared_lock_instead_of_per_bundle_locks(tmp_path: Path, queued_plan: HarnessPlan) -> None:
+    persist_dispatch_bundle(queued_plan, dispatch_dir=tmp_path)
+    payload = next_dispatch_step("w-queued", dispatch_dir=tmp_path)
+    record_dispatch_result("w-queued", str(payload["step"]["step_id"]), result="done", dispatch_dir=tmp_path)
+
+    assert not (tmp_path / "w-queued.json.lock").exists()
+    if dispatch_store._fcntl is not None:
+        assert (tmp_path / ".dispatch.lock").exists()
+
+
 def test_concurrent_next_dispatch_steps_do_not_claim_same_step(
     tmp_path: Path, queued_plan: HarnessPlan, monkeypatch: pytest.MonkeyPatch
 ) -> None:
