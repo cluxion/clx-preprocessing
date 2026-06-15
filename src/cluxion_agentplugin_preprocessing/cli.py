@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING
 
 from cluxion_agentplugin_preprocessing import __version__, hermes_config, runner
 from cluxion_agentplugin_preprocessing.doctor import (
-    DoctorResult,
     render_json,
     render_text,
     run_doctor,

@@ -3,11 +3,8 @@
 from __future__ import annotations
 
 import importlib.metadata
-import os
-import re
 import shutil
-from pathlib import Path
-from typing import Callable
+from collections.abc import Callable
 
 from .framework import DoctorContext
 
@@ -60,7 +57,7 @@ def entry_point_registered(ctx: DoctorContext) -> tuple[str, str]:
         for ep in eps:
             if "cluxion-agentplugin-preprocessing" in (ep.name or "").lower() or "cluxion_agentplugin_preprocessing" in (ep.value or ""):
                 mod = ep.load()
-                if hasattr(mod, "register") and callable(getattr(mod, "register")):
+                if hasattr(mod, "register") and callable(mod.register):
                     return "pass", ep.value or str(ep)
         return "fail", "entry point not found or register missing"
     except Exception as e:
@@ -157,7 +154,6 @@ def dispatch_dir_writable(ctx: DoctorContext) -> tuple[str, str]:
 def guard_daemon_startable(ctx: DoctorContext) -> tuple[str, str]:
     try:
         # best-effort, do not actually start long daemon in doctor
-        import psutil  # declared dep
 
         return "pass", "psutil available"
     except Exception:

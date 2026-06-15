@@ -1,9 +1,6 @@
 """Tests for embedded doctor (determinism + cross-cutting checks)."""
 
-import json
 from pathlib import Path
-
-import pytest
 
 from cluxion_agentplugin_preprocessing.doctor import (
     DoctorResult,
@@ -64,15 +61,15 @@ def test_probe_exception_becomes_fail():
     def bad_probe(ctx):
         raise RuntimeError("boom")
 
-    probes = {"hermes_on_path": bad_probe}
-    # minimal catalog subset not needed, engine catches
-    # run with full but only one will execute
-    cat = _catalog_path()
-    # patch probes temporarily not, instead test via run with override? simple: since engine catches, we trust
-    # direct
-    from cluxion_agentplugin_preprocessing.doctor.framework import CheckResult, run_doctor as rd
-    # we already know from code it catches to fail
-    assert True
+    result = run_doctor(
+        cwd=Path.cwd(),
+        catalog_path=_catalog_path(),
+        probes={"hermes_on_path": bad_probe},
+        plugin="preprocessing",
+        version="0.3.6",
+    )
+    statuses = {c.check_id: c.status for c in result.checks}
+    assert statuses["hermes_on_path"] == "fail"
 
 
 def test_warn_only_is_ok():
@@ -83,5 +80,3 @@ def test_warn_only_is_ok():
     )
     r = DoctorResult(plugin="p", version="0.3.6", checks=checks)
     assert r.ok is True
-    # exit would be 0
-    assert True
