@@ -65,6 +65,7 @@ def bootstrap(payload: Mapping[str, object], *, command_runner: CommandRunner | 
 def serve_local(payload: Mapping[str, object], *, command_runner: CommandRunner | None = None) -> RuntimeResult:
     """Run cluxion-runtime serve-local with dry-run by default."""
     model = _required_str(payload, "model")
+    port = _port(payload, "port", 23003)
     command = [
         _runtime_binary(None),
         "serve-local",
@@ -73,7 +74,7 @@ def serve_local(payload: Mapping[str, object], *, command_runner: CommandRunner 
         "--host",
         _str(payload, "host", "127.0.0.1"),
         "--port",
-        str(_int(payload, "port", 23003)),
+        str(port),
         "--max-tokens",
         str(_int(payload, "max_tokens", 128_000)),
     ]
@@ -89,6 +90,7 @@ def serve_local(payload: Mapping[str, object], *, command_runner: CommandRunner 
 def hermes_config(payload: Mapping[str, object], *, command_runner: CommandRunner | None = None) -> RuntimeResult:
     """Render Hermes config patch for a local endpoint."""
     model = _required_str(payload, "model")
+    port = _port(payload, "port", 23003)
     command = (
         _runtime_binary(None),
         "hermes-local-config",
@@ -97,7 +99,7 @@ def hermes_config(payload: Mapping[str, object], *, command_runner: CommandRunne
         "--host",
         _str(payload, "host", "127.0.0.1"),
         "--port",
-        str(_int(payload, "port", 23003)),
+        str(port),
         "--context-length",
         str(_int(payload, "context_length", 131_072)),
         "--provider-key",
@@ -144,6 +146,12 @@ def queue_brief(payload: Mapping[str, object], *, command_runner: CommandRunner 
 
 def context_compress(payload: Mapping[str, object], *, command_runner: CommandRunner | None = None) -> RuntimeResult:
     """Compress conversation context deterministically once it exceeds the trigger ratio."""
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        raise ValueError("messages must be a list of objects")
+    for i, m in enumerate(messages):
+        if not isinstance(m, dict) or not isinstance(m.get("content"), str):
+            raise ValueError(f"message[{i}] must be an object with string content")
     command = (_runtime_binary(None), "context-compress", "--json-stdin")
     stdin = json.dumps(dict(payload), ensure_ascii=False)
     return _execute_json(command, stdin, command_runner)
@@ -316,6 +324,16 @@ def _int(payload: Mapping[str, object], key: str, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return value if value > 0 else default
+
+
+def _port(payload: Mapping[str, object], key: str, default: int) -> int:
+    try:
+        value = int(payload.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    if not (1 <= value <= 65535):
+        raise ValueError(f"{key} must be between 1 and 65535")
+    return value
 
 
 def _non_negative_int(payload: Mapping[str, object], key: str, default: int) -> int:

@@ -247,6 +247,10 @@ def _handle_browser_type(args: dict[str, object], **_: object) -> str:
 
 
 def _handle_doctor(args: dict[str, object], **_: object) -> str:
+    return _json_result(lambda: _run_doctor(args))
+
+
+def _run_doctor(args: dict[str, object]) -> str:
     pkg = "cluxion_agentplugin_preprocessing.doctor"
     catalog_path = Path(str(importlib.resources.files(pkg).joinpath("catalog.json")))
     result = run_doctor(

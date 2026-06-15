@@ -176,3 +176,38 @@ def _isolated_env(key: str, value: str) -> Iterator[None]:
             os.environ.pop(key, None)
         else:
             os.environ[key] = old_value
+
+
+def test_serve_local_rejects_out_of_range_port() -> None:
+    try:
+        runner.serve_local({"model": "test", "port": 999999999})
+    except ValueError as exc:
+        assert "port must be between 1 and 65535" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_hermes_config_rejects_invalid_port() -> None:
+    try:
+        runner.hermes_config({"model": "test", "port": 0})
+    except ValueError as exc:
+        assert "port must be between 1 and 65535" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_context_compress_rejects_malformed_messages() -> None:
+    try:
+        runner.context_compress({"messages": [42, "x", None, {"role": "user"}]})
+    except ValueError as exc:
+        assert "message[0] must be an object with string content" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_context_compress_accepts_valid_messages_structure() -> None:
+    try:
+        runner.context_compress({"messages": [{"content": "hello world"}]})
+    except ValueError as exc:
+        assert "must be an object with string content" not in str(exc)
+    # ok if other error like runtime missing
