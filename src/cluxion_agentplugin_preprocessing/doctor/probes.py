@@ -252,16 +252,29 @@ def abi3_wheel_compatible(ctx: DoctorContext) -> tuple[str, str]:
 @_register("sqlite_wal_mode_compatible")
 def sqlite_wal_mode_compatible(ctx: DoctorContext) -> tuple[str, str]:
     try:
+        import contextlib
+        import os
         import sqlite3
-        conn = sqlite3.connect(":memory:")
+        import tempfile
+
+        # WAL is a file-database feature; an in-memory db always reports "memory",
+        # so probe on a real temp file (mirrors how the queue/forgetforge dbs run).
+        fd, path = tempfile.mkstemp(suffix=".sqlite", prefix="cluxion-doctor-")
+        os.close(fd)
         try:
-            mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
-            ver = sqlite3.sqlite_version
-            if str(mode).lower() == "wal":
-                return "pass", f"wal supported (sqlite {ver})"
-            return "warn", f"got {mode} (sqlite {ver})"
+            conn = sqlite3.connect(path)
+            try:
+                mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                ver = sqlite3.sqlite_version
+                if str(mode).lower() == "wal":
+                    return "pass", f"wal supported (sqlite {ver})"
+                return "warn", f"got {mode} (sqlite {ver})"
+            finally:
+                conn.close()
         finally:
-            conn.close()
+            for suffix in ("", "-wal", "-shm"):
+                with contextlib.suppress(OSError):
+                    os.unlink(path + suffix)
     except Exception as e:
         return "skip", f"uncertainty: {type(e).__name__}"
 
