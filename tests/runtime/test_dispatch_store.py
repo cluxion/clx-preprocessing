@@ -204,3 +204,12 @@ def test_work_id_traversal_is_neutralized(tmp_path: Path) -> None:
 def test_work_id_with_no_safe_chars_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(DispatchStoreError, match="empty"):
         load_dispatch_bundle("../..", dispatch_dir=tmp_path)
+
+from cluxion_runtime.core.types import ResourceSnapshot
+from cluxion_runtime.resources.queue_bridge import resolve_backend
+
+
+def test_queue_backend_label_matches_resolve_backend():
+    item = WorkItem("w-test", "short prompt", surface=AgentSurface.HERMES)
+    plan = build_harness_plan(item)
+    assert plan.queue_backend == resolve_backend()

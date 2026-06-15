@@ -95,3 +95,9 @@ def test_directory_plugin_wrapper_exports_register() -> None:
         sys.path[:] = old_path
 
     assert module.register is plugin.register
+
+def test_browser_check_fn_returns_false_when_playwright_missing(monkeypatch):
+    import importlib.util
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None if name == "playwright" else object())
+    from cluxion_agentplugin_preprocessing.plugin import _check_browser_tool_available
+    assert _check_browser_tool_available() is False

@@ -18,7 +18,7 @@ from cluxion_runtime.core.types import (
     WorkItem,
 )
 from cluxion_runtime.models.vllm_mlx import select_mac_local_profile
-from cluxion_runtime.resources.queue_bridge import queue_available
+from cluxion_runtime.resources.queue_bridge import resolve_backend
 from cluxion_runtime.resources.rust_bridge import capacity_decision, collect_resource_snapshot
 
 
@@ -49,7 +49,7 @@ def build_harness_plan(
             queue_position=queue_position,
             clarification_required=True,
             clarification_questions=tuple(question.prompt for question in clarification.questions),
-            queue_backend="rust" if queue_available() else "python",
+            queue_backend=resolve_backend(),
         )
     work_kind = _work_kind_for(item, intent_category=intent.category)
     preprocessed = preprocess_work(
@@ -72,7 +72,7 @@ def build_harness_plan(
         execution=_host_execution_plan_for(item, preprocessed, runtime),
         queue_position=queue_position,
         clarification_required=False,
-        queue_backend="rust" if queue_available() else "python",
+        queue_backend=resolve_backend(),
     )
 
 

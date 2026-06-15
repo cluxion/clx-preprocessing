@@ -58,7 +58,7 @@ def persist_dispatch_bundle(plan: HarnessPlan, *, dispatch_dir: Path | None = No
         return None
     bundle = _bundle_from_plan(plan)
     target_dir = default_dispatch_dir() if dispatch_dir is None else dispatch_dir
-    if plan.queue_backend == "rust" and dispatch_dir is None and not _custom_dispatch_dir_configured():
+    if plan.queue_backend in ("native", "subprocess") and dispatch_dir is None and not _custom_dispatch_dir_configured():
         try:
             from cluxion_runtime.resources.queue_bridge import default_store_dir
             from cluxion_runtime.resources.queue_bridge import persist_dispatch_bundle as rust_persist

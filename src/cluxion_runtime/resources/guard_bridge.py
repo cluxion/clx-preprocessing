@@ -396,10 +396,11 @@ def _which(binary: str) -> bool:
 
 
 def _python_sample(body: Mapping[str, Any]) -> dict[str, Any]:
-    interval_ms = max(100, int(body.get("cpu_sample_ms", 100)))
+    cpu_sample_ms = int(body.get("cpu_sample_ms", 100))
+    interval = None if cpu_sample_ms <= 0 else cpu_sample_ms / 1000.0
     memory = psutil.virtual_memory()
     swap = psutil.swap_memory()
-    cpu = psutil.cpu_percent(interval=interval_ms / 1000.0)
+    cpu = psutil.cpu_percent(interval=interval)
     zombie_pids: list[int] = []
     count = 0
     for proc in psutil.process_iter(["status"]):

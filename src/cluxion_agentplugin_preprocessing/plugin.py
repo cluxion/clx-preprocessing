@@ -183,7 +183,9 @@ def _check_runtime_available() -> bool:
 
 
 def _check_browser_tool_available() -> bool:
-    return True
+    import importlib.util
+
+    return importlib.util.find_spec("playwright") is not None
 
 
 def _handle_plan(args: dict[str, object], **_: object) -> str:

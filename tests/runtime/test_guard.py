@@ -344,3 +344,13 @@ def test_snapshot_prefers_fresh_daemon_state(tmp_path: Path, monkeypatch) -> Non
     (tmp_path / guard_bridge.STATE_FILE_NAME).write_text(json.dumps(state), encoding="utf-8")
     fallback = rust_bridge.collect_resource_snapshot()
     assert fallback.total_ram_mb != 4096 or fallback.available_ram_mb != 2048
+
+
+def test_guard_python_sample_with_cpu_sample_ms_0_is_nonblocking(monkeypatch):
+    import cluxion_runtime.resources.guard_bridge as gb
+    t0 = time.time()
+    res = gb._python_sample({"cpu_sample_ms": 0})
+    dt = time.time() - t0
+    assert dt < 0.05, "should be fast non-blocking"
+    assert "cpu_percent" in res
+    assert res["ok"]
