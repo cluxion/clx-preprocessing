@@ -9,6 +9,7 @@ mixed-language on purpose — they classify user input, they are not output.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 from cluxion_runtime.core.types import WorkIntent, WorkItem
@@ -125,11 +126,10 @@ def _question(question_id: str, locale: str) -> ClarificationQuestion:
     return ClarificationQuestion(question_id, prompt, why)
 
 
-_AMBIGUOUS_KEYWORDS = (
+# PHRASES: multi-word or longer markers — use plain substring match
+_AMBIGUOUS_PHRASES = (
     "maybe",
     "perhaps",
-    "either",
-    "or",
     "not sure",
     "unsure",
     "아마",
@@ -139,6 +139,18 @@ _AMBIGUOUS_KEYWORDS = (
     "헷갈",
     "애매",
 )
+# WORDS: short standalone tokens — match on whole-word boundaries only
+_AMBIGUOUS_WORDS = ("or", "either")
+
+
+def _has_ambiguous(text: str) -> bool:
+    """Return True if text contains ambiguous phrasing or choice words."""
+    t = text.lower()
+    if any(p in t for p in _AMBIGUOUS_PHRASES):
+        return True
+    return any(re.search(r"\b" + re.escape(w) + r"\b", t) for w in _AMBIGUOUS_WORDS)
+
+
 _SCOPE_KEYWORDS = ("all", "everything", "전부", "전체", "모든")
 _TARGET_MISSING_KEYWORDS = ("fix", "implement", "refactor", "patch", "수정", "구현", "리팩터", "패치")
 _LOW_CONFIDENCE_THRESHOLD = 0.62
@@ -155,7 +167,7 @@ def assess_clarification(item: WorkItem, intent: WorkIntent) -> ClarificationRes
         reasons.append("low_intent_confidence")
         questions.append(_question("intent_direction", locale))
 
-    if _has_any(text, _AMBIGUOUS_KEYWORDS):
+    if _has_ambiguous(text):
         reasons.append("ambiguous_language")
         questions.append(_question("disambiguate_choice", locale))
 
@@ -204,7 +216,7 @@ def assess_clarification(item: WorkItem, intent: WorkIntent) -> ClarificationRes
 def _needs_direction_confirmation(text: str, intent: WorkIntent) -> bool:
     if intent.category == "general" and len(text) < 240:
         return False
-    if _has_any(text, _AMBIGUOUS_KEYWORDS):
+    if _has_ambiguous(text):
         return True
     if intent.category in {"engineering", "security", "documentation", "local_model"}:
         return True

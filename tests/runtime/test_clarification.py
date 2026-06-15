@@ -68,3 +68,28 @@ def test_resolve_locale_fallbacks() -> None:
     assert clarification.resolve_locale("한국어 텍스트") == "ko"
     assert clarification.resolve_locale("plain", explicit="ko-KR") == "ko"
     assert clarification.resolve_locale("plain", explicit="fr") == "en"
+
+
+# Regression tests for word-boundary fix on 'or'/'either'
+def test_clear_prompts_no_false_positive_clarification() -> None:
+    clear_prompts = [
+        "Generate a sales report",
+        "Optimize the code base",
+        "sort a list of numbers",
+        "What is the hex code for the color blue?",
+    ]
+    for prompt in clear_prompts:
+        item = WorkItem(f"w-clear-{prompt[:10]}", prompt)
+        plan = build_harness_plan(item)
+        assert plan.clarification_required is False, f"False positive on: {prompt}"
+
+
+def test_real_or_choice_still_requires_clarification() -> None:
+    or_prompts = [
+        "Should I use X or Y?",
+        "do A or B?",
+    ]
+    for prompt in or_prompts:
+        item = WorkItem(f"w-or-{prompt[:10]}", prompt)
+        plan = build_harness_plan(item)
+        assert plan.clarification_required is True, f"Missed ambiguity on: {prompt}"
