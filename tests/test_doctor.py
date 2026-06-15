@@ -24,7 +24,7 @@ def test_run_doctor_returns_result_and_deterministic():
         catalog_path=cat,
         probes=PROBES,
         plugin="preprocessing",
-        version="0.3.6",
+        version="0.3.7",
     )
     assert isinstance(r1, DoctorResult)
     j1 = render_json(r1)
@@ -33,7 +33,7 @@ def test_run_doctor_returns_result_and_deterministic():
         catalog_path=cat,
         probes=PROBES,
         plugin="preprocessing",
-        version="0.3.6",
+        version="0.3.7",
     )
     j2 = render_json(r2)
     assert j1 == j2  # byte identical
@@ -49,12 +49,27 @@ def test_cross_cutting_checks_present():
         catalog_path=cat,
         probes=PROBES,
         plugin="preprocessing",
-        version="0.3.6",
+        version="0.3.7",
     )
     statuses = {c.check_id: c.status for c in result.checks}
     for key in ("hermes_on_path", "entry_point_registered", "toolset_valid"):
         assert key in statuses
         assert statuses[key] in ("pass", "warn", "fail", "skip")
+
+
+def test_new_probes_non_skip():
+    cat = _catalog_path()
+    result = run_doctor(
+        cwd=Path.cwd(),
+        catalog_path=cat,
+        probes=PROBES,
+        plugin="preprocessing",
+        version="0.3.7",
+    )
+    statuses = {c.check_id: c.status for c in result.checks}
+    for key in ("psutil_importable", "json_serialization_deterministic"):
+        assert key in statuses
+        assert statuses[key] in ("pass", "warn", "fail")  # non-skip
 
 
 def test_probe_exception_becomes_fail():
@@ -66,7 +81,7 @@ def test_probe_exception_becomes_fail():
         catalog_path=_catalog_path(),
         probes={"hermes_on_path": bad_probe},
         plugin="preprocessing",
-        version="0.3.6",
+        version="0.3.7",
     )
     statuses = {c.check_id: c.status for c in result.checks}
     assert statuses["hermes_on_path"] == "fail"
@@ -78,5 +93,5 @@ def test_warn_only_is_ok():
     checks = (
         CheckResult(check_id="x", category="c", severity="medium", status="warn", detail="w"),
     )
-    r = DoctorResult(plugin="p", version="0.3.6", checks=checks)
+    r = DoctorResult(plugin="p", version="0.3.7", checks=checks)
     assert r.ok is True

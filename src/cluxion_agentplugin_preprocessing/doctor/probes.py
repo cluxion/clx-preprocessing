@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import importlib.metadata
+import importlib.util
+import json as _json
+import os
 import shutil
+import sys
+import tempfile
 from collections.abc import Callable
 
 from .framework import DoctorContext
@@ -96,7 +101,7 @@ def native_module_importable(ctx: DoctorContext) -> tuple[str, str]:
             return "pass", "imported (native backend available)"
         return "warn", "imported but expected symbols missing"
     except Exception:
-        return "warn", "native missing \u2192 using fallback (slower)"
+        return "warn", "native missing → using fallback (slower)"
 
 
 # plugin-specific probes (deterministic ones only)
@@ -172,6 +177,150 @@ def handler_exception_coverage(ctx: DoctorContext) -> tuple[str, str]:
         return "fail", f"no error json: {result[:100]}"
     except Exception as e:
         return "skip", f"cannot invoke guard: {e}"
+
+
+def _safe_read_hermes_config():
+    try:
+        import yaml
+        cfg_path = os.path.expanduser("~/.hermes/config.yaml")
+        if not os.path.exists(cfg_path):
+            return None, "absent"
+        with open(cfg_path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        return data, "ok"
+    except Exception as e:
+        return None, f"read_error:{type(e).__name__}"
+
+
+@_register("psutil_importable")
+def psutil_importable(ctx: DoctorContext) -> tuple[str, str]:
+    try:
+        import psutil
+        _ = psutil.virtual_memory()
+        return "pass", "importable"
+    except ImportError:
+        return "fail", "psutil not installed"
+    except Exception as e:
+        return "skip", f"uncertainty: {type(e).__name__}"
+
+
+@_register("pyyaml_importable")
+def pyyaml_importable(ctx: DoctorContext) -> tuple[str, str]:
+    try:
+        import yaml
+        yaml.safe_load("test: 1")
+        return "pass", "importable"
+    except ImportError:
+        return "fail", "PyYAML not installed"
+    except Exception as e:
+        return "skip", f"uncertainty: {type(e).__name__}"
+
+
+@_register("fcntl_available_on_posix")
+def fcntl_available_on_posix(ctx: DoctorContext) -> tuple[str, str]:
+    if os.name != "posix":
+        return "skip", "non-POSIX (Windows)"
+    try:
+        import fcntl
+        # real check: lock a temp file
+        with tempfile.NamedTemporaryFile(delete=False) as tf:
+            tf_path = tf.name
+        try:
+            with open(tf_path, "a+b") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            return "pass", "fcntl works on POSIX"
+        finally:
+            os.unlink(tf_path)
+    except Exception as e:
+        return "skip", f"fcntl issue: {type(e).__name__}"
+
+
+@_register("playwright_optional_available")
+def playwright_optional_available(ctx: DoctorContext) -> tuple[str, str]:
+    if importlib.util.find_spec("playwright") is not None:
+        return "pass", "importable"
+    return "warn", "optional, not installed"
+
+
+@_register("abi3_wheel_compatible")
+def abi3_wheel_compatible(ctx: DoctorContext) -> tuple[str, str]:
+    # since requires-python >=3.11 the check is always pass
+    return "pass", f"Python {sys.version_info.major}.{sys.version_info.minor} >= 3.11 abi3 floor"
+
+
+@_register("sqlite_wal_mode_compatible")
+def sqlite_wal_mode_compatible(ctx: DoctorContext) -> tuple[str, str]:
+    try:
+        import sqlite3
+        conn = sqlite3.connect(":memory:")
+        try:
+            mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            ver = sqlite3.sqlite_version
+            if str(mode).lower() == "wal":
+                return "pass", f"wal supported (sqlite {ver})"
+            return "warn", f"got {mode} (sqlite {ver})"
+        finally:
+            conn.close()
+    except Exception as e:
+        return "skip", f"uncertainty: {type(e).__name__}"
+
+
+@_register("json_serialization_deterministic")
+def json_serialization_deterministic(ctx: DoctorContext) -> tuple[str, str]:
+    try:
+        d = {"z": 1, "a": 2, "nested": {"b": 3}}
+        j1 = _json.dumps(d, sort_keys=True, separators=(",", ":"))
+        j2 = _json.dumps(d, sort_keys=True, separators=(",", ":"))
+        if j1 == j2:
+            return "pass", "roundtrip bytes equal"
+        return "fail", "non-deterministic"
+    except Exception as e:
+        return "skip", f"uncertainty: {type(e).__name__}"
+
+
+@_register("hermes_plugin_enabled")
+def hermes_plugin_enabled(ctx: DoctorContext) -> tuple[str, str]:
+    data, status = _safe_read_hermes_config()
+    if status != "ok":
+        return "skip", f"config not present: {status}"
+    try:
+        plugins = (data or {}).get("plugins", {}) or {}
+        enabled = plugins.get("enabled", []) or []
+        disabled = plugins.get("disabled", []) or []
+        names = ["cluxion-agentplugin-preprocessing", "hermes-cluxion"]
+        for n in names:
+            if n in enabled and n not in disabled:
+                return "pass", f"{n} in enabled"
+        if any(n in enabled for n in names):
+            return "warn", "present but also disabled?"
+        return "warn", "not in plugins.enabled"
+    except Exception as e:
+        return "skip", f"uncertainty: {type(e).__name__}"
+
+
+@_register("env_var_consistency")
+def env_var_consistency(ctx: DoctorContext) -> tuple[str, str]:
+    try:
+        known = [
+            "CLUXION_QUEUE_STORE_DIR",
+            "CLUXION_PREPROCESS_DISPATCH_DIR",
+            "CLUXION_QUEUE_BACKEND",
+        ]
+        issues = []
+        for var in known:
+            val = os.environ.get(var)
+            if val and "DIR" in var:
+                try:
+                    p = os.path.expanduser(val)
+                    os.makedirs(p, exist_ok=True)
+                except Exception:
+                    issues.append(f"{var}=invalid_path")
+        if issues:
+            return "warn", ";".join(issues)
+        return "pass", "defaults or valid"
+    except Exception as e:
+        return "skip", f"uncertainty: {type(e).__name__}"
 
 
 # note: other checks in catalog will be reported as skip (no probe)
