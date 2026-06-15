@@ -2,9 +2,9 @@
 """Concurrency stress test for cluxion_queue with immediate tx and dispatch lock.
 Spawns N workers, enqueues M items, dequeues in parallel, verifies exactly-once claims.
 """
+import json
 import multiprocessing as mp
 import tempfile
-import json
 from pathlib import Path
 
 import cluxion_queue_native
