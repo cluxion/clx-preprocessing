@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import importlib.resources
 import json
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from cluxion_agentplugin_preprocessing import guard_watch, runner
+from cluxion_agentplugin_preprocessing.doctor import render_json, run_doctor
 from cluxion_agentplugin_preprocessing.schemas import (
     BOOTSTRAP_SCHEMA,
     BROWSER_CLICK_SCHEMA,
@@ -155,6 +158,24 @@ def register(ctx: object) -> None:
         check_fn=_check_browser_tool_available,
         emoji="🌐",
     )
+    # doctor tool
+    DOCTOR_SCHEMA = {
+        "name": "cluxion_doctor",
+        "description": "Run the embedded deterministic health checks for this plugin",
+        "parameters": {
+            "type": "object",
+            "properties": {"verbose": {"type": "boolean"}},
+            "additionalProperties": False,
+        },
+    }
+    ctx.register_tool(
+        name="cluxion_doctor",
+        toolset="cluxion",
+        schema=DOCTOR_SCHEMA,
+        handler=_handle_doctor,
+        check_fn=_check_runtime_available,
+        emoji="🩺",
+    )
 
 
 def _check_runtime_available() -> bool:
@@ -225,10 +246,27 @@ def _handle_browser_type(args: dict[str, object], **_: object) -> str:
     return _json_result(lambda: runner.browser_type(args).to_json())
 
 
+def _handle_doctor(args: dict[str, object], **_: object) -> str:
+    verbose = bool(args.get("verbose", False))
+    pkg = "cluxion_agentplugin_preprocessing.doctor"
+    catalog_path = Path(str(importlib.resources.files(pkg).joinpath("catalog.json")))
+    result = run_doctor(
+        cwd=Path.cwd(),
+        hermes_bin="hermes",
+        catalog_path=catalog_path,
+        probes=__import__(
+            "cluxion_agentplugin_preprocessing.doctor.probes", fromlist=["PROBES"]
+        ).PROBES,
+        plugin="preprocessing",
+        version=__import__("cluxion_agentplugin_preprocessing").__version__,
+    )
+    return render_json(result)
+
+
 def _json_result(callback: Callable[[], str]) -> str:
     try:
         return callback()
-    except ValueError as exc:
+    except Exception as exc:
         return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, sort_keys=True)
 
 

@@ -1,0 +1,538 @@
+[
+  {
+    "check_id": "hermes_on_path",
+    "category": "hermes_contract",
+    "severity": "critical",
+    "what_it_checks": "hermes binary is resolvable on PATH",
+    "failure_symptom": "All tool/subprocess calls to the host fail immediately",
+    "likely_causes": [
+      "Hermes not installed",
+      "PATH not exported in this shell/agent env"
+    ],
+    "fix_steps": [
+      "Run: which hermes",
+      "If missing, install/repair Hermes Agent and ensure its bin dir is on PATH",
+      "For agents, confirm the spawned shell inherits PATH"
+    ],
+    "change_robust": "Uses shutil.which at runtime \u2014 independent of any hardcoded path",
+    "detection_method": "shutil.which(ctx.hermes_bin) is not None"
+  },
+  {
+    "check_id": "hermes_version",
+    "category": "hermes_contract",
+    "severity": "high",
+    "what_it_checks": "hermes --version is parseable (host is a known-good build)",
+    "failure_symptom": "Unknown host version; contract assumptions may not hold",
+    "likely_causes": [
+      "Hermes build does not print the expected banner",
+      "Broken install"
+    ],
+    "fix_steps": [
+      "Run: hermes --version",
+      "Reinstall Hermes if the version banner is missing"
+    ],
+    "change_robust": "Parses live --version output, not a pinned constant",
+    "detection_method": "regex 'Hermes Agent v<ver>' matches `hermes --version`"
+  },
+  {
+    "check_id": "hermes_oneshot_flag",
+    "category": "hermes_contract",
+    "severity": "critical",
+    "what_it_checks": "host advertises -z/--oneshot (the non-interactive entry every plugin relies on)",
+    "failure_symptom": "Plugin/CLI falls into interactive mode or errors when invoking the host",
+    "likely_causes": [
+      "A Hermes update renamed/removed the oneshot flag"
+    ],
+    "fix_steps": [
+      "Run: hermes --help | grep -- -z",
+      "If absent, pin to a compatible Hermes version or update the plugin to the new flag"
+    ],
+    "change_robust": "Greps live --help output each run \u2014 detects a Hermes update that breaks the contract",
+    "detection_method": "'-z' and '--oneshot' present in `hermes --help`"
+  },
+  {
+    "check_id": "entry_point_registered",
+    "category": "registration",
+    "severity": "critical",
+    "what_it_checks": "this plugin's entry point is registered under hermes_agent.plugins and import+register() works",
+    "failure_symptom": "Plugin not loaded by Hermes; its tools/subcommand are absent",
+    "likely_causes": [
+      "pip install incomplete",
+      "entry point metadata missing",
+      "register() import error"
+    ],
+    "fix_steps": [
+      "Run: python -c \"import importlib.metadata as m; print([e.value for e in m.entry_points(group='hermes_agent.plugins') if 'cluxion-agentplugin-preprocessing' in e.name.lower()])\"",
+      "Reinstall: pip install --force-reinstall cluxion-agentplugin-preprocessing",
+      "Confirm the entry module imports and exposes a callable register"
+    ],
+    "change_robust": "Reads live importlib.metadata.entry_points(), not a config file",
+    "detection_method": "entry_points(group='hermes_agent.plugins') contains this dist and register is callable"
+  },
+  {
+    "check_id": "toolset_valid",
+    "category": "contract_drift",
+    "severity": "high",
+    "what_it_checks": "this plugin's toolset 'cluxion' is listed and enabled by `hermes tools list`",
+    "failure_symptom": "Model cannot see this plugin's tools; --toolsets silently ignores it",
+    "likely_causes": [
+      "Plugin failed to register its toolset",
+      "Hermes toolset registration API changed"
+    ],
+    "fix_steps": [
+      "Run: hermes tools list | grep cluxion",
+      "If missing, reinstall cluxion-agentplugin-preprocessing and restart the host",
+      "Verify register_tool used a valid toolset name"
+    ],
+    "change_robust": "Queries live `hermes tools list` for 'cluxion' \u2014 catches contract drift on Hermes upgrade",
+    "detection_method": "'cluxion' appears under plugin toolsets in `hermes tools list`"
+  },
+  {
+    "check_id": "install_integrity",
+    "category": "install",
+    "severity": "high",
+    "what_it_checks": "installed distribution version equals the package __version__",
+    "failure_symptom": "Stale or mismatched install; fixes/behaviors may not be the deployed ones",
+    "likely_causes": [
+      "Partial upgrade",
+      "multiple installs shadowing each other"
+    ],
+    "fix_steps": [
+      "Run: pip show cluxion-agentplugin-preprocessing",
+      "Force a clean reinstall: pip install --force-reinstall cluxion-agentplugin-preprocessing"
+    ],
+    "change_robust": "Compares live importlib.metadata.version() to __version__ \u2014 no hardcoding",
+    "detection_method": "importlib.metadata.version('cluxion-agentplugin-preprocessing') == __version__"
+  },
+  {
+    "check_id": "native_module_importable",
+    "category": "native_backend",
+    "severity": "medium",
+    "what_it_checks": "native module cluxion_queue_native imports (else pure-Python/subprocess fallback is used)",
+    "failure_symptom": "Slower path; if fallback also broke, tool errors",
+    "likely_causes": [
+      "wheel ABI/arch mismatch",
+      "native package not installed"
+    ],
+    "fix_steps": [
+      "Run: python -c 'import cluxion_queue_native'",
+      "If ImportError, reinstall the bundled wheel; fallback keeps working meanwhile"
+    ],
+    "change_robust": "Attempts the import + hasattr at runtime; WARN (not fail) because fallback works",
+    "detection_method": "import cluxion_queue_native succeeds"
+  },
+  {
+    "check_id": "handler_exception_coverage",
+    "category": "handler",
+    "severity": "low",
+    "what_it_checks": "_json_result guard catches TypeError too (args=None / wrong-typed) \u2192 error JSON, never raises to host",
+    "failure_symptom": "Traceback escapes into the host on malformed args",
+    "likely_causes": [
+      "_json_result only caught ValueError"
+    ],
+    "fix_steps": [
+      "Broaden _json_result except to (ValueError, TypeError) or Exception"
+    ],
+    "change_robust": "Invokes a handler with args=None and asserts error JSON",
+    "detection_method": "handler raising TypeError yields {ok:false,...}"
+  },
+  {
+    "check_id": "queue_backend_resolvable",
+    "category": "native_backend",
+    "severity": "high",
+    "what_it_checks": "Queue backend resolution succeeds and at least one backend (native/subprocess/python) is available",
+    "failure_symptom": "RuntimeError when enqueuing work; cluxion_plan returns error 'queue backend resolution failed'; fallback to python backend silently succeeds but slower",
+    "likely_causes": [
+      "CLUXION_QUEUE_BACKEND env var set to invalid value (typo like 'native-impl' instead of 'native')",
+      "native module present but forced backend via CLUXION_QUEUE_BACKEND to 'native' and module fails to import",
+      "subprocess binary path misconfigured via CLUXION_QUEUE_BIN",
+      "cluxion-queue binary not in PATH and local build not found",
+      "Python sqlite3 module broken on system (rare)"
+    ],
+    "fix_steps": [
+      "Check env var: echo $CLUXION_QUEUE_BACKEND (should be empty, 'native', 'subprocess', or 'python')",
+      "If set to invalid value, unset: unset CLUXION_QUEUE_BACKEND",
+      "Verify binary location: echo $CLUXION_QUEUE_BIN, then file <value>",
+      "Check PATH for cluxion-queue: which cluxion-queue",
+      "Test fallback explicitly: CLUXION_QUEUE_BACKEND=python python -c 'from cluxion_runtime.resources.queue_bridge import resolve_backend; print(resolve_backend())'",
+      "If native module issue, follow native_module_importable fix steps"
+    ],
+    "change_robust": "Backend resolution is deterministic and lazy; add a unit test to hermes test suite that exercises each backend in order of preference and asserts fallback chain",
+    "detection_method": "python -c 'from cluxion_runtime.resources import queue_bridge; backend = queue_bridge.resolve_backend(); print(f\"Resolved: {backend}\"); assert backend in (\"native\", \"subprocess\", \"python\"), f\"Invalid backend {backend}\"'"
+  },
+  {
+    "check_id": "queue_store_dir_writable",
+    "category": "config",
+    "severity": "critical",
+    "what_it_checks": "Default or configured queue store directory is writable and can be created",
+    "failure_symptom": "enqueue/dequeue/dispatch operations fail with OSError/PermissionError; queue operations appear hung if waiting on lock; dispatch bundles not persisted",
+    "likely_causes": [
+      "Store dir path set via CLUXION_QUEUE_STORE_DIR to a non-existent parent that cannot be created",
+      "Home directory (~/.local/share/...) not writable due to permissions or mounted read-only",
+      "NFS/network mount issues causing flaky writes or lock contention",
+      "Disk full condition",
+      "SELinux/AppArmor denying write access"
+    ],
+    "fix_steps": [
+      "Check env var: echo $CLUXION_QUEUE_STORE_DIR",
+      "Test directory creation: mkdir -p ~/.local/share/cluxion-agentplugin-preprocessing/queue",
+      "Check permissions: ls -ld ~/.local/share/cluxion-agentplugin-preprocessing",
+      "Verify writable: touch ~/.local/share/cluxion-agentplugin-preprocessing/.test && rm $_",
+      "Check disk space: df -h ~",
+      "If NFS, verify mount options: mount | grep home",
+      "Override store dir temporarily: CLUXION_QUEUE_STORE_DIR=/tmp/cluxion-test python -c 'from cluxion_runtime.resources import queue_bridge; print(queue_bridge.default_store_dir())'"
+    ],
+    "change_robust": "Test by creating a fixture with a writable temp directory; verify this check before every queue operation in tests",
+    "detection_method": "python -c 'from pathlib import Path; from cluxion_runtime.resources import queue_bridge; store = queue_bridge.default_store_dir(); store.mkdir(parents=True, exist_ok=True); test_file = store / \".test\"; test_file.touch(); test_file.unlink()'"
+  },
+  {
+    "check_id": "dispatch_dir_writable",
+    "category": "config",
+    "severity": "high",
+    "what_it_checks": "Dispatch bundle storage directory is writable and fcntl locks work (on POSIX)",
+    "failure_symptom": "Dispatch bundle operations timeout with lock contention; concurrent segment updates lose writes; dispatch bundles get corrupted JSON",
+    "likely_causes": [
+      "CLUXION_PREPROCESS_DISPATCH_DIR env var misconfigured to non-writable path",
+      "fcntl module unavailable (Windows without WSL fallback)",
+      "NFS mount with broken advisory locking (common issue)",
+      "Multiple Hermes instances with DISPATCH_DIR_ENV pointing to same location without proper synchronization",
+      ".dispatch.lock file manually deleted leaving lock_path.open() to fail"
+    ],
+    "fix_steps": [
+      "Check env: echo $CLUXION_PREPROCESS_DISPATCH_DIR (or legacy HERMES_CLUXION_DISPATCH_DIR)",
+      "Verify directory is writable: mkdir -p ~/.local/share/cluxion-agentplugin-preprocessing/queue/dispatch && touch $_/.test && rm $_",
+      "Check for lock file issues: ls -la ~/.local/share/cluxion-agentplugin-preprocessing/queue/dispatch/.dispatch.lock 2>/dev/null",
+      "On NFS, check mount options: mount | grep dispatch-dir-path",
+      "Verify fcntl available (Unix only): python -c 'import fcntl; print(\"fcntl available\")'",
+      "Test on non-NFS mount: override CLUXION_PREPROCESS_DISPATCH_DIR=/tmp/dispatch-test && run tool",
+      "Verify single Hermes instance accessing this path via process monitor"
+    ],
+    "change_robust": "Create temp dispatch dirs in tests; verify fcntl availability on POSIX; document Windows fallback (no lock, atomic rename only)",
+    "detection_method": "python -c 'from pathlib import Path; from cluxion_runtime.core.dispatch_store import default_dispatch_dir, _exclusive_bundle_lock; d = default_dispatch_dir(); d.mkdir(parents=True, exist_ok=True); test = d / \".test.json\"; with _exclusive_bundle_lock(test): pass; test.unlink(missing_ok=True)'"
+  },
+  {
+    "check_id": "guard_daemon_startable",
+    "category": "runtime",
+    "severity": "medium",
+    "what_it_checks": "Guard daemon process can be spawned; binary exists or Python host can run native module",
+    "failure_symptom": "Guard tools return binary_not_found error; resource enforcement unavailable; stale guard_state.json causes auto_enforce to fail with daemon_state_stale",
+    "likely_causes": [
+      "cluxion-queue binary not in PATH and local build missing at rust/cluxion_queue/target/release/cluxion-queue",
+      "native cluxion_queue_native module importable but run_guard_daemon function missing (version mismatch)",
+      "guard_daemon_host.py module broken or cluxion_runtime.guard_daemon_host not installed",
+      "Python cannot spawn detached subprocess (rare POSIX issue)",
+      "store_dir not writable so guard_daemon.pid cannot be written"
+    ],
+    "fix_steps": [
+      "Check for binary: which cluxion-queue",
+      "Check for local build: file /path/to/cluxion_queue/target/release/cluxion-queue",
+      "Verify native module has run_guard_daemon: python -c 'from cluxion_queue_native import run_guard_daemon; print(\"OK\")'",
+      "Test Python host path: python -m cluxion_runtime.guard_daemon_host --help 2>&1 | head -5",
+      "If no binary, build locally: cd rust/cluxion_queue && cargo build --release",
+      "Verify store_dir writable: mkdir -p <store_dir> && test -w <store_dir>",
+      "Check daemon can stop: python -c 'from cluxion_runtime.resources.guard_bridge import stop_daemon; stop_daemon()'"
+    ],
+    "change_robust": "Test with mock store_dir; verify both binary and Python fallback paths; ensure daemon pidfile cleanup on stop",
+    "detection_method": "python -c 'from cluxion_runtime.resources import guard_bridge; result = guard_bridge.start_daemon(store_dir=\"/tmp/guard-test-$$\"); print(result); assert result.get(\"ok\") and result.get(\"started\"), result'"
+  },
+  {
+    "check_id": "guard_state_not_stale",
+    "category": "runtime",
+    "severity": "medium",
+    "what_it_checks": "Guard daemon state file exists, is valid JSON, and is not older than 3 seconds (STALE_AFTER_MS=3000)",
+    "failure_symptom": "auto_enforce returns daemon_state_stale; resource enforcement disabled during critical operations; no resource admission control",
+    "likely_causes": [
+      "guard daemon process crashed or was killed without cleanup",
+      "system clock skew or large time adjustment",
+      "guard_state.json manually deleted or corrupted (truncated JSON)",
+      "daemon still running but not updating state file (hung process)",
+      "store_dir env var differs between daemon startup and read attempt"
+    ],
+    "fix_steps": [
+      "Check daemon running: ps aux | grep 'guard-daemon\\|guard_daemon_host'",
+      "Check state file: cat ~/.local/share/cluxion-agentplugin-preprocessing/queue/guard_state.json | python -m json.tool",
+      "Check timestamp: python -c 'import json, time; s = json.load(open(\"<path>/guard_state.json\")); print(f\"Age: {int(time.time()*1000) - s.get(\\\"updated_at_ms\\\", 0)}ms\")'",
+      "Stop and restart daemon: python -c 'from cluxion_runtime.resources.guard_bridge import stop_daemon, start_daemon; stop_daemon(); start_daemon()'",
+      "Verify store_dir consistency: unset CLUXION_QUEUE_STORE_DIR && check state file location",
+      "Check system time: date && timedatectl (or ntpq -p on some systems)",
+      "Clean state and restart: rm ~/.local/share/cluxion-agentplugin-preprocessing/queue/guard_state.json && restart guard"
+    ],
+    "change_robust": "Log state age in auto_enforce; add daemon heartbeat check; verify timestamp updates in integration tests",
+    "detection_method": "python -c 'from cluxion_runtime.resources import guard_bridge; import time; state = guard_bridge.read_daemon_state(); assert state is not None, \"No state\"; assert not state.get(\"stale\", True), \"State is stale\"; print(f\"Age: {int(time.time()*1000) - state.get(\"updated_at_ms\", 0)}ms\")'"
+  },
+  {
+    "check_id": "hermes_plugin_enabled",
+    "category": "config",
+    "severity": "critical",
+    "what_it_checks": "Hermes config.yaml has cluxion-agentplugin-preprocessing or hermes-cluxion in plugins.enabled and not in plugins.disabled",
+    "failure_symptom": "cluxion_plan, cluxion_queue_*, cluxion_guard, cluxion_web_* tools missing from Hermes UI; RuntimeError: 'no tools available'",
+    "likely_causes": [
+      "Plugin installation did not trigger entry point registration",
+      "config.yaml plugins section missing or malformed YAML",
+      "Both PLUGIN_NAME and LEGACY_PLUGIN_NAME in disabled list",
+      "hermes-cluxion plugin was disabled but not re-enabled after package upgrade",
+      "config.yaml points to old entry point name before rename"
+    ],
+    "fix_steps": [
+      "Check Hermes home: echo $HERMES_HOME (or ~/.hermes/config.yaml)",
+      "Check plugin status: python -c 'from cluxion_agentplugin_preprocessing.hermes_config import plugin_status; print(plugin_status().to_dict())'",
+      "Enable plugin: python -c 'from cluxion_agentplugin_preprocessing.hermes_config import enable_plugin; result = enable_plugin(); print(result.to_dict())'",
+      "Verify entry point: pip show cluxion-agentplugin-preprocessing | grep 'Entry-points\\|Location'",
+      "Restart Hermes: (depends on Hermes startup method, typically hermes restart or kill/relaunch)",
+      "Check config YAML syntax: python -c 'import yaml; yaml.safe_load(open(\"~/.hermes/config.yaml\"))'",
+      "Check for both old and new names in config: grep -E 'hermes-cluxion|cluxion-agentplugin-preprocessing' ~/.hermes/config.yaml"
+    ],
+    "change_robust": "Check both PLUGIN_NAME and LEGACY_PLUGIN_NAME in enabled/disabled lists; verify entry point resolution via importlib.metadata",
+    "detection_method": "python -c 'from cluxion_agentplugin_preprocessing.hermes_config import plugin_status; result = plugin_status(); assert result.enabled, f\"Plugin not enabled: {result}\"'"
+  },
+  {
+    "check_id": "clarification_answers_present",
+    "category": "data",
+    "severity": "medium",
+    "what_it_checks": "When clarification is required, clarification_answers are provided in work item metadata before queueing",
+    "failure_symptom": "Work queued without clarification answers; plan tool returns ready_for_queue=False but agent proceeds anyway; user intent is misinterpreted",
+    "likely_causes": [
+      "Host agent ignores clarification.required=True and calls queue_next anyway",
+      "clarification_answers metadata field not populated by host after asking user",
+      "User response not serialized into metadata before retry",
+      "ambiguous keywords missed by detector (new keywords in prompt)"
+    ],
+    "fix_steps": [
+      "Check plan output: run cluxion_plan and inspect ready_for_queue, required, questions fields",
+      "If clarification required, verify questions are presented to user",
+      "Capture user response: update work item metadata['clarification_answers'] = <user_response>",
+      "Retry plan: call cluxion_plan again with updated item",
+      "Check for low-confidence signals: intent.confidence < 0.62 means direction confirmation needed",
+      "Review ambiguous keyword list: see _AMBIGUOUS_KEYWORDS in src/cluxion_runtime/core/clarification.py",
+      "Test with low-confidence prompt: python -c '... item.prompt=\"maybe implement this\"' (triggers intent_direction question)"
+    ],
+    "change_robust": "Detector is deterministic; keywords are hardcoded with both English and Korean variants; extend _AMBIGUOUS_KEYWORDS if new patterns found; verify confidence threshold matches Hermes risk tolerance",
+    "detection_method": "python -c 'from cluxion_runtime.core.clarification import assess_clarification; from cluxion_runtime.core.types import WorkItem, WorkIntent, AgentSurface; item = WorkItem(work_id=\"test\", prompt=\"maybe fix all\", surface=AgentSurface.HERMES, metadata={}); intent = WorkIntent(category=\"engineering\", operation=\"fix\", local_model_requested=False, direction=\"coding\", confidence=0.5); result = assess_clarification(item, intent); print(f\"Clarification required: {result.required}, Ready: {result.ready_for_queue}\")'"
+  },
+  {
+    "check_id": "playwright_optional_available",
+    "category": "resource",
+    "severity": "low",
+    "what_it_checks": "Playwright is available (optional) for browser tools; if missing, web_search and browser_* tools fail gracefully with helpful error",
+    "failure_symptom": "cluxion_web_search and cluxion_browser_* tools hang or return vague error; user cannot use browser features",
+    "likely_causes": [
+      "cluxion-agentplugin-preprocessing not installed with [browser] extra: pip install cluxion-agentplugin-preprocessing (missing bracket)",
+      "playwright package installed but browsers (chromium) not: playwright install",
+      "Chrome not running and playwright cannot spawn headless browser (Xvfb missing on Linux)",
+      "Remote debugging port 9222 blocked or Chrome not listening",
+      "playwright version incompatible with Python 3.11/3.12"
+    ],
+    "fix_steps": [
+      "Install with browser support: pip install 'cluxion-agentplugin-preprocessing[browser]'",
+      "Install playwright browsers: playwright install chromium",
+      "Test playwright: python -c 'from playwright.sync_api import sync_playwright; with sync_playwright() as p: print(\"OK\")'",
+      "For remote Chrome: start chrome --remote-debugging-port=9222 before using browser tools",
+      "Check Xvfb on Linux headless: apt-get install xvfb (or equivalent)",
+      "Verify playwright version: pip show playwright | grep Version",
+      "Test search without playwright: python -c 'from cluxion_runtime.web.browser_bridge import search; print(search(\"test\"))'",
+      "Use only non-browser tools if playwright unavailable (search, context_compress, guard, queue_*)"
+    ],
+    "change_robust": "Tool check_fn returns True even if playwright missing (tools degrade gracefully); test browser_bridge with/without playwright installed",
+    "detection_method": "python -c 'try:\n import playwright\n print(\"Playwright available\")\nexcept ImportError:\n from cluxion_runtime.web.browser_bridge import search\n result = search(\"test\")\n assert not result.get(\"ok\"), \"Should fail without playwright\"\n assert result.get(\"error\") in (\"playwright_required\", \"browser_unavailable\"), result'"
+  },
+  {
+    "check_id": "runtime_binary_accessible",
+    "category": "runtime",
+    "severity": "high",
+    "what_it_checks": "cluxion-runtime CLI binary is in PATH or can be found via CLUXION_RUNTIME_BIN env var",
+    "failure_symptom": "All cluxion_* tools fail with subprocess.CalledProcessError; Hermes tools return error 'cluxion-runtime not found'; fallback to in-process execution (if _runtime_module_available) succeeds",
+    "likely_causes": [
+      "cluxion-agentplugin-preprocessing package installed but not in editable/development mode, so cluxion-runtime script not created",
+      "Virtual environment not activated when calling Hermes",
+      "CLUXION_RUNTIME_BIN env var set to wrong path",
+      "cluxion-runtime entry point broken (package not installed correctly)",
+      "Path corruption or subprocess PATH not inherited from parent shell"
+    ],
+    "fix_steps": [
+      "Check binary location: which cluxion-runtime",
+      "Check env var: echo $CLUXION_RUNTIME_BIN (if set, verify file exists: file $CLUXION_RUNTIME_BIN)",
+      "Reinstall in development mode: pip install -e /path/to/cluxion-Agentplugin-preprocessing",
+      "Verify entry point: pip show cluxion-agentplugin-preprocessing | grep Entry-points",
+      "Test directly: python -c 'from cluxion_agentplugin_preprocessing.runner import runtime_available; print(runtime_available())'",
+      "Check PATH: echo $PATH | tr ':' '\\n'",
+      "Test subprocess directly: python -c 'import subprocess; subprocess.run([\"cluxion-runtime\", \"--help\"], check=True)'"
+    ],
+    "change_robust": "Runtime availability is probed lazily (only when tool is called); add startup health check to Hermes plugin init",
+    "detection_method": "python -c 'from cluxion_agentplugin_preprocessing.runner import runtime_available; assert runtime_available(), \"cluxion-runtime not available\"'"
+  },
+  {
+    "check_id": "psutil_importable",
+    "category": "install",
+    "severity": "medium",
+    "what_it_checks": "psutil module is installed and functional (required fallback for guard daemon resource sampling)",
+    "failure_symptom": "Guard resource sampling fails; ResourceSnapshot collection returns zero/invalid values; capacity_decision admission always deferred",
+    "likely_causes": [
+      "psutil not installed (not in dependencies)",
+      "psutil module exists but extensions (.so files) corrupted or wrong architecture",
+      "System does not support required psutil calls (very rare)"
+    ],
+    "fix_steps": [
+      "Check installation: pip show psutil",
+      "Reinstall: pip install --force-reinstall psutil",
+      "Test import: python -c 'import psutil; print(psutil.virtual_memory())'",
+      "Verify cluxion-agentplugin-preprocessing dependencies: pip show cluxion-agentplugin-preprocessing | grep Requires",
+      "Check Python version: psutil requires Python 3.5+, verify python --version"
+    ],
+    "change_robust": "psutil is a core dependency; add to pyproject.toml requires list for all Python versions",
+    "detection_method": "python -c 'import psutil; m = psutil.virtual_memory(); s = psutil.swap_memory(); c = psutil.cpu_percent(); assert m.total > 0 and isinstance(c, float), \"psutil broken\"'"
+  },
+  {
+    "check_id": "pyyaml_importable",
+    "category": "install",
+    "severity": "medium",
+    "what_it_checks": "PyYAML module is installed and can parse config.yaml",
+    "failure_symptom": "hermes_config tool fails when reading/writing config.yaml; plugin enable/disable operations crash",
+    "likely_causes": [
+      "PyYAML not installed",
+      "PyYAML C extension (.so) corrupted",
+      "config.yaml has invalid YAML syntax (tabs instead of spaces, etc.)"
+    ],
+    "fix_steps": [
+      "Check installation: pip show PyYAML",
+      "Reinstall: pip install --force-reinstall PyYAML",
+      "Test import: python -c 'import yaml; yaml.safe_load(\"test: 1\")'",
+      "Validate config.yaml: python -c 'import yaml; yaml.safe_load(open(\"~/.hermes/config.yaml\"))'",
+      "Check YAML syntax: yamllint ~/.hermes/config.yaml (if yamllint available)"
+    ],
+    "change_robust": "PyYAML is in dependencies; version constraint is >=6.0; test config parsing in plugin tests",
+    "detection_method": "python -c 'import yaml; yaml.safe_load(\"test: value\"); print(\"OK\")'"
+  },
+  {
+    "check_id": "abi3_wheel_compatible",
+    "category": "native_backend",
+    "severity": "high",
+    "what_it_checks": "Native module wheel is built with abi3 (stable ABI) tag compatible with current Python interpreter",
+    "failure_symptom": "ImportError: cannot import name 'run' from 'cluxion_queue_native'; module loads but functions missing",
+    "likely_causes": [
+      "Wheel downloaded/built for Python 3.11 but running 3.12 (or vice versa) and stable ABI not used",
+      "cluxion_queue/pyproject.toml does not use pyo3 abi3 feature",
+      "maturin build version mismatch (<1.7 or >=2.0)",
+      "Wheel built on macOS x86_64 but running on arm64 (M1/M2 Mac) or vice versa"
+    ],
+    "fix_steps": [
+      "Check Python version and SOABI: python -c 'import sysconfig; print(f\"{sysconfig.get_python_version()} {sysconfig.get_config_var(\\\"SOABI\\\")}\")' ",
+      "Verify abi3 in Cargo.toml: grep 'abi3' /path/to/cluxion_queue/Cargo.toml",
+      "Check built wheel tags: pip show cluxion-queue-native | grep -A5 Location, then unzip -l <whl> | grep .so",
+      "Rebuild: cd rust/cluxion_queue && maturin develop --release",
+      "Force download correct wheel: pip install --force-reinstall --no-cache-dir cluxion-agentplugin-preprocessing",
+      "Check architecture: python -c 'import platform; print(platform.machine())'  (must match wheel filename)"
+    ],
+    "change_robust": "Verify abi3 feature in Cargo.toml remains pinned; test wheel upload includes both arm64 and x86_64 variants for macOS",
+    "detection_method": "python -c 'import sysconfig; print(sysconfig.get_config_var(\"SOABI\")); from cluxion_queue_native import __backend__; assert __backend__ == \"rust_native\"'"
+  },
+  {
+    "check_id": "fcntl_available_on_posix",
+    "category": "config",
+    "severity": "medium",
+    "what_it_checks": "fcntl module is available on POSIX systems (not Windows native); advisory file locking works",
+    "failure_symptom": "Concurrent dispatch bundle updates cause JSON corruption or lost writes; multiple Hermes instances on same dispatch dir race",
+    "likely_causes": [
+      "Running on Windows without WSL2 (fcntl is Unix-only)",
+      "NFS mount with broken fcntl support (returns success but doesn't actually lock)",
+      "SELinux/AppArmor denying file locks",
+      "In-memory filesystem (tmpfs) issues with lock granularity"
+    ],
+    "fix_steps": [
+      "Check if fcntl available: python -c 'import fcntl; print(\"OK\")'",
+      "On Windows, use WSL2 or switch dispatch_dir to Windows path and accept lack of locking (document risk)",
+      "On NFS, verify mount options: mount | grep dispatch-dir-path | grep actimeo,timeo (good NFS cache settings)",
+      "Test lock manually: python -c 'import fcntl; open(\\\"/tmp/.test_lock\\\", \\\"a+b\\\") as f: fcntl.flock(f.fileno(), fcntl.LOCK_EX); print(\\\"Locked\\\"); fcntl.flock(f.fileno(), fcntl.LOCK_UN)'",
+      "If NFS broken, override dispatch to local SSD: CLUXION_PREPROCESS_DISPATCH_DIR=/mnt/local-nvme/dispatch cluxion-runtime ..."
+    ],
+    "change_robust": "Code gracefully skips locking on non-POSIX; document that NFS users need proper mount options; test fcntl availability in pre-flight checks",
+    "detection_method": "python -c 'import sys; import os; from pathlib import Path; test_lock = Path(\"/tmp/.fcntl_test\"); test_lock.touch(); import fcntl; f = open(test_lock, \"a+b\"); fcntl.flock(f.fileno(), fcntl.LOCK_EX); fcntl.flock(f.fileno(), fcntl.LOCK_UN); f.close(); test_lock.unlink()'"
+  },
+  {
+    "check_id": "env_var_consistency",
+    "category": "config",
+    "severity": "medium",
+    "what_it_checks": "Environment variables for queue store, dispatch dir, runtime venv are consistent across daemon lifecycle and do not conflict",
+    "failure_symptom": "Work queued in one store but dispatch bundles in another; daemon reads from different directory than client; inconsistent state",
+    "likely_causes": [
+      "CLUXION_QUEUE_STORE_DIR and CLUXION_PREPROCESS_DISPATCH_DIR both set but to incompatible paths",
+      "Guard daemon started with one CLUXION_QUEUE_STORE_DIR but client code calls with different value",
+      "Legacy env vars (HERMES_CLUXION_*) and new vars (CLUXION_*) both set, fallback logic picks wrong one",
+      "Parent shell sets env var but subprocess inherits different value (PATH modification)"
+    ],
+    "fix_steps": [
+      "Print all relevant env vars: env | grep CLUXION; env | grep HERMES_CLUXION",
+      "If using non-defaults, verify consistency: CLUXION_QUEUE_STORE_DIR must be used everywhere; don't mix with HERMES_CLUXION_*",
+      "Check daemon startup: ps aux | grep guard-daemon and check arguments",
+      "Unset legacy vars: unset HERMES_CLUXION_DISPATCH_DIR HERMES_CLUXION_RUNTIME_VENV (if using new vars)",
+      "Test consistency: python -c 'import os; os.environ[\"CLUXION_QUEUE_STORE_DIR\"]=\"/custom\"; from cluxion_runtime.resources.queue_bridge import default_store_dir; print(default_store_dir())'",
+      "For multi-process systems, document env setup in startup scripts; verify all processes export same vars"
+    ],
+    "change_robust": "Fallback logic prefers new CLUXION_* over legacy HERMES_CLUXION_*; add startup trace logging to show resolved paths",
+    "detection_method": "python -c 'import os; from cluxion_runtime.resources import queue_bridge; from cluxion_runtime.core.dispatch_store import default_dispatch_dir; qstore = queue_bridge.default_store_dir(); dstore = default_dispatch_dir(); print(f\"Queue: {qstore}\"); print(f\"Dispatch: {dstore}\"); assert qstore.parent != dstore.parent or \"queue\" not in str(dstore), \"Paths should not collide\"'"
+  },
+  {
+    "check_id": "sqlite_wal_mode_compatible",
+    "category": "data",
+    "severity": "medium",
+    "what_it_checks": "SQLite WAL (Write-Ahead Logging) mode works correctly for queue database; locks are not permanently held",
+    "failure_symptom": "Queue operations deadlock or timeout; two Hermes instances trying to dequeue hit 'database is locked'; WAL files accumulate (.sqlite-wal, .sqlite-shm)",
+    "likely_causes": [
+      "SQLite version <3.10 doesn't support WAL properly",
+      "WAL files on network filesystem (NFS) causing sync issues",
+      "Multiple concurrent dequeue operations without proper transaction isolation",
+      "Database corruption from power loss (WAL checkpoint failed)"
+    ],
+    "fix_steps": [
+      "Check SQLite version: python -c 'import sqlite3; print(sqlite3.sqlite_version)'",
+      "Test WAL mode: python -c 'import sqlite3; conn = sqlite3.connect(\":memory:\"); print(conn.execute(\"PRAGMA journal_mode=WAL\").fetchone())'",
+      "Check queue database journal mode: python -c 'from cluxion_runtime.resources.py_queue import _open_db; from pathlib import Path; conn = _open_db(Path.home() / \\\".local/share/cluxion-agentplugin-preprocessing/queue\\\"); print(conn.execute(\\\"PRAGMA journal_mode\\\").fetchone())'",
+      "Clean up WAL files if stuck: rm ~/.local/share/cluxion-agentplugin-preprocessing/queue/*.sqlite-wal ~/.local/share/cluxion-agentplugin-preprocessing/queue/*.sqlite-shm",
+      "If on NFS, disable WAL: in py_queue.py set journal_mode=TRUNCATE instead (slower but safer)",
+      "Verify database integrity: python -c 'import sqlite3; conn = sqlite3.connect(\\\"<dbpath>\\\"); result = conn.execute(\\\"PRAGMA integrity_check\\\").fetchone(); print(result)'"
+    ],
+    "change_robust": "Test WAL mode in py_queue tests; add database integrity check on startup; log journal_mode at init time",
+    "detection_method": "python -c 'from pathlib import Path; from cluxion_runtime.resources.py_queue import _open_db; import tempfile; tmpdir = Path(tempfile.mkdtemp()); conn = _open_db(tmpdir); pragma_mode = conn.execute(\"PRAGMA journal_mode\").fetchone()[0]; assert pragma_mode.upper() == \"WAL\", f\"Expected WAL, got {pragma_mode}\"; conn.close()'"
+  },
+  {
+    "check_id": "json_serialization_deterministic",
+    "category": "data",
+    "severity": "low",
+    "what_it_checks": "JSON serialization is deterministic (sort_keys=True) so checksums/fingerprints match across runs",
+    "failure_symptom": "Dispatch bundle checksums don't match on re-read; context compression produces different output for identical input",
+    "likely_causes": [
+      "Code path not using sort_keys=True when serializing bundles/context",
+      "Python dict iteration order difference (unlikely on 3.7+ but possible in edge cases)",
+      "Floating point precision differences in timestamps or metrics"
+    ],
+    "fix_steps": [
+      "Check all json.dumps calls: grep -r 'json.dumps' src/ --include='*.py' | grep -v sort_keys",
+      "Audit dispatch_store.py and context_compress.py for determinism",
+      "Test round-trip: python -c 'import json; d = {\"z\":1, \"a\":2}; s1 = json.dumps(d, sort_keys=True); d2 = json.loads(s1); s2 = json.dumps(d2, sort_keys=True); assert s1 == s2'",
+      "Add checksums to test fixtures to catch non-determinism early"
+    ],
+    "change_robust": "Enforce sort_keys=True in all queue/dispatch serialization; add docstring reminding of determinism requirement",
+    "detection_method": "python -c 'import json; d = {\"z\": 1, \"a\": 2}; j1 = json.dumps(d, sort_keys=True); j2 = json.dumps(d, sort_keys=True); assert j1 == j2, f\"{j1} != {j2}\"'"
+  },
+  {
+    "check_id": "temp_file_cleanup",
+    "category": "resource",
+    "severity": "low",
+    "what_it_checks": "Temporary files created during atomic writes (dispatch store, py_queue) are cleaned up on failure or success",
+    "failure_symptom": "Dispatch dir fills with tmp* files on repeated failures; disk usage grows unbounded; tmpfs fills up on systems with small /tmp",
+    "likely_causes": [
+      "NamedTemporaryFile exceptions not caught; temp file not cleaned up on write failure",
+      "os.fsync() call fails but exception not handled",
+      "path.replace() (atomic rename) fails, leaving temp file orphaned",
+      "Power loss during atomic write leaves tmpfile"
+    ],
+    "fix_steps": [
+      "Check dispatch dir for temp files: ls -la ~/.local/share/cluxion-agentplugin-preprocessing/queue/dispatch/ | grep tmp",
+      "Remove stale temps: find ~/.local/share/cluxion-agentplugin-preprocessing/queue/dispatch -name 'tmp*' -mtime +1 -delete",
+      "Review _atomic_write_json and py_queue._write_atomic for proper exception handling",
+      "Test failure mode: python -c 'import os; os.chmod(dispatch_dir, 0o444); try: _atomic_write_json(...); except: pass; print(list(dispatch_dir.glob(\\\"tmp*\\\")))'",
+      "Add cleanup context manager: ensure tempfile.unlink() on exception"
+    ],
+    "change_robust": "All atomic write calls must use try/finally or context manager for cleanup; add integration test for write failure scenarios",
+    "detection_method": "python -c 'from pathlib import Path; import tempfile; tmpdir = Path(tempfile.mkdtemp()); from cluxion_runtime.core.dispatch_store import _atomic_write_json; test_path = tmpdir / \\\"test.json\\\"; _atomic_write_json(test_path, {\\\"test\\\": 1}); temp_files = list(tmpdir.glob(\\\"tmp*\\\")); assert len(temp_files) == 0, f\\\"Leftover temps: {temp_files}\\\"'"
+  }
+]

@@ -44,6 +44,7 @@ def test_register_adds_expected_tools() -> None:
         "cluxion_browser_type",
         "cluxion_clarify",
         "cluxion_context_compress",
+        "cluxion_doctor",
         "cluxion_guard",
         "cluxion_hermes_config",
         "cluxion_plan",
@@ -63,9 +64,20 @@ def test_handler_returns_json_error_for_missing_model() -> None:
 
     result = handler({})
     payload = json.loads(result)
-
     assert payload["ok"] is False
     assert "model is required" in payload["error"]
+
+
+def test_handler_returns_json_error_for_type_error() -> None:
+    ctx = FakeContext()
+    plugin.register(ctx)
+    handler = ctx.tools["cluxion_serve_local"]["handler"]
+
+    # Passing None for args (as model might) triggers TypeError inside wrapped handler
+    result = handler(None)
+    payload = json.loads(result)
+    assert payload["ok"] is False
+    assert isinstance(payload["error"], str)
 
 
 def test_directory_plugin_wrapper_exports_register() -> None:
