@@ -12,8 +12,16 @@ import json
 import os
 import sqlite3
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - exercised only on non-POSIX platforms.
+    _fcntl = None
 
 
 def run(command: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -41,10 +49,11 @@ def _default_store() -> str:
 
 def _open_db(store_dir: Path) -> sqlite3.Connection:
     store_dir.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(store_dir / "work_queue.sqlite")
+    conn = sqlite3.connect(store_dir / "work_queue.sqlite", timeout=30.0)
     conn.executescript(
         """
         PRAGMA journal_mode=WAL;
+        -- NORMAL+WAL can lose the latest commit on OS crash, but avoids corruption and keeps queue throughput balanced.
         PRAGMA synchronous=NORMAL;
         CREATE TABLE IF NOT EXISTS work_queue (
             work_id TEXT PRIMARY KEY,
@@ -62,6 +71,10 @@ def _open_db(store_dir: Path) -> sqlite3.Connection:
         """
     )
     return conn
+
+
+def _begin_immediate(conn: sqlite3.Connection) -> None:
+    conn.execute("BEGIN IMMEDIATE")
 
 
 def _ok(data: dict[str, Any]) -> dict[str, Any]:
@@ -83,6 +96,7 @@ def _enqueue(store_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
     metadata_json = json.dumps(payload.get("metadata", {}), ensure_ascii=False)
     now = time.time()
     with _open_db(store_dir) as conn:
+        _begin_immediate(conn)
         sequence = conn.execute("SELECT COALESCE(MAX(sequence), 0) + 1 FROM work_queue").fetchone()[0]
         conn.execute(
             """INSERT INTO work_queue (work_id, prompt, surface, priority, status, metadata_json, sequence, created_at, updated_at)
@@ -99,6 +113,7 @@ def _enqueue(store_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
 def _dequeue(store_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
     now = time.time()
     with _open_db(store_dir) as conn:
+        _begin_immediate(conn)
         row = conn.execute(
             """SELECT work_id, prompt, surface, priority, metadata_json FROM work_queue
                WHERE status = 'pending' ORDER BY priority ASC, sequence ASC LIMIT 1"""
@@ -165,9 +180,13 @@ def _read_bundle(path: Path) -> dict[str, Any]:
 
 def _write_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(".json.tmp")
-    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temp.rename(path)
+    with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        temporary = Path(handle.name)
+    temporary.replace(path)
 
 
 def _steps(bundle: dict[str, Any]) -> list[dict[str, Any]]:
@@ -186,7 +205,8 @@ def _persist(store_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
     if "bundle" not in payload:
         raise RuntimeError("missing bundle")
     path = _bundle_path(store_dir, work_id)
-    _write_atomic(path, payload["bundle"])
+    with _exclusive_bundle_lock(path):
+        _write_atomic(path, payload["bundle"])
     return _ok({"stored": True, "path": str(path)})
 
 
@@ -207,31 +227,32 @@ def _public_step(step: dict[str, Any]) -> dict[str, Any]:
 def _next_step(store_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
     work_id = _require_str(payload, "work_id")
     path = _bundle_path(store_dir, work_id)
-    bundle = _read_bundle(path)
-    steps = _steps(bundle)
-    for step in steps:
-        if step.get("status") in ("queued", "retry_wait"):
-            step["status"] = "running"
-            step["updated_at"] = time.time()
-            _write_atomic(path, bundle)
-            return _ok(
-                {
-                    "work_id": work_id,
-                    "ready": True,
-                    "step": _public_step(step),
-                    "remaining": _remaining(steps),
-                    "synthesis_ready": False,
-                }
-            )
-    return _ok(
-        {
-            "work_id": work_id,
-            "ready": False,
-            "step": {},
-            "remaining": _remaining(steps),
-            "synthesis_ready": all(s.get("status") == "succeeded" for s in steps),
-        }
-    )
+    with _exclusive_bundle_lock(path):
+        bundle = _read_bundle(path)
+        steps = _steps(bundle)
+        for step in steps:
+            if step.get("status") in ("queued", "retry_wait"):
+                step["status"] = "running"
+                step["updated_at"] = time.time()
+                _write_atomic(path, bundle)
+                return _ok(
+                    {
+                        "work_id": work_id,
+                        "ready": True,
+                        "step": _public_step(step),
+                        "remaining": _remaining(steps),
+                        "synthesis_ready": False,
+                    }
+                )
+        return _ok(
+            {
+                "work_id": work_id,
+                "ready": False,
+                "step": {},
+                "remaining": _remaining(steps),
+                "synthesis_ready": all(s.get("status") == "succeeded" for s in steps),
+            }
+        )
 
 
 def _record_step(store_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
@@ -239,26 +260,43 @@ def _record_step(store_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
     step_id = _require_str(payload, "step_id")
     failed = bool(payload.get("failed", False))
     path = _bundle_path(store_dir, work_id)
-    bundle = _read_bundle(path)
-    steps = _steps(bundle)
-    for step in steps:
-        if step.get("step_id") == step_id:
-            step["status"] = "failed" if failed else "succeeded"
-            step["result"] = payload.get("result", "")
-            step["error"] = payload.get("error", "")
-            step["updated_at"] = time.time()
-            _write_atomic(path, bundle)
-            return _ok(
-                {
-                    "work_id": work_id,
-                    "step_id": step_id,
-                    "recorded": True,
-                    "status": step["status"],
-                    "remaining": _remaining(steps),
-                    "synthesis_ready": all(s.get("status") == "succeeded" for s in steps),
-                }
-            )
+    with _exclusive_bundle_lock(path):
+        bundle = _read_bundle(path)
+        steps = _steps(bundle)
+        for step in steps:
+            if step.get("step_id") == step_id:
+                step["status"] = "failed" if failed else "succeeded"
+                step["result"] = payload.get("result", "")
+                step["error"] = payload.get("error", "")
+                step["updated_at"] = time.time()
+                _write_atomic(path, bundle)
+                return _ok(
+                    {
+                        "work_id": work_id,
+                        "step_id": step_id,
+                        "recorded": True,
+                        "status": step["status"],
+                        "remaining": _remaining(steps),
+                        "synthesis_ready": all(s.get("status") == "succeeded" for s in steps),
+                    }
+                )
     raise RuntimeError(f"dispatch step not found: {work_id}/{step_id}")
+
+
+@contextmanager
+def _exclusive_bundle_lock(path: Path) -> Iterator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if _fcntl is None:
+        # Non-POSIX platforms keep atomic rename but skip advisory locking.
+        yield
+        return
+    lock_path = path.with_name(f"{path.name}.lock")
+    with lock_path.open("a+b") as lock_file:
+        _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_UN)
 
 
 def _brief(store_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:

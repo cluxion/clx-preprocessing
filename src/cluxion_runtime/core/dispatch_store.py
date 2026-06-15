@@ -5,10 +5,17 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import TYPE_CHECKING
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - exercised only on non-POSIX platforms.
+    _fcntl = None
 
 if TYPE_CHECKING:
     from cluxion_runtime.core.types import HarnessPlan, QueueSegment
@@ -63,48 +70,43 @@ def persist_dispatch_bundle(plan: HarnessPlan, *, dispatch_dir: Path | None = No
             pass
     target_dir.mkdir(parents=True, exist_ok=True)
     path = _bundle_path(plan.item.work_id, target_dir)
-    _atomic_write_json(path, bundle)
+    with _exclusive_bundle_lock(path):
+        _atomic_write_json(path, bundle)
     return path
 
 
 def load_dispatch_bundle(work_id: str, *, dispatch_dir: Path | None = None) -> dict[str, object]:
     """Read the dispatch bundle for a work_id."""
     path = _bundle_path(work_id, default_dispatch_dir() if dispatch_dir is None else dispatch_dir)
-    if not path.exists():
-        raise DispatchStoreError(f"dispatch bundle not found: {work_id}")
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise DispatchStoreError(f"dispatch bundle is invalid JSON: {work_id}") from exc
-    if not isinstance(payload, dict):
-        raise DispatchStoreError(f"dispatch bundle must be an object: {work_id}")
-    return payload
+    return _load_dispatch_bundle_from_path(path, work_id)
 
 
 def next_dispatch_step(work_id: str, *, dispatch_dir: Path | None = None) -> dict[str, object]:
     """Mark the next queued segment as running and return the payload for Hermes."""
     target_dir = default_dispatch_dir() if dispatch_dir is None else dispatch_dir
-    bundle = load_dispatch_bundle(work_id, dispatch_dir=target_dir)
-    steps = _steps(bundle)
-    for step in steps:
-        if step.get("status") in {"queued", "retry_wait"}:
-            step["status"] = "running"
-            step["updated_at"] = time.time()
-            _atomic_write_json(_bundle_path(work_id, target_dir), bundle)
-            return {
-                "work_id": work_id,
-                "ready": True,
-                "step": _public_step(step),
-                "remaining": _remaining_count(steps),
-                "synthesis_ready": False,
-            }
-    return {
-        "work_id": work_id,
-        "ready": False,
-        "step": {},
-        "remaining": _remaining_count(steps),
-        "synthesis_ready": all(step.get("status") == "succeeded" for step in steps),
-    }
+    path = _bundle_path(work_id, target_dir)
+    with _exclusive_bundle_lock(path):
+        bundle = _load_dispatch_bundle_from_path(path, work_id)
+        steps = _steps(bundle)
+        for step in steps:
+            if step.get("status") in {"queued", "retry_wait"}:
+                step["status"] = "running"
+                step["updated_at"] = time.time()
+                _atomic_write_json(path, bundle)
+                return {
+                    "work_id": work_id,
+                    "ready": True,
+                    "step": _public_step(step),
+                    "remaining": _remaining_count(steps),
+                    "synthesis_ready": False,
+                }
+        return {
+            "work_id": work_id,
+            "ready": False,
+            "step": {},
+            "remaining": _remaining_count(steps),
+            "synthesis_ready": all(step.get("status") == "succeeded" for step in steps),
+        }
 
 
 def record_dispatch_result(
@@ -118,23 +120,25 @@ def record_dispatch_result(
 ) -> dict[str, object]:
     """Store the segment result produced by the Hermes model."""
     target_dir = default_dispatch_dir() if dispatch_dir is None else dispatch_dir
-    bundle = load_dispatch_bundle(work_id, dispatch_dir=target_dir)
-    steps = _steps(bundle)
-    for step in steps:
-        if step.get("step_id") == step_id:
-            step["status"] = "succeeded" if succeeded else "failed"
-            step["result"] = result
-            step["error"] = error
-            step["updated_at"] = time.time()
-            _atomic_write_json(_bundle_path(work_id, target_dir), bundle)
-            return {
-                "work_id": work_id,
-                "step_id": step_id,
-                "recorded": True,
-                "status": step["status"],
-                "remaining": _remaining_count(steps),
-                "synthesis_ready": all(item.get("status") == "succeeded" for item in steps),
-            }
+    path = _bundle_path(work_id, target_dir)
+    with _exclusive_bundle_lock(path):
+        bundle = _load_dispatch_bundle_from_path(path, work_id)
+        steps = _steps(bundle)
+        for step in steps:
+            if step.get("step_id") == step_id:
+                step["status"] = "succeeded" if succeeded else "failed"
+                step["result"] = result
+                step["error"] = error
+                step["updated_at"] = time.time()
+                _atomic_write_json(path, bundle)
+                return {
+                    "work_id": work_id,
+                    "step_id": step_id,
+                    "recorded": True,
+                    "status": step["status"],
+                    "remaining": _remaining_count(steps),
+                    "synthesis_ready": all(item.get("status") == "succeeded" for item in steps),
+                }
     raise DispatchStoreError(f"dispatch step not found: {work_id}/{step_id}")
 
 
@@ -244,6 +248,34 @@ def _bundle_path(work_id: str, dispatch_dir: Path) -> Path:
     if not safe:
         raise DispatchStoreError("work_id is empty")
     return dispatch_dir / f"{safe}.json"
+
+
+def _load_dispatch_bundle_from_path(path: Path, work_id: str) -> dict[str, object]:
+    if not path.exists():
+        raise DispatchStoreError(f"dispatch bundle not found: {work_id}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise DispatchStoreError(f"dispatch bundle is invalid JSON: {work_id}") from exc
+    if not isinstance(payload, dict):
+        raise DispatchStoreError(f"dispatch bundle must be an object: {work_id}")
+    return payload
+
+
+@contextmanager
+def _exclusive_bundle_lock(path: Path) -> Iterator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if _fcntl is None:
+        # Non-POSIX platforms keep atomic rename but skip advisory locking.
+        yield
+        return
+    lock_path = path.with_name(f"{path.name}.lock")
+    with lock_path.open("a+b") as lock_file:
+        _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_UN)
 
 
 def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:

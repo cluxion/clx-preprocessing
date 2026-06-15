@@ -1,0 +1,160 @@
+"""Concurrency coverage for the pure-Python queue fallback."""
+
+from __future__ import annotations
+
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from cluxion_runtime.resources import py_queue
+
+_RACE_TIMEOUT_SECONDS = 0.25
+
+
+def _run_concurrently(worker_count: int, worker) -> list[object]:
+    start = threading.Barrier(worker_count)
+
+    def run(index: int) -> object:
+        start.wait()
+        return worker(index)
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        return list(executor.map(run, range(worker_count)))
+
+
+def _bundle(step_count: int) -> dict[str, Any]:
+    return {
+        "work_id": "py-race",
+        "steps": [
+            {
+                "step_id": f"s{index}",
+                "segment_id": f"g{index}",
+                "checksum": f"c{index}",
+                "token_estimate": 10,
+                "content": f"segment {index}",
+                "status": "queued",
+                "result": "",
+                "error": "",
+            }
+            for index in range(step_count)
+        ],
+    }
+
+
+def _store_payload(store_dir: Path, **payload: Any) -> dict[str, Any]:
+    return {"store_dir": str(store_dir), **payload}
+
+
+def _dispatch_bundle_path(store_dir: Path, work_id: str) -> Path:
+    return store_dir / "dispatch" / f"{work_id}.json"
+
+
+def _read_dispatch_bundle(store_dir: Path, work_id: str) -> dict[str, Any]:
+    return json.loads(_dispatch_bundle_path(store_dir, work_id).read_text(encoding="utf-8"))
+
+
+def _stall_bundle_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_write = py_queue._write_atomic
+    write_barrier = threading.Barrier(2)
+
+    def write(path: Path, payload: dict[str, Any]) -> None:
+        with suppress(threading.BrokenBarrierError):
+            write_barrier.wait(timeout=_RACE_TIMEOUT_SECONDS)
+        original_write(path, payload)
+
+    monkeypatch.setattr(py_queue, "_write_atomic", write)
+
+
+def test_python_queue_concurrent_next_steps_do_not_claim_same_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Python fallback queue-next serializes JSON bundle updates."""
+    store_dir = tmp_path / "queue"
+    py_queue.run("persist", _store_payload(store_dir, work_id="py-race", bundle=_bundle(2)))
+    _stall_bundle_writes(monkeypatch)
+
+    results = _run_concurrently(2, lambda _index: py_queue.run("next", _store_payload(store_dir, work_id="py-race")))
+    step_ids = [str(result["step"]["step_id"]) for result in results if result["ready"]]
+
+    assert len(step_ids) == 2
+    assert len(set(step_ids)) == 2
+    statuses = [step["status"] for step in _read_dispatch_bundle(store_dir, "py-race")["steps"]]
+    assert statuses.count("running") == 2
+
+
+def test_python_queue_concurrent_record_steps_preserve_both_updates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Python fallback queue-record serializes JSON bundle updates."""
+    store_dir = tmp_path / "queue"
+    py_queue.run("persist", _store_payload(store_dir, work_id="py-race", bundle=_bundle(2)))
+    step_ids = [
+        str(py_queue.run("next", _store_payload(store_dir, work_id="py-race"))["step"]["step_id"]),
+        str(py_queue.run("next", _store_payload(store_dir, work_id="py-race"))["step"]["step_id"]),
+    ]
+    _stall_bundle_writes(monkeypatch)
+
+    _run_concurrently(
+        2,
+        lambda index: py_queue.run(
+            "record",
+            _store_payload(
+                store_dir,
+                work_id="py-race",
+                step_id=step_ids[index],
+                result=f"done:{index}",
+            ),
+        ),
+    )
+
+    steps = {step["step_id"]: step for step in _read_dispatch_bundle(store_dir, "py-race")["steps"]}
+    assert steps[step_ids[0]]["result"] == "done:0"
+    assert steps[step_ids[1]]["result"] == "done:1"
+
+
+def test_python_queue_concurrent_dequeue_serializes_select_update(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Python fallback dequeue uses a transaction so two workers cannot claim one row."""
+    store_dir = tmp_path / "queue"
+    for index in range(2):
+        py_queue.run(
+            "enqueue",
+            _store_payload(store_dir, work_id=f"w{index}", prompt=f"prompt {index}", priority=index),
+        )
+
+    original_open_db = py_queue._open_db
+    select_barrier = threading.Barrier(2)
+
+    class SlowConnection:
+        def __init__(self, conn) -> None:
+            self._conn = conn
+
+        def __enter__(self):
+            self._conn.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> bool | None:
+            return self._conn.__exit__(exc_type, exc, tb)
+
+        def execute(self, sql: str, parameters: tuple[object, ...] = ()):
+            if "SELECT work_id, prompt, surface, priority, metadata_json FROM work_queue" in sql:
+                with suppress(threading.BrokenBarrierError):
+                    select_barrier.wait(timeout=_RACE_TIMEOUT_SECONDS)
+            return self._conn.execute(sql, parameters)
+
+    def open_db(path: Path) -> SlowConnection:
+        return SlowConnection(original_open_db(path))
+
+    monkeypatch.setattr(py_queue, "_open_db", open_db)
+
+    results = _run_concurrently(2, lambda _index: py_queue.run("dequeue", _store_payload(store_dir)))
+    work_ids = [str(result["item"]["work_id"]) for result in results if result["ready"]]
+
+    assert len(work_ids) == 2
+    assert len(set(work_ids)) == 2

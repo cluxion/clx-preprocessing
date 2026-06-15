@@ -1,9 +1,15 @@
+"""Concurrency coverage for the file-backed dispatch store."""
+
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from typing import TYPE_CHECKING
 
 import pytest
 
+from cluxion_runtime.core import dispatch_store
 from cluxion_runtime.core.dispatch_store import (
     DispatchStoreError,
     build_briefing_payload,
@@ -21,6 +27,7 @@ if TYPE_CHECKING:
     from cluxion_runtime.core.types import HarnessPlan
 
 _SNAPSHOT = ResourceSnapshot(total_ram_mb=48_000, available_ram_mb=40_000, swap_used_mb=0, cpu_percent=20.0)
+_RACE_TIMEOUT_SECONDS = 0.25
 
 
 @pytest.fixture(scope="module")
@@ -51,6 +58,29 @@ def _drain_ids(work_id: str, dispatch_dir: Path) -> list[str]:
         record_dispatch_result(work_id, step_id, result=f"done:{step_id}", dispatch_dir=dispatch_dir)
 
 
+def _run_concurrently(worker_count: int, worker) -> list[object]:
+    start = threading.Barrier(worker_count)
+
+    def run(index: int) -> object:
+        start.wait()
+        return worker(index)
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        return list(executor.map(run, range(worker_count)))
+
+
+def _stall_dispatch_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_write = dispatch_store._atomic_write_json
+    write_barrier = threading.Barrier(2)
+
+    def write(path: Path, payload: dict[str, object]) -> None:
+        with suppress(threading.BrokenBarrierError):
+            write_barrier.wait(timeout=_RACE_TIMEOUT_SECONDS)
+        original_write(path, payload)
+
+    monkeypatch.setattr(dispatch_store, "_atomic_write_json", write)
+
+
 def test_persist_skips_plans_without_queue(tmp_path: Path) -> None:
     plan = build_harness_plan(WorkItem("w-short", "작업: 작은 버그를 고쳐줘."), snapshot=_SNAPSHOT)
     assert plan.execution.queue_required is False
@@ -78,6 +108,22 @@ def test_next_marks_step_running_on_disk(tmp_path: Path, queued_plan: HarnessPla
     assert statuses.count("running") == 1
 
 
+def test_concurrent_next_dispatch_steps_do_not_claim_same_step(
+    tmp_path: Path, queued_plan: HarnessPlan, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent queue-next calls must not overwrite each other's running marker."""
+    persist_dispatch_bundle(queued_plan, dispatch_dir=tmp_path)
+    _stall_dispatch_writes(monkeypatch)
+
+    results = _run_concurrently(2, lambda _index: next_dispatch_step("w-queued", dispatch_dir=tmp_path))
+    step_ids = [str(result["step"]["step_id"]) for result in results if result["ready"]]
+
+    assert len(step_ids) == 2
+    assert len(set(step_ids)) == 2
+    statuses = [step["status"] for step in load_dispatch_bundle("w-queued", dispatch_dir=tmp_path)["steps"]]
+    assert statuses.count("running") == 2
+
+
 def test_next_reports_not_ready_when_nothing_queued(tmp_path: Path, queued_plan: HarnessPlan) -> None:
     persist_dispatch_bundle(queued_plan, dispatch_dir=tmp_path)
     while next_dispatch_step("w-queued", dispatch_dir=tmp_path)["ready"]:
@@ -99,6 +145,32 @@ def test_full_drain_unlocks_briefing(tmp_path: Path, queued_plan: HarnessPlan) -
     assert briefing["result_count"] == len(step_ids)
     for step_id in step_ids:
         assert f"done:{step_id}" in str(briefing["briefing_prompt"])
+
+
+def test_concurrent_record_dispatch_results_preserve_both_updates(
+    tmp_path: Path, queued_plan: HarnessPlan, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent queue-record calls for different steps must both persist."""
+    persist_dispatch_bundle(queued_plan, dispatch_dir=tmp_path)
+    step_ids = [
+        str(next_dispatch_step("w-queued", dispatch_dir=tmp_path)["step"]["step_id"]),
+        str(next_dispatch_step("w-queued", dispatch_dir=tmp_path)["step"]["step_id"]),
+    ]
+    _stall_dispatch_writes(monkeypatch)
+
+    _run_concurrently(
+        2,
+        lambda index: record_dispatch_result(
+            "w-queued",
+            step_ids[index],
+            result=f"done:{index}",
+            dispatch_dir=tmp_path,
+        ),
+    )
+
+    steps = {str(step["step_id"]): step for step in load_dispatch_bundle("w-queued", dispatch_dir=tmp_path)["steps"]}
+    assert steps[step_ids[0]]["result"] == "done:0"
+    assert steps[step_ids[1]]["result"] == "done:1"
 
 
 def test_record_unknown_step_raises(tmp_path: Path, queued_plan: HarnessPlan) -> None:
