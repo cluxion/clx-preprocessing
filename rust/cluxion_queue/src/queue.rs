@@ -95,6 +95,8 @@ pub fn enqueue(store_dir: &Path, payload: &Value) -> Result<Value, QueueError> {
 pub fn dequeue(store_dir: &Path, _payload: &Value) -> Result<Value, QueueError> {
     let now = now_secs();
     with_db(store_dir, |conn| {
+        // Use BEGIN IMMEDIATE for atomic SELECT-then-UPDATE claim
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
         let row = conn.query_row(
             "SELECT work_id, prompt, surface, priority, metadata_json
          FROM work_queue
@@ -118,6 +120,7 @@ pub fn dequeue(store_dir: &Path, _payload: &Value) -> Result<Value, QueueError> 
                     "UPDATE work_queue SET status='running', updated_at=?2 WHERE work_id=?1",
                     params![work_id, now],
                 )?;
+                conn.execute_batch("COMMIT;")?;
                 Ok(ok_payload(json!({
                     "ready": true,
                     "item": {
@@ -129,11 +132,17 @@ pub fn dequeue(store_dir: &Path, _payload: &Value) -> Result<Value, QueueError> 
                     }
                 })))
             }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(ok_payload(json!({
-                "ready": false,
-                "item": Value::Null,
-            }))),
-            Err(err) => Err(QueueError::Sqlite(err)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                conn.execute_batch("COMMIT;")?;
+                Ok(ok_payload(json!({
+                    "ready": false,
+                    "item": Value::Null,
+                })))
+            }
+            Err(err) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(QueueError::Sqlite(err))
+            }
         }
     })
 }

@@ -1,6 +1,7 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 
+use fs2::FileExt;
 use serde_json::{json, Value};
 
 use crate::types::{ok_payload, require_str, QueueError};
@@ -14,49 +15,55 @@ pub fn persist_bundle(store_dir: &Path, payload: &Value) -> Result<Value, QueueE
     let dispatch_dir = dispatch_dir(store_dir);
     fs::create_dir_all(&dispatch_dir)?;
     let path = bundle_path(&dispatch_dir, work_id)?;
-    write_atomic_json(&path, &bundle)?;
-    Ok(ok_payload(json!({
-        "stored": true,
-        "path": path.to_string_lossy(),
-    })))
+    with_dispatch_lock(&dispatch_dir, || {
+        write_atomic_json(&path, &bundle)?;
+        Ok(ok_payload(json!({
+            "stored": true,
+            "path": path.to_string_lossy(),
+        })))
+    })
 }
 
 pub fn next_step(store_dir: &Path, payload: &Value) -> Result<Value, QueueError> {
     let work_id = require_str(payload, "work_id")?;
-    let path = bundle_path(&dispatch_dir(store_dir), work_id)?;
-    let mut bundle = read_bundle(&path)?;
-    let mut selected: Option<Value> = None;
-    {
-        let steps = steps_mut(&mut bundle)?;
-        for step in steps.iter_mut() {
-            let status = step.get("status").and_then(Value::as_str).unwrap_or("");
-            if status == "queued" || status == "retry_wait" {
-                step["status"] = json!("running");
-                step["updated_at"] = json!(now_secs());
-                selected = Some(public_step(step));
-                break;
+    let dispatch_dir = dispatch_dir(store_dir);
+    fs::create_dir_all(&dispatch_dir)?;
+    let path = bundle_path(&dispatch_dir, work_id)?;
+    with_dispatch_lock(&dispatch_dir, || {
+        let mut bundle = read_bundle(&path)?;
+        let mut selected: Option<Value> = None;
+        {
+            let steps = steps_mut(&mut bundle)?;
+            for step in steps.iter_mut() {
+                let status = step.get("status").and_then(Value::as_str).unwrap_or("");
+                if status == "queued" || status == "retry_wait" {
+                    step["status"] = json!("running");
+                    step["updated_at"] = json!(now_secs());
+                    selected = Some(public_step(step));
+                    break;
+                }
             }
         }
-    }
-    if let Some(step) = selected {
-        write_atomic_json(&path, &bundle)?;
-        let remaining = remaining_count(steps_ref(&bundle)?);
-        return Ok(ok_payload(json!({
+        if let Some(step) = selected {
+            write_atomic_json(&path, &bundle)?;
+            let remaining = remaining_count(steps_ref(&bundle)?);
+            return Ok(ok_payload(json!({
+                "work_id": work_id,
+                "ready": true,
+                "step": step,
+                "remaining": remaining,
+                "synthesis_ready": false,
+            })));
+        }
+        let steps = steps_ref(&bundle)?;
+        Ok(ok_payload(json!({
             "work_id": work_id,
-            "ready": true,
-            "step": step,
-            "remaining": remaining,
-            "synthesis_ready": false,
-        })));
-    }
-    let steps = steps_ref(&bundle)?;
-    Ok(ok_payload(json!({
-        "work_id": work_id,
-        "ready": false,
-        "step": json!({}),
-        "remaining": remaining_count(steps),
-        "synthesis_ready": steps.iter().all(|step| step.get("status") == Some(&json!("succeeded"))),
-    })))
+            "ready": false,
+            "step": json!({}),
+            "remaining": remaining_count(steps),
+            "synthesis_ready": steps.iter().all(|step| step.get("status") == Some(&json!("succeeded"))),
+        })))
+    })
 }
 
 pub fn record_step(store_dir: &Path, payload: &Value) -> Result<Value, QueueError> {
@@ -68,37 +75,41 @@ pub fn record_step(store_dir: &Path, payload: &Value) -> Result<Value, QueueErro
         .get("failed")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let path = bundle_path(&dispatch_dir(store_dir), work_id)?;
-    let mut bundle = read_bundle(&path)?;
-    let mut recorded_status = None;
-    {
-        let steps = steps_mut(&mut bundle)?;
-        for step in steps.iter_mut() {
-            if step.get("step_id") == Some(&json!(step_id)) {
-                step["status"] = json!(if failed { "failed" } else { "succeeded" });
-                step["result"] = json!(result);
-                step["error"] = json!(error);
-                step["updated_at"] = json!(now_secs());
-                recorded_status = step.get("status").cloned();
-                break;
+    let dispatch_dir = dispatch_dir(store_dir);
+    fs::create_dir_all(&dispatch_dir)?;
+    let path = bundle_path(&dispatch_dir, work_id)?;
+    with_dispatch_lock(&dispatch_dir, || {
+        let mut bundle = read_bundle(&path)?;
+        let mut recorded_status = None;
+        {
+            let steps = steps_mut(&mut bundle)?;
+            for step in steps.iter_mut() {
+                if step.get("step_id") == Some(&json!(step_id)) {
+                    step["status"] = json!(if failed { "failed" } else { "succeeded" });
+                    step["result"] = json!(result);
+                    step["error"] = json!(error);
+                    step["updated_at"] = json!(now_secs());
+                    recorded_status = step.get("status").cloned();
+                    break;
+                }
             }
         }
-    }
-    if let Some(status) = recorded_status {
-        write_atomic_json(&path, &bundle)?;
-        let steps = steps_ref(&bundle)?;
-        return Ok(ok_payload(json!({
-            "work_id": work_id,
-            "step_id": step_id,
-            "recorded": true,
-            "status": status,
-            "remaining": remaining_count(steps),
-            "synthesis_ready": steps.iter().all(|item| item.get("status") == Some(&json!("succeeded"))),
-        })));
-    }
-    Err(QueueError::Store(format!(
-        "dispatch step not found: {work_id}/{step_id}"
-    )))
+        if let Some(status) = recorded_status {
+            write_atomic_json(&path, &bundle)?;
+            let steps = steps_ref(&bundle)?;
+            return Ok(ok_payload(json!({
+                "work_id": work_id,
+                "step_id": step_id,
+                "recorded": true,
+                "status": status,
+                "remaining": remaining_count(steps),
+                "synthesis_ready": steps.iter().all(|item| item.get("status") == Some(&json!("succeeded"))),
+            })));
+        }
+        Err(QueueError::Store(format!(
+            "dispatch step not found: {work_id}/{step_id}"
+        )))
+    })
 }
 
 pub fn build_brief(store_dir: &Path, payload: &Value) -> Result<Value, QueueError> {
@@ -131,6 +142,22 @@ pub fn build_brief(store_dir: &Path, payload: &Value) -> Result<Value, QueueErro
         "briefing_prompt": prompt,
         "result_count": steps.len(),
     })))
+}
+
+fn with_dispatch_lock<T>(
+    dispatch_dir: &Path,
+    f: impl FnOnce() -> Result<T, QueueError>,
+) -> Result<T, QueueError> {
+    let lock_path = dispatch_dir.join(".dispatch.lock");
+    let lockfile = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&lock_path)?;
+    lockfile.lock_exclusive()?;
+    let result = f();
+    let _ = lockfile.unlock();
+    result
 }
 
 fn dispatch_dir(store_dir: &Path) -> PathBuf {
