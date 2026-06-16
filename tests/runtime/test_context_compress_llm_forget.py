@@ -179,6 +179,55 @@ def test_summarize_messages_returns_none_on_bad_json(monkeypatch) -> None:
     assert llm_compress.summarize_messages([type("M", (), {"role": "user", "content": "hi"})()], [0]) is None
 
 
+def test_pinned_recent_last_resort_brings_under_target(monkeypatch) -> None:
+    """Live edge case: all messages pinned and huge — intent preserved, usage <= target."""
+    monkeypatch.setattr(context_compress, "hermes_available", lambda: False)
+    intent = "TASK_INTENT: implement pinned-overflow guard"
+    payload = {
+        "messages": [
+            {"role": "user", "content": intent + _long(160_000)},
+            {"role": "assistant", "content": _long(160_000)},
+            {"role": "tool", "content": _long(160_000)},
+            {"role": "assistant", "content": _long(160_000)},
+            {"role": "user", "content": _long(160_000)},
+        ],
+        # 5 x ~40k tokens ~ 200k total -> usage 0.80 at this limit (live edge case).
+        "context_limit_tokens": 250_000,
+        "keep_recent_turns": 4,
+        "enable_llm_summary": False,
+        "enable_forget": True,
+    }
+    result = context_compress.compress(payload)
+    target = int(0.30 * result["context_limit"])
+    assert result["usage_before"] >= 0.70
+    assert result["messages"][0]["content"].startswith(intent)
+    assert result["tokens_after"] <= target
+    assert result.get("over_target_pinned_only") is not True
+    assert "truncate_pinned_recent" in result["stages_applied"]
+
+
+def test_lone_giant_intent_forced_over_target(monkeypatch) -> None:
+    """When intent alone exceeds target, truncate everything else and flag forced_over_target."""
+    monkeypatch.setattr(context_compress, "hermes_available", lambda: False)
+    intent = "GIANT_INTENT"
+    payload = {
+        "messages": [
+            {"role": "user", "content": intent + _long(12_000)},
+            {"role": "assistant", "content": _long(12_000)},
+        ],
+        "context_limit_tokens": 1000,
+        "keep_recent_turns": 2,
+        "enable_llm_summary": False,
+        "enable_forget": True,
+    }
+    result = context_compress.compress(payload)
+    assert result["messages"][0]["content"].startswith(intent)
+    assert result.get("forced_over_target") is True
+    assert result.get("over_target_pinned_only") is True
+    assert "[...cluxion:" in result["messages"][1]["content"]
+    assert result["tokens_after"] > int(0.30 * result["context_limit"])
+
+
 def test_korean_decision_survives_stage3() -> None:
     body = _long(4000)
     digest = f"[cluxion digest] tool: {body[:80]} [900 tokens elided]"

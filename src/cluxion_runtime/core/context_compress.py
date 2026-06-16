@@ -6,8 +6,10 @@ lockstep so the three backends produce identical Stage-1 output (parity-tested).
 
 Stages 2 (LLM summarization via ``hermes -z``) and 3 (hybrid forgetting) are
 Python-only; the Rust mirror intentionally does not replicate LLM or forgetforge
-calls. Disable them with ``enable_llm_summary`` / ``enable_forget`` for Stage-1
-parity.
+calls. Stage 4 (last-resort truncation of pinned recent turns) is also
+Python-only — it runs when every remaining message is pinned yet still exceeds
+the target. Disable stages 2-4 with ``enable_llm_summary`` / ``enable_forget``
+for Stage-1 parity.
 
 What stays untouched: pinned messages (explicit ``pinned``, the first
 user message = task intent, the most recent ``keep_recent`` turns).
@@ -152,13 +154,26 @@ def compress(payload: Mapping[str, object]) -> dict[str, object]:
             stages.append("forget")
         pinned = _pinned_indices(messages, keep_recent)
 
+    intent_idx = _first_user_index(messages)
+    if total > target_tokens and (
+        over_target_pinned_only or not any(idx not in pinned for idx in range(len(messages)))
+    ):
+        total, changed = _stage_truncate_pinned_recent(
+            messages, keep_recent, total, target_tokens, intent_idx=intent_idx
+        )
+        if changed:
+            stages.append("truncate_pinned_recent")
+        over_target_pinned_only = False
+
     if total > target_tokens:
         if summary_request is None:
             summary_request = _build_summary_request(messages, pinned, total, target_tokens)
-        if over_target_pinned_only or not any(idx not in pinned for idx in range(len(messages))):
-            over_target_pinned_only = True
-        if total / context_limit > trigger_ratio:
+        intent_tokens = (
+            estimate_tokens(messages[intent_idx].content) if intent_idx is not None else 0
+        )
+        if intent_tokens > target_tokens:
             forced_over_target = True
+            over_target_pinned_only = True
 
     return _result_payload(
         messages,
@@ -208,6 +223,10 @@ def _bool_flag(payload: Mapping[str, object], key: str, default: bool) -> bool:
     return default
 
 
+def _first_user_index(messages: list[_Msg]) -> int | None:
+    return next((idx for idx, msg in enumerate(messages) if msg.role == "user"), None)
+
+
 def _pinned_indices(messages: list[_Msg], keep_recent: int) -> list[int]:
     pinned = [idx for idx, msg in enumerate(messages) if msg.pinned]
     first_user = next((idx for idx, msg in enumerate(messages) if msg.role == "user"), None)
@@ -221,6 +240,17 @@ def _pinned_indices(messages: list[_Msg], keep_recent: int) -> list[int]:
     return pinned
 
 
+def _apply_head_tail_truncate(content: str) -> str | None:
+    if estimate_tokens(content) <= TRUNCATE_MIN_TOKENS:
+        return None
+    if len(content) <= TRUNCATE_HEAD_CHARS + TRUNCATE_TAIL_CHARS:
+        return None
+    elided = len(content) - TRUNCATE_HEAD_CHARS - TRUNCATE_TAIL_CHARS
+    head = content[:TRUNCATE_HEAD_CHARS]
+    tail = content[len(content) - TRUNCATE_TAIL_CHARS :]
+    return f"{head}\n[...cluxion: {elided} chars elided...]\n{tail}"
+
+
 def _stage_truncate(messages: list[_Msg], pinned: list[int], total: int, target: int) -> tuple[int, bool]:
     changed = False
     for idx, msg in enumerate(messages):
@@ -228,18 +258,50 @@ def _stage_truncate(messages: list[_Msg], pinned: list[int], total: int, target:
             break
         if idx in pinned:
             continue
+        replacement = _apply_head_tail_truncate(msg.content)
+        if replacement is None:
+            continue
         tokens = estimate_tokens(msg.content)
-        if tokens <= TRUNCATE_MIN_TOKENS:
-            continue
-        if len(msg.content) <= TRUNCATE_HEAD_CHARS + TRUNCATE_TAIL_CHARS:
-            continue
-        elided = len(msg.content) - TRUNCATE_HEAD_CHARS - TRUNCATE_TAIL_CHARS
-        head = msg.content[:TRUNCATE_HEAD_CHARS]
-        tail = msg.content[len(msg.content) - TRUNCATE_TAIL_CHARS :]
-        replacement = f"{head}\n[...cluxion: {elided} chars elided...]\n{tail}"
         total = total - tokens + estimate_tokens(replacement)
         msg.content = replacement
         changed = True
+    return total, changed
+
+
+def _pinned_recent_indices(messages: list[_Msg], keep_recent: int, intent_idx: int | None) -> list[int]:
+    recent_start = max(0, len(messages) - keep_recent)
+    return [idx for idx in range(recent_start, len(messages)) if idx != intent_idx]
+
+
+def _stage_truncate_pinned_recent(
+    messages: list[_Msg],
+    keep_recent: int,
+    total: int,
+    target: int,
+    *,
+    intent_idx: int | None,
+) -> tuple[int, bool]:
+    """Last-resort: truncate pinned recent turns (never intent) until total <= target."""
+    if total <= target:
+        return total, False
+
+    candidates = _pinned_recent_indices(messages, keep_recent, intent_idx)
+    changed = False
+    while total > target:
+        progressed = False
+        for idx in candidates:
+            if total <= target:
+                break
+            replacement = _apply_head_tail_truncate(messages[idx].content)
+            if replacement is None:
+                continue
+            tokens = estimate_tokens(messages[idx].content)
+            total = total - tokens + estimate_tokens(replacement)
+            messages[idx].content = replacement
+            changed = True
+            progressed = True
+        if not progressed:
+            break
     return total, changed
 
 
