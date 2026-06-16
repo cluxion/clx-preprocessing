@@ -315,7 +315,8 @@ def start_daemon(
     if Path(binary).exists() or _which(binary):
         host = "binary"
         cmd = [binary, "guard-daemon", str(base), str(int(interval_ms)), str(int(window))]
-    elif _native_guard_available():
+    else:
+        # Universal fallback: guard_daemon_host selects native vs pure-Python at runtime.
         host = "python"
         cmd = [
             sys.executable,
@@ -325,8 +326,6 @@ def start_daemon(
             str(int(interval_ms)),
             str(int(window)),
         ]
-    else:
-        return {"ok": False, "started": False, "reason": "binary_not_found", "binary": binary}
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,

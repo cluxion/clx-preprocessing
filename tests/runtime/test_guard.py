@@ -133,11 +133,14 @@ def test_touch_heartbeat_updates_mtime(tmp_path: Path) -> None:
 def test_start_daemon_touches_heartbeat(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv(queue_bridge.QUEUE_BIN_ENV, "/nonexistent/cluxion-queue")
     monkeypatch.setattr(guard_bridge, "_which", lambda _binary: False)
+    monkeypatch.setattr(guard_bridge, "_native_guard_available", lambda: False)
+    monkeypatch.setattr(queue_bridge, "_native", None)
     heartbeat = tmp_path / guard_bridge.HEARTBEAT_FILE_NAME
     assert not heartbeat.exists()
 
     started = guard_bridge.start_daemon(store_dir=tmp_path, interval_ms=100, window=5)
     assert started["ok"] is True and started["started"] is True
+    assert started["host"] == "python"
     try:
         assert heartbeat.exists()
         assert heartbeat.stat().st_mtime > 0
