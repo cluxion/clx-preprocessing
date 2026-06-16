@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
-__version__ = "0.3.12"
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("cluxion-agentplugin-preprocessing")
+except PackageNotFoundError:  # pragma: no cover
+    __version__ = "0.3.13"
 
 __all__ = ["__version__"]
