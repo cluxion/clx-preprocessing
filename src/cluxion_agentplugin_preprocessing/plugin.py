@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.resources
 import json
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -26,6 +27,12 @@ from cluxion_agentplugin_preprocessing.schemas import (
     SERVE_LOCAL_SCHEMA,
     WEB_SEARCH_SCHEMA,
 )
+from cluxion_runtime.core.context_compress import (
+    DEFAULT_TRIGGER_RATIO,
+    _resolve_context_limit,
+    compress,
+)
+from cluxion_runtime.core.preprocess import estimate_tokens
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -37,6 +44,10 @@ def register(ctx: object) -> None:
     if callable(register_hook):
         register_hook("on_session_start", guard_watch.on_session_start)
         register_hook("post_tool_call", guard_watch.post_tool_call)
+
+    register_mw = getattr(ctx, "register_middleware", None)
+    if callable(register_mw):
+        register_mw("llm_request", _auto_compress_middleware)
 
     ctx.register_tool(
         name="cluxion_plan",
@@ -273,6 +284,59 @@ def _json_result(callback: Callable[[], str]) -> str:
         return callback()
     except Exception as exc:
         return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, sort_keys=True)
+
+
+def _autocompress_enabled() -> bool:
+    value = os.environ.get("CLUXION_PREPROCESS_AUTOCOMPRESS", "1").strip().lower()
+    return value not in ("0", "false", "no", "off")
+
+
+def _auto_compress_middleware(
+    request: dict[str, object],
+    original_request: object = None,
+    model: str | None = None,
+    **_: object,
+) -> dict[str, object] | None:
+    del original_request
+    if os.environ.get("CLUXION_PREPROCESS_IN_COMPRESS") == "1":
+        return None
+    if not _autocompress_enabled():
+        return None
+
+    messages_key = "messages"
+    raw_messages = request.get("messages")
+    if not isinstance(raw_messages, list):
+        raw_messages = request.get("input")
+        messages_key = "input"
+    if not isinstance(raw_messages, list):
+        return None
+
+    try:
+        total_tokens = 0
+        for raw in raw_messages:
+            if isinstance(raw, dict):
+                total_tokens += estimate_tokens(str(raw.get("content", "")))
+            else:
+                total_tokens += estimate_tokens(str(raw))
+
+        limit_payload: dict[str, object] = {}
+        if model:
+            limit_payload["model"] = model
+        ctx_limit = request.get("context_limit_tokens")
+        if isinstance(ctx_limit, int) and not isinstance(ctx_limit, bool) and ctx_limit > 0:
+            limit_payload["context_limit_tokens"] = ctx_limit
+        context_limit = _resolve_context_limit(limit_payload)
+        if total_tokens / context_limit < DEFAULT_TRIGGER_RATIO:
+            return None
+
+        payload: dict[str, object] = {"messages": raw_messages, **limit_payload}
+        result = compress(payload)
+        shrunk = result.get("messages")
+        if not isinstance(shrunk, list):
+            return None
+        return {"request": {**request, messages_key: shrunk}, "source": "preprocessing"}
+    except Exception:
+        return None
 
 
 __all__ = ["register"]

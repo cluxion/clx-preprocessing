@@ -6,6 +6,7 @@ stderr and never raised into the host agent.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import threading
@@ -35,6 +36,7 @@ def on_session_start(**_: Any) -> None:
         return
     try:
         result = guard_bridge.start_daemon()
+        guard_bridge.touch_heartbeat()
     except Exception as exc:
         _warn(f"cluxion guard autostart failed: {exc}")
         return
@@ -52,6 +54,9 @@ def post_tool_call(**_: Any) -> None:
     candidates.
     """
     global _last_warning_at, _last_watch_at
+
+    with contextlib.suppress(Exception):
+        guard_bridge.touch_heartbeat()
 
     now = time.monotonic()
     try:

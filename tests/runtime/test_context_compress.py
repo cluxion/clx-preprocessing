@@ -32,6 +32,11 @@ def _long(chars: int) -> str:
     return "x" * chars
 
 
+_STAGE1_ONLY = {
+    "enable_llm_summary": False,
+    "enable_forget": False,
+}
+
 _COMPRESSIBLE = {
     "messages": [
         {"role": "user", "content": "the task intent"},
@@ -44,6 +49,7 @@ _COMPRESSIBLE = {
     ],
     "context_limit_tokens": 3000,
     "keep_recent_turns": 1,
+    **_STAGE1_ONLY,
 }
 
 
@@ -98,6 +104,7 @@ def test_all_pinned_requests_ai_summary(backend) -> None:
             ],
             "context_limit_tokens": 1000,
             "keep_recent_turns": 2,
+            **_STAGE1_ONLY,
         }
     )
     request = result["ai_summary_request"]

@@ -1,0 +1,236 @@
+"""Pure-Python guard daemon host: dual-cadence tick tests."""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from cluxion_runtime.guard_daemon_host import (
+    HEARTBEAT_FILE_NAME,
+    PID_FILE_NAME,
+    PROC_SCAN_EVERY_N_TICKS,
+    ProcessScanCache,
+    _daemon_loop_step,
+    _python_daemon_tick,
+    _run_python_daemon,
+    is_idle,
+)
+
+_TOP_LEVEL_KEYS = ("ok", "current", "window", "interval_ms", "updated_at_ms")
+_CURRENT_KEYS = (
+    "ok",
+    "total_ram_mb",
+    "available_ram_mb",
+    "swap_used_mb",
+    "cpu_percent",
+    "process_count",
+    "zombie_count",
+    "zombie_pids",
+    "sampled_at_ms",
+)
+_WINDOW_KEYS = ("samples", "cpu_avg", "cpu_peak", "min_available_ram_mb")
+
+
+def _assert_state_schema(state: dict[str, Any], *, interval_ms: int) -> None:
+    for key in _TOP_LEVEL_KEYS:
+        assert key in state, f"missing top-level key: {key}"
+    assert state["ok"] is True
+    assert isinstance(state["interval_ms"], int)
+    assert state["interval_ms"] == interval_ms
+    assert isinstance(state["updated_at_ms"], int)
+
+    current = state["current"]
+    for key in _CURRENT_KEYS:
+        assert key in current, f"missing current key: {key}"
+    assert current["ok"] is True
+    assert isinstance(current["total_ram_mb"], int) and current["total_ram_mb"] > 0
+    assert isinstance(current["available_ram_mb"], int)
+    assert isinstance(current["swap_used_mb"], int)
+    assert isinstance(current["cpu_percent"], (int, float))
+    assert isinstance(current["process_count"], int)
+    assert isinstance(current["zombie_count"], int)
+    assert isinstance(current["zombie_pids"], list)
+    assert all(isinstance(pid, int) for pid in current["zombie_pids"])
+    assert isinstance(current["sampled_at_ms"], int)
+
+    window = state["window"]
+    for key in _WINDOW_KEYS:
+        assert key in window, f"missing window key: {key}"
+    assert isinstance(window["samples"], int)
+    assert isinstance(window["cpu_avg"], (int, float))
+    assert isinstance(window["cpu_peak"], (int, float))
+    assert isinstance(window["min_available_ram_mb"], int)
+
+
+def test_python_daemon_state_json_key_order_matches_rust() -> None:
+    process_cache = ProcessScanCache(process_count=0, zombie_count=0, zombie_pids=[])
+    cpu_window: list[float] = []
+    ram_window: list[int] = []
+    state, _ = _python_daemon_tick(
+        process_cache, cpu_window, ram_window, 10, 1000, tick=0
+    )
+    payload = json.dumps(state, separators=(",", ":"))
+    assert payload.startswith(
+        '{"ok":true,"current":{"ok":true,"total_ram_mb":'
+    )
+    assert ',"window":{"samples":' in payload
+    assert ',"interval_ms":1000,"updated_at_ms":' in payload
+
+
+def test_python_daemon_tick_scan_tick_schema_and_window() -> None:
+    process_cache = ProcessScanCache(process_count=0, zombie_count=0, zombie_pids=[])
+    cpu_window: list[float] = []
+    ram_window: list[int] = []
+    interval_ms = 1000
+    window = 10
+
+    state, cache = _python_daemon_tick(
+        process_cache, cpu_window, ram_window, window, interval_ms, tick=0
+    )
+    _assert_state_schema(state, interval_ms=interval_ms)
+    assert state["current"]["process_count"] > 0
+    assert state["window"]["samples"] == 1
+    assert cache.process_count == state["current"]["process_count"]
+
+
+def test_python_daemon_tick_cheap_tick_reuses_process_cache() -> None:
+    process_cache = ProcessScanCache(process_count=0, zombie_count=0, zombie_pids=[])
+    cpu_window: list[float] = []
+    ram_window: list[int] = []
+    interval_ms = 1000
+    window = 10
+
+    _python_daemon_tick(process_cache, cpu_window, ram_window, window, interval_ms, tick=0)
+
+    stale_cache = ProcessScanCache(process_count=1, zombie_count=2, zombie_pids=[99, 100])
+    cheap_state, returned_cache = _python_daemon_tick(
+        stale_cache, cpu_window, ram_window, window, interval_ms, tick=1
+    )
+    _assert_state_schema(cheap_state, interval_ms=interval_ms)
+    assert cheap_state["current"]["process_count"] == 1
+    assert cheap_state["current"]["zombie_count"] == 2
+    assert cheap_state["current"]["zombie_pids"] == [99, 100]
+    assert returned_cache == stale_cache
+
+    rescan_state, refreshed_cache = _python_daemon_tick(
+        stale_cache, cpu_window, ram_window, window, interval_ms, tick=PROC_SCAN_EVERY_N_TICKS
+    )
+    _assert_state_schema(rescan_state, interval_ms=interval_ms)
+    assert refreshed_cache != stale_cache
+    assert refreshed_cache.process_count > 0
+    assert rescan_state["current"]["process_count"] == refreshed_cache.process_count
+
+
+def test_python_daemon_tick_window_grows_one_per_tick() -> None:
+    process_cache = ProcessScanCache(process_count=0, zombie_count=0, zombie_pids=[])
+    cpu_window: list[float] = []
+    ram_window: list[int] = []
+    interval_ms = 1000
+    window = 10
+
+    state0, process_cache = _python_daemon_tick(
+        process_cache, cpu_window, ram_window, window, interval_ms, tick=0
+    )
+    assert state0["window"]["samples"] == 1
+
+    state1, process_cache = _python_daemon_tick(
+        process_cache, cpu_window, ram_window, window, interval_ms, tick=1
+    )
+    assert state1["window"]["samples"] == 2
+    assert len(cpu_window) == 2
+    assert len(ram_window) == 2
+
+
+@pytest.mark.parametrize("tick", [0, 1, 4, 5])
+def test_python_daemon_tick_scan_cadence(tick: int) -> None:
+    process_cache = ProcessScanCache(process_count=0, zombie_count=0, zombie_pids=[])
+    cpu_window: list[float] = []
+    ram_window: list[int] = []
+
+    _, cache = _python_daemon_tick(
+        process_cache, cpu_window, ram_window, 5, 1000, tick=tick
+    )
+    if tick % PROC_SCAN_EVERY_N_TICKS == 0:
+        assert cache.process_count > 0
+    else:
+        assert cache.process_count == 0
+
+
+def test_is_idle_detects_stale_and_fresh_heartbeats() -> None:
+    ttl = 600_000
+    now = 1_700_000_000_000
+    assert is_idle(now - ttl - 1, now, ttl)
+    assert not is_idle(now - ttl, now, ttl)
+    assert not is_idle(now - 1, now, ttl)
+
+
+def test_daemon_loop_step_exits_idle_and_removes_pidfile(tmp_path: Path) -> None:
+    heartbeat = tmp_path / HEARTBEAT_FILE_NAME
+    heartbeat.touch()
+    stale_mtime = time.time() - 700
+    os.utime(heartbeat, (stale_mtime, stale_mtime))
+    pid_path = tmp_path / PID_FILE_NAME
+    pid_path.write_text("4242", encoding="utf-8")
+
+    process_cache = ProcessScanCache(process_count=0, zombie_count=0, zombie_pids=[])
+    keep_running, _ = _daemon_loop_step(
+        tmp_path,
+        process_cache=process_cache,
+        cpu_window=[],
+        ram_window=[],
+        window=5,
+        interval_ms=1000,
+        tick=0,
+        idle_ttl_ms=600_000,
+        now_ms=int(time.time() * 1000),
+    )
+
+    assert keep_running is False
+    assert not pid_path.exists()
+
+
+def test_run_python_daemon_idle_exit_removes_pidfile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    heartbeat = tmp_path / HEARTBEAT_FILE_NAME
+    heartbeat.touch()
+    stale_mtime = time.time() - 700
+    os.utime(heartbeat, (stale_mtime, stale_mtime))
+    pid_path = tmp_path / PID_FILE_NAME
+    pid_path.write_text("4242", encoding="utf-8")
+
+    monkeypatch.setattr("cluxion_runtime.guard_daemon_host.time.sleep", lambda _: None)
+
+    _run_python_daemon(str(tmp_path), 1000, 5)
+
+    assert not pid_path.exists()
+
+
+def test_daemon_loop_step_keeps_running_with_fresh_heartbeat(tmp_path: Path) -> None:
+    heartbeat = tmp_path / HEARTBEAT_FILE_NAME
+    heartbeat.touch()
+    pid_path = tmp_path / PID_FILE_NAME
+    pid_path.write_text("4242", encoding="utf-8")
+
+    process_cache = ProcessScanCache(process_count=0, zombie_count=0, zombie_pids=[])
+    keep_running, refreshed_cache = _daemon_loop_step(
+        tmp_path,
+        process_cache=process_cache,
+        cpu_window=[],
+        ram_window=[],
+        window=5,
+        interval_ms=1000,
+        tick=0,
+        idle_ttl_ms=600_000,
+        now_ms=int(time.time() * 1000),
+    )
+
+    assert keep_running is True
+    assert pid_path.exists()
+    assert refreshed_cache.process_count > 0
+    assert (tmp_path / "guard_state.json").exists()

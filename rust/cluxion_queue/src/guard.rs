@@ -19,15 +19,39 @@ const DEFAULT_CPU_SAMPLE_MS: u64 = 100;
 const MAX_REPORTED_PIDS: usize = 50;
 const DEFAULT_CPU_HOT_THRESHOLD: f64 = 50.0;
 const DEFAULT_RSS_HOT_THRESHOLD_MB: u64 = 1024;
-pub const DEFAULT_DAEMON_INTERVAL_MS: u64 = 200;
-pub const DEFAULT_DAEMON_WINDOW: usize = 25;
+pub const DEFAULT_DAEMON_INTERVAL_MS: u64 = 1000;
+pub const DEFAULT_DAEMON_WINDOW: usize = 10;
+pub const PROC_SCAN_EVERY_N_TICKS: u64 = 5;
 pub const STATE_FILE_NAME: &str = "guard_state.json";
+pub const HEARTBEAT_FILE_NAME: &str = "guard_heartbeat";
+pub const PID_FILE_NAME: &str = "guard_daemon.pid";
+pub const DEFAULT_IDLE_TTL_MS: u64 = 600_000;
 
 fn epoch_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn idle_ttl_ms() -> u64 {
+    std::env::var("CLUXION_GUARD_IDLE_TTL_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_IDLE_TTL_MS)
+}
+
+/// True when the heartbeat mtime is older than `ttl_ms` relative to `now_ms`.
+pub fn is_idle(heartbeat_mtime_ms: u64, now_ms: u64, ttl_ms: u64) -> bool {
+    now_ms.saturating_sub(heartbeat_mtime_ms) > ttl_ms
+}
+
+fn heartbeat_mtime_ms(path: &Path) -> Option<u64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    modified
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as u64)
 }
 
 fn uint_field(payload: &Value, key: &str, default: u64) -> u64 {
@@ -48,7 +72,14 @@ pub fn sample(payload: &Value) -> Result<Value, QueueError> {
     Ok(sample_from(&sys))
 }
 
-fn sample_from(sys: &System) -> Value {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProcessScanCache {
+    process_count: usize,
+    zombie_count: usize,
+    zombie_pids: Vec<u64>,
+}
+
+fn scan_process_fields(sys: &System) -> ProcessScanCache {
     let mut zombie_pids: Vec<u64> = sys
         .processes()
         .iter()
@@ -58,17 +89,86 @@ fn sample_from(sys: &System) -> Value {
     zombie_pids.sort_unstable();
     let zombie_count = zombie_pids.len();
     zombie_pids.truncate(MAX_REPORTED_PIDS);
+    ProcessScanCache {
+        process_count: sys.processes().len(),
+        zombie_count,
+        zombie_pids,
+    }
+}
+
+fn build_current_snapshot(sys: &System, process_cache: &ProcessScanCache) -> Value {
     json!({
         "ok": true,
         "total_ram_mb": sys.total_memory() / 1_048_576,
         "available_ram_mb": sys.available_memory() / 1_048_576,
         "swap_used_mb": sys.used_swap() / 1_048_576,
         "cpu_percent": f64::from(sys.global_cpu_usage()),
-        "process_count": sys.processes().len(),
-        "zombie_count": zombie_count,
-        "zombie_pids": zombie_pids,
+        "process_count": process_cache.process_count,
+        "zombie_count": process_cache.zombie_count,
+        "zombie_pids": process_cache.zombie_pids.clone(),
         "sampled_at_ms": epoch_ms(),
     })
+}
+
+fn sample_from(sys: &System) -> Value {
+    build_current_snapshot(sys, &scan_process_fields(sys))
+}
+
+fn push_window_sample(
+    cpu_window: &mut Vec<f64>,
+    ram_window: &mut Vec<u64>,
+    window: usize,
+    cpu: f64,
+    ram: u64,
+) {
+    if cpu_window.len() == window {
+        cpu_window.remove(0);
+        ram_window.remove(0);
+    }
+    cpu_window.push(cpu);
+    ram_window.push(ram);
+}
+
+fn build_daemon_state(
+    current: &Value,
+    cpu_window: &[f64],
+    ram_window: &[u64],
+    interval_ms: u64,
+) -> Value {
+    json!({
+        "ok": true,
+        "current": current,
+        "window": {
+            "samples": cpu_window.len(),
+            "cpu_avg": cpu_window.iter().sum::<f64>() / cpu_window.len() as f64,
+            "cpu_peak": cpu_window.iter().cloned().fold(0.0, f64::max),
+            "min_available_ram_mb": ram_window.iter().min().copied().unwrap_or(0),
+        },
+        "interval_ms": interval_ms,
+        "updated_at_ms": epoch_ms(),
+    })
+}
+
+fn daemon_tick(
+    sys: &mut System,
+    process_cache: &mut ProcessScanCache,
+    cpu_window: &mut Vec<f64>,
+    ram_window: &mut Vec<u64>,
+    window: usize,
+    interval_ms: u64,
+    tick: u64,
+) -> Value {
+    if tick % PROC_SCAN_EVERY_N_TICKS == 0 {
+        sys.refresh_processes(ProcessesToUpdate::All, true);
+        *process_cache = scan_process_fields(sys);
+    }
+    sys.refresh_memory();
+    sys.refresh_cpu_usage();
+    let current = build_current_snapshot(sys, process_cache);
+    let cpu = current["cpu_percent"].as_f64().unwrap_or(0.0);
+    let ram = current["available_ram_mb"].as_u64().unwrap_or(0);
+    push_window_sample(cpu_window, ram_window, window, cpu, ram);
+    build_daemon_state(&current, cpu_window, ram_window, interval_ms)
 }
 
 /// Scan processes against registered owner roots. A process is `owned`
@@ -157,50 +257,53 @@ fn is_owned(pid: u64, owned_roots: &[u64], parents: &HashMap<u64, u64>) -> bool 
 }
 
 /// Polling daemon: refresh, fold into a rolling window, publish state
-/// atomically (write to a temp file, then rename). Runs until killed.
+/// atomically (write to a temp file, then rename). Self-exits when the
+/// heartbeat file is stale; otherwise runs until killed.
+///
+/// Cheap ticks refresh memory/CPU every `interval_ms`; full process scans run
+/// every [`PROC_SCAN_EVERY_N_TICKS`] ticks and their results are cached for
+/// intervening cheap ticks.
 pub fn run_daemon(store_dir: &Path, interval_ms: u64, window: usize) -> Result<(), QueueError> {
     std::fs::create_dir_all(store_dir)?;
     let state_path = store_dir.join(STATE_FILE_NAME);
     let tmp_path = store_dir.join(format!("{STATE_FILE_NAME}.tmp"));
+    let heartbeat_path = store_dir.join(HEARTBEAT_FILE_NAME);
+    let pid_path = store_dir.join(PID_FILE_NAME);
+    let idle_ttl = idle_ttl_ms();
     let interval = std::time::Duration::from_millis(interval_ms.max(100));
     let window = window.max(1);
+    let interval_ms = interval.as_millis() as u64;
 
     let mut sys = System::new();
-    sys.refresh_memory();
-    sys.refresh_cpu_usage();
+    let mut process_cache = ProcessScanCache {
+        process_count: 0,
+        zombie_count: 0,
+        zombie_pids: Vec::new(),
+    };
     let mut cpu_window: Vec<f64> = Vec::with_capacity(window);
     let mut ram_window: Vec<u64> = Vec::with_capacity(window);
+    let mut tick: u64 = 0;
 
     loop {
-        std::thread::sleep(interval);
-        sys.refresh_memory();
-        sys.refresh_cpu_usage();
-        sys.refresh_processes(ProcessesToUpdate::All, true);
-        let current = sample_from(&sys);
-
-        let cpu = current["cpu_percent"].as_f64().unwrap_or(0.0);
-        let ram = current["available_ram_mb"].as_u64().unwrap_or(0);
-        if cpu_window.len() == window {
-            cpu_window.remove(0);
-            ram_window.remove(0);
+        if let Some(mtime) = heartbeat_mtime_ms(&heartbeat_path) {
+            if is_idle(mtime, epoch_ms(), idle_ttl) {
+                let _ = std::fs::remove_file(&pid_path);
+                return Ok(());
+            }
         }
-        cpu_window.push(cpu);
-        ram_window.push(ram);
-
-        let state = json!({
-            "ok": true,
-            "current": current,
-            "window": {
-                "samples": cpu_window.len(),
-                "cpu_avg": cpu_window.iter().sum::<f64>() / cpu_window.len() as f64,
-                "cpu_peak": cpu_window.iter().cloned().fold(0.0, f64::max),
-                "min_available_ram_mb": ram_window.iter().min().copied().unwrap_or(0),
-            },
-            "interval_ms": interval.as_millis() as u64,
-            "updated_at_ms": epoch_ms(),
-        });
+        let state = daemon_tick(
+            &mut sys,
+            &mut process_cache,
+            &mut cpu_window,
+            &mut ram_window,
+            window,
+            interval_ms,
+            tick,
+        );
         std::fs::write(&tmp_path, serde_json::to_vec(&state)?)?;
         std::fs::rename(&tmp_path, &state_path)?;
+        tick += 1;
+        std::thread::sleep(interval);
     }
 }
 
@@ -261,5 +364,127 @@ mod tests {
         assert!(!is_owned(42, &[5], &parents));
         // No roots registered -> nothing is owned.
         assert!(!is_owned(10, &[], &parents));
+    }
+
+    #[test]
+    fn daemon_tick_caches_process_fields_between_scans() {
+        let mut sys = System::new();
+        sys.refresh_processes(ProcessesToUpdate::All, true);
+        let mut process_cache = scan_process_fields(&sys);
+        let mut cpu_window: Vec<f64> = Vec::with_capacity(3);
+        let mut ram_window: Vec<u64> = Vec::with_capacity(3);
+
+        let scan_tick_state = daemon_tick(
+            &mut sys,
+            &mut process_cache,
+            &mut cpu_window,
+            &mut ram_window,
+            3,
+            1000,
+            0,
+        );
+        let scan_process_count = scan_tick_state["current"]["process_count"]
+            .as_u64()
+            .expect("process_count");
+        assert!(scan_process_count > 0);
+
+        let stale_cache = ProcessScanCache {
+            process_count: 1,
+            zombie_count: 2,
+            zombie_pids: vec![99, 100],
+        };
+        process_cache = stale_cache.clone();
+
+        let cheap_tick_state = daemon_tick(
+            &mut sys,
+            &mut process_cache,
+            &mut cpu_window,
+            &mut ram_window,
+            3,
+            1000,
+            1,
+        );
+        assert_eq!(
+            cheap_tick_state["current"]["process_count"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            cheap_tick_state["current"]["zombie_count"].as_u64(),
+            Some(2)
+        );
+        assert_eq!(
+            cheap_tick_state["current"]["zombie_pids"],
+            json!([99, 100])
+        );
+
+        let rescan_tick_state = daemon_tick(
+            &mut sys,
+            &mut process_cache,
+            &mut cpu_window,
+            &mut ram_window,
+            3,
+            1000,
+            PROC_SCAN_EVERY_N_TICKS,
+        );
+        assert_ne!(process_cache, stale_cache);
+        assert!(process_cache.process_count > 0);
+        assert_eq!(
+            rescan_tick_state["current"]["process_count"].as_u64(),
+            Some(process_cache.process_count as u64)
+        );
+    }
+
+    #[test]
+    fn is_idle_detects_stale_and_fresh_heartbeats() {
+        let ttl = 600_000;
+        let now = 1_700_000_000_000u64;
+        assert!(is_idle(now - ttl - 1, now, ttl));
+        assert!(!is_idle(now - ttl, now, ttl));
+        assert!(!is_idle(now - 1, now, ttl));
+    }
+
+    #[test]
+    fn daemon_state_json_has_required_keys() {
+        let mut sys = System::new();
+        sys.refresh_processes(ProcessesToUpdate::All, true);
+        let mut process_cache = scan_process_fields(&sys);
+        let mut cpu_window: Vec<f64> = Vec::with_capacity(2);
+        let mut ram_window: Vec<u64> = Vec::with_capacity(2);
+
+        let state = daemon_tick(
+            &mut sys,
+            &mut process_cache,
+            &mut cpu_window,
+            &mut ram_window,
+            2,
+            1000,
+            0,
+        );
+
+        for key in ["ok", "current", "window", "interval_ms", "updated_at_ms"] {
+            assert!(state.get(key).is_some(), "missing top-level key: {key}");
+        }
+        for key in [
+            "ok",
+            "total_ram_mb",
+            "available_ram_mb",
+            "swap_used_mb",
+            "cpu_percent",
+            "process_count",
+            "zombie_count",
+            "zombie_pids",
+            "sampled_at_ms",
+        ] {
+            assert!(
+                state["current"].get(key).is_some(),
+                "missing current key: {key}"
+            );
+        }
+        for key in ["samples", "cpu_avg", "cpu_peak", "min_available_ram_mb"] {
+            assert!(
+                state["window"].get(key).is_some(),
+                "missing window key: {key}"
+            );
+        }
     }
 }

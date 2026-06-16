@@ -31,8 +31,9 @@ if TYPE_CHECKING:
 
 STATE_FILE_NAME = "guard_state.json"
 PID_FILE_NAME = "guard_daemon.pid"
-DEFAULT_INTERVAL_MS = 200
-DEFAULT_WINDOW = 25
+HEARTBEAT_FILE_NAME = "guard_heartbeat"
+DEFAULT_INTERVAL_MS = 1000
+DEFAULT_WINDOW = 10
 STALE_AFTER_MS = 3_000
 _MAX_REPORTED = 50
 DEFAULT_ENFORCE_CPU = 90.0
@@ -275,6 +276,13 @@ def _protected_pids(protect: list[int] | tuple[int, ...], store_dir: Path | str 
     return protected
 
 
+def touch_heartbeat(store_dir: Path | str | None = None) -> None:
+    """Update the daemon heartbeat mtime (best-effort)."""
+    base = _store_base(store_dir)
+    base.mkdir(parents=True, exist_ok=True)
+    (base / HEARTBEAT_FILE_NAME).touch()
+
+
 def read_daemon_state(*, store_dir: Path | str | None = None) -> dict[str, Any] | None:
     """Read the daemon's published state. Returns None when absent; sets
     ``stale`` when the file is older than STALE_AFTER_MS."""
@@ -326,6 +334,7 @@ def start_daemon(
         start_new_session=True,
     )
     (base / PID_FILE_NAME).write_text(str(process.pid), encoding="utf-8")
+    touch_heartbeat(base)
     return {
         "ok": True,
         "started": True,
@@ -479,6 +488,7 @@ def _is_owned(pid: int, owned_roots: list[int], parents: dict[int, int]) -> bool
 
 
 __all__ = [
+    "HEARTBEAT_FILE_NAME",
     "auto_enforce",
     "daemon_status",
     "enforce",
@@ -487,4 +497,5 @@ __all__ = [
     "scan",
     "start_daemon",
     "stop_daemon",
+    "touch_heartbeat",
 ]

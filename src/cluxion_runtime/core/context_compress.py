@@ -1,17 +1,16 @@
-"""Deterministic context compression: stage 1 of the 70% -> 30% pipeline.
+"""Context compression: 70% trigger -> 30% target pipeline.
 
-Pure-Python mirror of ``rust/cluxion_queue/src/context.rs`` — every
+Stage 1 (deterministic) mirrors ``rust/cluxion_queue/src/context.rs`` — every
 constant, threshold, ordering rule, and the token estimator must stay in
-lockstep so the three backends produce identical output (parity-tested).
+lockstep so the three backends produce identical Stage-1 output (parity-tested).
+
+Stages 2 (LLM summarization via ``hermes -z``) and 3 (hybrid forgetting) are
+Python-only; the Rust mirror intentionally does not replicate LLM or forgetforge
+calls. Disable them with ``enable_llm_summary`` / ``enable_forget`` for Stage-1
+parity.
 
 What stays untouched: pinned messages (explicit ``pinned``, the first
 user message = task intent, the most recent ``keep_recent`` turns).
-Stages run oldest-first and stop as soon as usage reaches the target:
-  A. truncate long messages (head + tail excerpt)
-  B. drop exact duplicates (trimmed-content match)
-  C. fold remaining old turns into one-line digests
-If the target is still not met the result carries ``ai_summary_request``
-telling the host AI which messages to summarize and what to preserve.
 """
 
 from __future__ import annotations
@@ -19,6 +18,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from cluxion_runtime.core.hybrid_forget import apply_hybrid_forget
+from cluxion_runtime.core.llm_compress import hermes_available, summarize_messages
 from cluxion_runtime.core.preprocess import estimate_tokens
 
 if TYPE_CHECKING:
@@ -70,6 +71,12 @@ def compress(payload: Mapping[str, object]) -> dict[str, object]:
     trigger_ratio = _ratio(payload, "trigger_ratio", DEFAULT_TRIGGER_RATIO)
     target_ratio = _ratio(payload, "target_ratio", DEFAULT_TARGET_RATIO)
     keep_recent = _uint(payload, "keep_recent_turns", DEFAULT_KEEP_RECENT)
+    enable_llm = _bool_flag(payload, "enable_llm_summary", True)
+    enable_forget = _bool_flag(payload, "enable_forget", True)
+    model = payload.get("model") if isinstance(payload.get("model"), str) else None
+    session_id = payload.get("session_id") if isinstance(payload.get("session_id"), str) else None
+    timeout_raw = payload.get("llm_timeout_s")
+    timeout_s = float(timeout_raw) if isinstance(timeout_raw, (int, float)) and not isinstance(timeout_raw, bool) else 120.0
 
     tokens_before = sum(estimate_tokens(m.content) for m in messages)
     usage_before = tokens_before / context_limit
@@ -102,11 +109,69 @@ def compress(payload: Mapping[str, object]) -> dict[str, object]:
         if changed:
             stages.append("digest")
 
-    summary_request = None
-    if total > target_tokens:
-        summary_request = _build_summary_request(messages, pinned, total, target_tokens)
+    summary_request: dict[str, object] | None = None
+    dropped_without_backup = False
+    over_target_pinned_only = False
+    forced_over_target = False
 
-    return _result_payload(messages, tokens_before, total, context_limit, stages, summary_request, pinned)
+    if total > target_tokens and enable_llm and hermes_available():
+        summary_request = _build_summary_request(messages, pinned, total, target_tokens)
+        indices = summary_request["summarize_indices"]
+        if isinstance(indices, list) and indices:
+            summaries = summarize_messages(
+                messages,
+                indices,  # type: ignore[arg-type]
+                str(summary_request.get("instructions", "")),
+                model=model,
+                timeout_s=timeout_s,
+            )
+            if summaries is not None:
+                for idx, summary in summaries.items():
+                    if idx in pinned or idx < 0 or idx >= len(messages):
+                        continue
+                    old_tokens = estimate_tokens(messages[idx].content)
+                    messages[idx].content = summary
+                    total = total - old_tokens + estimate_tokens(summary)
+                stages.append("llm_summary")
+                summary_request = None
+        # fail-safe: keep Stage-1 output and ai_summary_request on LLM failure
+
+    if total > target_tokens and enable_forget:
+        forget_result = apply_hybrid_forget(
+            messages,
+            pinned,
+            total,
+            target_tokens,
+            session_id=session_id,
+        )
+        messages = forget_result.messages
+        total = forget_result.tokens_after
+        dropped_without_backup = forget_result.dropped_without_backup
+        over_target_pinned_only = forget_result.over_target_pinned_only
+        if forget_result.dropped_indices:
+            stages.append("forget")
+        pinned = _pinned_indices(messages, keep_recent)
+
+    if total > target_tokens:
+        if summary_request is None:
+            summary_request = _build_summary_request(messages, pinned, total, target_tokens)
+        if over_target_pinned_only or not any(idx not in pinned for idx in range(len(messages))):
+            over_target_pinned_only = True
+        if total / context_limit > trigger_ratio:
+            forced_over_target = True
+
+    return _result_payload(
+        messages,
+        tokens_before,
+        total,
+        context_limit,
+        stages,
+        summary_request,
+        pinned,
+        dropped_without_backup=dropped_without_backup,
+        over_target_pinned_only=over_target_pinned_only,
+        forced_over_target=forced_over_target,
+    )
 
 
 def _resolve_context_limit(payload: Mapping[str, object]) -> int:
@@ -132,6 +197,13 @@ def _ratio(payload: Mapping[str, object], key: str, default: float) -> float:
 def _uint(payload: Mapping[str, object], key: str, default: int) -> int:
     value = payload.get(key)
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return default
+
+
+def _bool_flag(payload: Mapping[str, object], key: str, default: bool) -> bool:
+    value = payload.get(key)
+    if isinstance(value, bool):
         return value
     return default
 
@@ -235,8 +307,12 @@ def _result_payload(
     stages: list[str],
     summary_request: dict[str, object] | None,
     pinned: list[int],
+    *,
+    dropped_without_backup: bool = False,
+    over_target_pinned_only: bool = False,
+    forced_over_target: bool = False,
 ) -> dict[str, object]:
-    return {
+    result: dict[str, object] = {
         "ok": True,
         "compressed": bool(stages),
         "tokens_before": tokens_before,
@@ -249,6 +325,13 @@ def _result_payload(
         "messages": [{"role": m.role, "content": m.content, "pinned": m.pinned} for m in messages],
         "ai_summary_request": summary_request,
     }
+    if dropped_without_backup:
+        result["dropped_without_backup"] = True
+    if over_target_pinned_only:
+        result["over_target_pinned_only"] = True
+    if forced_over_target:
+        result["forced_over_target"] = True
+    return result
 
 
 __all__ = ["compress", "estimate_tokens"]

@@ -170,6 +170,10 @@ def test_resource_snapshot_uses_non_blocking_cpu_percent(monkeypatch: pytest.Mon
     monkeypatch.setattr("psutil.virtual_memory", lambda: Memory())
     monkeypatch.setattr("psutil.swap_memory", lambda: Swap())
     monkeypatch.setattr("psutil.cpu_percent", fake_cpu_percent)
+    monkeypatch.setattr(
+        "cluxion_runtime.resources.guard_bridge.read_daemon_state",
+        lambda store_dir=None: None,
+    )
 
     snapshot = collect_resource_snapshot()
 

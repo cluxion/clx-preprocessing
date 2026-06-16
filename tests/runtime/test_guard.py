@@ -118,6 +118,33 @@ def test_stop_daemon_refuses_foreign_pid(tmp_path: Path) -> None:
     assert result["reason"] == "identity_mismatch"
 
 
+def test_touch_heartbeat_updates_mtime(tmp_path: Path) -> None:
+    heartbeat = tmp_path / guard_bridge.HEARTBEAT_FILE_NAME
+    stale_mtime = time.time() - 3600
+    heartbeat.touch()
+    os.utime(heartbeat, (stale_mtime, stale_mtime))
+    before = heartbeat.stat().st_mtime
+
+    guard_bridge.touch_heartbeat(store_dir=tmp_path)
+
+    assert heartbeat.stat().st_mtime > before
+
+
+def test_start_daemon_touches_heartbeat(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv(queue_bridge.QUEUE_BIN_ENV, "/nonexistent/cluxion-queue")
+    monkeypatch.setattr(guard_bridge, "_which", lambda _binary: False)
+    heartbeat = tmp_path / guard_bridge.HEARTBEAT_FILE_NAME
+    assert not heartbeat.exists()
+
+    started = guard_bridge.start_daemon(store_dir=tmp_path, interval_ms=100, window=5)
+    assert started["ok"] is True and started["started"] is True
+    try:
+        assert heartbeat.exists()
+        assert heartbeat.stat().st_mtime > 0
+    finally:
+        guard_bridge.stop_daemon(store_dir=tmp_path)
+
+
 class _FakeProcess:
     def __init__(self, cmdline: list[str]) -> None:
         self._cmdline = cmdline
