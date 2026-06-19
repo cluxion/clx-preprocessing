@@ -8,6 +8,7 @@ replicate LLM calls.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -19,14 +20,30 @@ if TYPE_CHECKING:
 
 DEFAULT_TIMEOUT_S = 120.0
 _HERMES_BIN = "hermes"
+logger = logging.getLogger(__name__)
 
 _SUMMARY_INSTRUCTIONS = (
     "Summarize each message by importance. PRESERVE ABOVE ALL: the user's intent and "
     "direction, decisions made, unresolved items, file paths / identifiers / commands — "
     "regardless of language (Korean or English). "
+    "ONLY summarize content actually present in the message. NEVER invent, add, infer, "
+    "or fabricate any identifier, number, name, port, path, or fact that is not in the "
+    "original. If unsure whether something is in the source, OMIT it. "
     "Compress everything else. Each summary < 10% of the original. "
     'Output STRICT JSON: {"<index>": "<summary>", ...} only.'
 )
+
+_HARD_TOKEN_RE = re.compile(
+    r"\b(?:"
+    r"\d+(?:\.\d+)?(?:k|m|만|억)?"
+    r"|[A-Za-z][\w.-]*\d[\w.-]*"
+    r"|\d[\w.-]+"
+    r")\b",
+    re.IGNORECASE,
+)
+_NUMERIC_SUFFIX_RE = re.compile(r"^(\d+(?:\.\d+)?)(k|m|만|억)?$", re.IGNORECASE)
+_STRIP_LABEL_PREFIX_RE = re.compile(r"(?:\w+:\s*)+", re.IGNORECASE)
+_SUFFIX_MULTIPLIERS = {"k": 1000, "m": 1_000_000, "만": 10_000, "억": 100_000_000}
 
 
 class _MessageLike(Protocol):
@@ -60,13 +77,119 @@ def summarize_messages(
     if parsed is None:
         return None
     result: dict[int, str] = {}
+    hallucination_stripped = 0
     for idx in indices:
         key = str(idx)
-        if key in parsed and isinstance(parsed[key], str) and parsed[key].strip():
-            result[idx] = parsed[key].strip()
+        if key not in parsed or not isinstance(parsed[key], str) or not parsed[key].strip():
+            continue
+        summary = parsed[key].strip()
+        if idx < 0 or idx >= len(messages):
+            result[idx] = summary
+            continue
+        try:
+            guarded, stripped = _apply_hallucination_guard(summary, messages[idx].content)
+        except Exception:
+            logger.exception("llm_compress: hallucination guard failed for message %s", idx)
+            return None
+        if guarded is None:
+            return None
+        hallucination_stripped += stripped
+        result[idx] = guarded
     if not result:
         return None
+    if hallucination_stripped > 0:
+        logger.info(
+            "llm_compress: stripped %d hallucinated token(s) from summaries",
+            hallucination_stripped,
+        )
     return result
+
+
+def _normalize_for_match(text: str) -> str:
+    return re.sub(r"[,\s]+", "", text.lower())
+
+
+def _numeric_variants(token: str) -> set[str]:
+    norm = _normalize_for_match(token)
+    variants = {norm}
+    match = _NUMERIC_SUFFIX_RE.match(norm)
+    if not match:
+        return variants
+    base, suffix = match.group(1), match.group(2)
+    variants.add(_normalize_for_match(base))
+    if suffix:
+        multiplier = _SUFFIX_MULTIPLIERS.get(suffix.lower())
+        if multiplier is not None:
+            try:
+                expanded = str(int(float(base) * multiplier))
+            except ValueError:
+                expanded = None
+            if expanded:
+                variants.add(expanded)
+    return variants
+
+
+def _token_traceable_in_source(token: str, source: str) -> bool:
+    norm_source = _normalize_for_match(source)
+    norm_token = _normalize_for_match(token)
+
+    if norm_token in norm_source:
+        return True
+
+    for variant in _numeric_variants(token):
+        if variant in norm_source:
+            return True
+
+    digit_groups = re.findall(r"\d+", norm_token)
+    if digit_groups:
+        all_digits_traceable = True
+        for digits in digit_groups:
+            if digits in norm_source:
+                continue
+            traceable = any(variant in norm_source for variant in _numeric_variants(digits))
+            if not traceable:
+                all_digits_traceable = False
+                break
+        if all_digits_traceable:
+            alpha_prefix = re.sub(r"[\d._-]+", "", norm_token)
+            if not alpha_prefix or alpha_prefix in norm_source:
+                return True
+
+    if "." in norm_token:
+        without_dots = norm_token.replace(".", "")
+        if without_dots in norm_source or without_dots in norm_source.replace(".", ""):
+            return True
+
+    return False
+
+
+def _extract_hard_tokens(summary: str) -> list[str]:
+    return list(dict.fromkeys(_HARD_TOKEN_RE.findall(summary)))
+
+
+def _strip_fabricated_token(summary: str, token: str) -> str | None:
+    escaped = re.escape(token)
+    pattern = rf"(?:{_STRIP_LABEL_PREFIX_RE.pattern})?{escaped}\b"
+    stripped = re.sub(pattern, "", summary, count=1, flags=re.IGNORECASE)
+    stripped = re.sub(r"\s+", " ", stripped).strip(" \t\n\r,;:-")
+    stripped = re.sub(r"[,;:\-]\s*$", "", stripped).strip()
+    if not stripped or not re.search(r"\w", stripped):
+        return None
+    return stripped
+
+
+def _apply_hallucination_guard(summary: str, source: str) -> tuple[str | None, int]:
+    guarded = summary
+    stripped_count = 0
+    for token in _extract_hard_tokens(summary):
+        if _token_traceable_in_source(token, source):
+            continue
+        updated = _strip_fabricated_token(guarded, token)
+        if updated is None:
+            return None, stripped_count
+        guarded = updated
+        stripped_count += 1
+    return guarded, stripped_count
 
 
 def _build_prompt(

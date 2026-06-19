@@ -179,6 +179,67 @@ def test_summarize_messages_returns_none_on_bad_json(monkeypatch) -> None:
     assert llm_compress.summarize_messages([type("M", (), {"role": "user", "content": "hi"})()], [0]) is None
 
 
+def _msg(content: str):
+    return type("M", (), {"role": "user", "content": content})()
+
+
+def test_hallucination_guard_strips_fabricated_port(monkeypatch) -> None:
+    from cluxion_runtime.core import llm_compress
+
+    source = "Connect to Redis on port 5433 for caching. File: recon_v4.py"
+    llm_json = (
+        '{"0": "Redis caching on port 5433. recon_v4.py. Hot: Redis:6390"}'
+    )
+    monkeypatch.setattr(llm_compress, "hermes_available", lambda: True)
+    monkeypatch.setattr(llm_compress, "_call_hermes_oneshot", lambda *a, **k: llm_json)
+
+    result = llm_compress.summarize_messages([_msg(source)], [0])
+    assert result is not None
+    assert "6390" not in result[0]
+    assert "Hot:" not in result[0]
+    assert "5433" in result[0]
+    assert "recon_v4.py" in result[0]
+
+
+def test_hallucination_guard_keeps_normalized_number(monkeypatch) -> None:
+    from cluxion_runtime.core import llm_compress
+
+    source = "Daily traffic is 482,000 requests with peak at 14 months uptime."
+    llm_json = '{"0": "Traffic 482k requests, 14mo uptime."}'
+    monkeypatch.setattr(llm_compress, "hermes_available", lambda: True)
+    monkeypatch.setattr(llm_compress, "_call_hermes_oneshot", lambda *a, **k: llm_json)
+
+    result = llm_compress.summarize_messages([_msg(source)], [0])
+    assert result is not None
+    assert "482k" in result[0]
+    assert "14mo" in result[0]
+
+
+def test_hallucination_guard_keeps_korean_normalized_number(monkeypatch) -> None:
+    from cluxion_runtime.core import llm_compress
+
+    source = "일평균 482,000건 처리, Redis 포트 5433 사용."
+    llm_json = '{"0": "일평균 482k/day, Redis 5433."}'
+    monkeypatch.setattr(llm_compress, "hermes_available", lambda: True)
+    monkeypatch.setattr(llm_compress, "_call_hermes_oneshot", lambda *a, **k: llm_json)
+
+    result = llm_compress.summarize_messages([_msg(source)], [0])
+    assert result is not None
+    assert "482k" in result[0]
+    assert "5433" in result[0]
+
+
+def test_hallucination_guard_all_fabricated_returns_none(monkeypatch) -> None:
+    from cluxion_runtime.core import llm_compress
+
+    source = "Discuss caching strategy for the API layer."
+    llm_json = '{"0": "Hot: Redis:6390"}'
+    monkeypatch.setattr(llm_compress, "hermes_available", lambda: True)
+    monkeypatch.setattr(llm_compress, "_call_hermes_oneshot", lambda *a, **k: llm_json)
+
+    assert llm_compress.summarize_messages([_msg(source)], [0]) is None
+
+
 def test_pinned_recent_last_resort_brings_under_target(monkeypatch) -> None:
     """Live edge case: all messages pinned and huge — intent preserved, usage <= target."""
     monkeypatch.setattr(context_compress, "hermes_available", lambda: False)
