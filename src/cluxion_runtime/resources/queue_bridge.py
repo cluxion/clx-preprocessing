@@ -114,15 +114,72 @@ def queue_status(*, store_dir: Path | None = None) -> dict[str, object]:
 
 def compress_context(payload: Mapping[str, object]) -> dict[str, object]:
     """Deterministic context compression — pure function, no store_dir involved."""
-    body = dict(payload)
-    backend = resolve_backend()
-    if backend == "native":
-        return _invoke_native("context-compress", body)
-    if backend == "subprocess":
-        return _invoke_subprocess("context-compress", body)
     from cluxion_runtime.core import context_compress
 
-    return context_compress.compress(body)
+    body = dict(payload)
+    backend = resolve_backend()
+    if backend == "python":
+        return context_compress.compress(body)
+    if backend == "native":
+        stage1 = _invoke_native("context-compress", body)
+    else:
+        stage1 = _invoke_subprocess("context-compress", body)
+    return _finalize_context_compress(body, stage1)
+
+
+def _context_trigger_ratio(payload: Mapping[str, object]) -> float:
+    from cluxion_runtime.core.context_compress import DEFAULT_TRIGGER_RATIO
+
+    value = payload.get("trigger_ratio")
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and 0.0 < float(value) < 1.0:
+        return float(value)
+    return DEFAULT_TRIGGER_RATIO
+
+
+def _context_bool_flag(payload: Mapping[str, object], key: str, default: bool) -> bool:
+    value = payload.get(key)
+    if isinstance(value, bool):
+        return value
+    return default
+
+
+def _finalize_context_compress(body: Mapping[str, object], stage1: dict[str, object]) -> dict[str, object]:
+    """After Rust Stage-1, continue the Python pipeline when still above trigger."""
+    from cluxion_runtime.core import context_compress
+
+    trigger_ratio = _context_trigger_ratio(body)
+    usage_after = float(stage1.get("usage_after", 0))
+    if usage_after <= trigger_ratio:
+        stage1["reached_target"] = True
+        return stage1
+
+    enable_llm = _context_bool_flag(body, "enable_llm_summary", True)
+    enable_forget = _context_bool_flag(body, "enable_forget", True)
+    if not enable_llm and not enable_forget:
+        stage1["reached_target"] = False
+        if stage1.get("ai_summary_request"):
+            stage1["requires_summary"] = True
+        return stage1
+
+    continued_body = dict(body)
+    messages = stage1.get("messages")
+    if isinstance(messages, list):
+        continued_body["messages"] = messages
+    continued = context_compress.compress(continued_body)
+    continued_usage = float(continued.get("usage_after", 1.0))
+    continued["reached_target"] = continued_usage <= trigger_ratio
+    if not continued["reached_target"] and continued.get("ai_summary_request"):
+        continued["requires_summary"] = True
+
+    stage1_stages = stage1.get("stages_applied")
+    continued_stages = continued.get("stages_applied")
+    if isinstance(stage1_stages, list) and isinstance(continued_stages, list):
+        merged = list(stage1_stages)
+        for stage in continued_stages:
+            if stage not in merged:
+                merged.append(stage)
+        continued["stages_applied"] = merged
+    return continued
 
 
 def _invoke(command: str, payload: Mapping[str, object], *, store_dir: Path | None) -> dict[str, object]:

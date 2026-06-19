@@ -43,6 +43,7 @@ def register(ctx: object) -> None:
     register_hook = getattr(ctx, "register_hook", None)
     if callable(register_hook):
         register_hook("on_session_start", guard_watch.on_session_start)
+        register_hook("on_session_end", guard_watch.on_session_end)
         register_hook("post_tool_call", guard_watch.post_tool_call)
 
     register_mw = getattr(ctx, "register_middleware", None)

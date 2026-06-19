@@ -206,11 +206,27 @@ def _run_context_compress(_: argparse.Namespace) -> int:
     return 0
 
 
+_VALID_GUARD_ACTIONS = frozenset({"status", "start", "stop", "enforce", "auto-enforce"})
+
+
+def _guard_action_error(action: str) -> str:
+    return (
+        f"unknown guard action: {action} "
+        "(expected: status|start|stop|enforce|auto-enforce)"
+    )
+
+
 def _run_guard(_: argparse.Namespace) -> int:
     from cluxion_runtime.resources import guard_bridge
 
     payload = _payload_from_stdin()
     action = str(payload.get("action", "status"))
+    if action not in _VALID_GUARD_ACTIONS:
+        print(
+            json.dumps({"ok": False, "error": _guard_action_error(action)}, ensure_ascii=False, sort_keys=True),
+            file=sys.stderr,
+        )
+        return 1
     try:
         if action == "start":
             result = guard_bridge.start_daemon(
@@ -256,9 +272,8 @@ def _run_guard(_: argparse.Namespace) -> int:
                 result["scan"] = guard_bridge.scan([int(pid) for pid in owned_roots])
         else:
             print(
-                json.dumps(
-                    {"ok": False, "error": f"unknown guard action: {action}"}, ensure_ascii=False, sort_keys=True
-                )
+                json.dumps({"ok": False, "error": _guard_action_error(action)}, ensure_ascii=False, sort_keys=True),
+                file=sys.stderr,
             )
             return 1
     except RuntimeError as exc:

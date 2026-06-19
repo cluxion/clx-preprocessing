@@ -35,13 +35,15 @@ _SUMMARY_INSTRUCTIONS = (
 
 _HARD_TOKEN_RE = re.compile(
     r"\b(?:"
-    r"\d+(?:\.\d+)?(?:k|m|만|억)?"
+    r"\d+(?:[._]\d+)+(?:k|m|만|억)?"
+    r"|\d+(?:\.\d+)?(?:k|m|만|억)?"
     r"|[A-Za-z][\w.-]*\d[\w.-]*"
     r"|\d[\w.-]+"
     r")\b",
     re.IGNORECASE,
 )
 _NUMERIC_SUFFIX_RE = re.compile(r"^(\d+(?:\.\d+)?)(k|m|만|억)?$", re.IGNORECASE)
+_MULTI_GROUP_NUMERIC_RE = re.compile(r"^\d+(?:[._]\d+)+$")
 _STRIP_LABEL_PREFIX_RE = re.compile(r"(?:\w+:\s*)+", re.IGNORECASE)
 _SUFFIX_MULTIPLIERS = {"k": 1000, "m": 1_000_000, "만": 10_000, "억": 100_000_000}
 
@@ -129,9 +131,24 @@ def _numeric_variants(token: str) -> set[str]:
     return variants
 
 
+def _bounded_numeric_in_source(norm_token: str, norm_source: str) -> bool:
+    """Match a dotted/underscored numeric token only as a complete identifier."""
+    pattern = rf"(?<![\d._]){re.escape(norm_token)}(?![\d._])"
+    return re.search(pattern, norm_source) is not None
+
+
 def _token_traceable_in_source(token: str, source: str) -> bool:
     norm_source = _normalize_for_match(source)
     norm_token = _normalize_for_match(token)
+
+    # Version/IP/port-like tokens must match atomically — never as a substring prefix
+    # of a longer value (e.g. 0.3.1 must not trace to source 0.3.17).
+    if _MULTI_GROUP_NUMERIC_RE.match(norm_token):
+        if _bounded_numeric_in_source(norm_token, norm_source):
+            return True
+        return any(
+            _bounded_numeric_in_source(variant, norm_source) for variant in _numeric_variants(token)
+        )
 
     if norm_token in norm_source:
         return True

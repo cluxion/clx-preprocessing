@@ -1,13 +1,22 @@
-name: hermes-cluxion
-version: 0.1.9
+name: cluxion-agentplugin-preprocessing
+version: 0.3.18
 description: "Universal agent preprocessing plugin: honesty contracts, clarification, Rust work queue, resource-aware harness handoff. Connected AI calls cluxion tools; plugin does not own models."
 author: cluxion
 kind: standalone
 provides_tools:
-  - cluxion_bootstrap
   - cluxion_plan
+  - cluxion_clarify
+  - cluxion_bootstrap
   - cluxion_serve_local
   - cluxion_hermes_config
   - cluxion_queue_next
   - cluxion_queue_record
   - cluxion_queue_brief
+  - cluxion_context_compress
+  - cluxion_guard
+  - cluxion_web_search
+  - cluxion_browser_open
+  - cluxion_browser_extract
+  - cluxion_browser_click
+  - cluxion_browser_type
+  - cluxion_doctor

@@ -205,6 +205,14 @@ def test_context_compress_rejects_malformed_messages() -> None:
         raise AssertionError("expected ValueError")
 
 
+def test_guard_unknown_action_returns_clear_error() -> None:
+    result = runner.guard({"action": "sample"})
+    payload = json.loads(result.to_json())
+    assert result.ok is False
+    assert "unknown guard action: sample" in payload["error"]
+    assert "status|start|stop|enforce|auto-enforce" in payload["error"]
+
+
 def test_context_compress_accepts_valid_messages_structure() -> None:
     try:
         runner.context_compress({"messages": [{"content": "hello world"}]})

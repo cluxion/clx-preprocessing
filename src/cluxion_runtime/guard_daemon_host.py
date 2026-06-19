@@ -15,8 +15,9 @@ import psutil
 STATE_FILE_NAME = "guard_state.json"
 HEARTBEAT_FILE_NAME = "guard_heartbeat"
 PID_FILE_NAME = "guard_daemon.pid"
-DEFAULT_IDLE_TTL_MS = 600_000
+DEFAULT_IDLE_TTL_MS = 120_000
 PROC_SCAN_EVERY_N_TICKS = 5
+STATE_WRITE_EVERY_N_TICKS = 30
 _MAX_REPORTED_PIDS = 50
 _MIN_INTERVAL_MS = 100
 _MIN_WINDOW = 1
@@ -145,6 +146,35 @@ def _write_state_atomically(store_dir: Path, state: dict[str, Any]) -> None:
     os.replace(tmp_path, state_path)
 
 
+def _state_write_fingerprint(state: dict[str, Any]) -> str:
+    """Stable snapshot key excluding volatile timestamps."""
+    current = dict(state.get("current", {}))
+    current.pop("sampled_at_ms", None)
+    window = state.get("window")
+    payload = {
+        "current": current,
+        "window": window,
+        "interval_ms": state.get("interval_ms"),
+    }
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+def _write_state_if_changed(
+    store_dir: Path,
+    state: dict[str, Any],
+    *,
+    last_fingerprint: str | None,
+    tick: int,
+) -> str:
+    fingerprint = _state_write_fingerprint(state)
+    if (
+        fingerprint != last_fingerprint
+        or tick % STATE_WRITE_EVERY_N_TICKS == 0
+    ):
+        _write_state_atomically(store_dir, state)
+    return fingerprint
+
+
 def _idle_ttl_ms() -> int:
     raw = os.environ.get("CLUXION_GUARD_IDLE_TTL_MS")
     if raw is None:
@@ -192,10 +222,11 @@ def _daemon_loop_step(
     interval_ms: int,
     tick: int,
     idle_ttl_ms: int,
+    last_fingerprint: str | None = None,
     now_ms: int | None = None,
-) -> tuple[bool, ProcessScanCache]:
+) -> tuple[bool, ProcessScanCache, str]:
     if _check_idle_exit(base, idle_ttl_ms, now_ms=now_ms):
-        return False, process_cache
+        return False, process_cache, last_fingerprint or ""
     state, process_cache = _python_daemon_tick(
         process_cache,
         cpu_window,
@@ -204,8 +235,13 @@ def _daemon_loop_step(
         interval_ms,
         tick,
     )
-    _write_state_atomically(base, state)
-    return True, process_cache
+    fingerprint = _write_state_if_changed(
+        base,
+        state,
+        last_fingerprint=last_fingerprint,
+        tick=tick,
+    )
+    return True, process_cache, fingerprint
 
 
 def _run_python_daemon(store_dir: str, interval_ms: int, window: int) -> None:
@@ -219,9 +255,10 @@ def _run_python_daemon(store_dir: str, interval_ms: int, window: int) -> None:
     cpu_window: list[float] = []
     ram_window: list[int] = []
     tick = 0
+    last_fingerprint: str | None = None
 
     while True:
-        keep_running, process_cache = _daemon_loop_step(
+        keep_running, process_cache, last_fingerprint = _daemon_loop_step(
             base,
             process_cache=process_cache,
             cpu_window=cpu_window,
@@ -230,6 +267,7 @@ def _run_python_daemon(store_dir: str, interval_ms: int, window: int) -> None:
             interval_ms=interval_ms,
             tick=tick,
             idle_ttl_ms=idle_ttl_ms,
+            last_fingerprint=last_fingerprint,
         )
         if not keep_running:
             return

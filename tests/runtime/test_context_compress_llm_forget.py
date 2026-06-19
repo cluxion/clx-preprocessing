@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
+
+import pytest
 
 from cluxion_runtime.core import context_compress
 from cluxion_runtime.core.context_compress import _Msg
@@ -268,6 +271,48 @@ def test_hallucination_guard_keeps_korean_normalized_number(monkeypatch) -> None
     assert result is not None
     assert "482k" in result[0]
     assert "5433" in result[0]
+
+
+@pytest.mark.parametrize(
+    "fabricated",
+    ["0.3.7", "0.3.1", "3.17", "0.17", "0.31.7", "1.3.17"],
+)
+def test_hallucination_guard_strips_fabricated_version_parts(fabricated: str, monkeypatch) -> None:
+    from cluxion_runtime.core import llm_compress
+
+    source = "deployed version 0.3.17 of the package"
+    llm_json = json.dumps({"0": f"Package version {fabricated} deployed."})
+    monkeypatch.setattr(llm_compress, "hermes_available", lambda: True)
+    monkeypatch.setattr(llm_compress, "_call_hermes_oneshot", lambda *a, **k: llm_json)
+
+    result = llm_compress.summarize_messages([_msg(source)], [0])
+    assert result is not None
+    assert fabricated not in result[0]
+    assert "0.3.17" in result[0] or "version" in result[0].lower()
+
+
+def test_hallucination_guard_keeps_exact_version(monkeypatch) -> None:
+    from cluxion_runtime.core import llm_compress
+
+    source = "deployed version 0.3.17 of the package"
+    llm_json = '{"0": "Deployed version 0.3.17."}'
+    monkeypatch.setattr(llm_compress, "hermes_available", lambda: True)
+    monkeypatch.setattr(llm_compress, "_call_hermes_oneshot", lambda *a, **k: llm_json)
+
+    result = llm_compress.summarize_messages([_msg(source)], [0])
+    assert result is not None
+    assert "0.3.17" in result[0]
+
+
+def test_apply_hallucination_guard_strips_invented_version() -> None:
+    from cluxion_runtime.core import llm_compress
+
+    source = "Current package is version 0.3.17 only."
+    summary = "We bumped to version 1.2.3 for this release."
+    guarded, stripped = llm_compress._apply_hallucination_guard(summary, source)
+    assert stripped >= 1
+    assert guarded is not None
+    assert "1.2.3" not in guarded
 
 
 def test_hallucination_guard_all_fabricated_returns_none(monkeypatch) -> None:

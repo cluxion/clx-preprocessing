@@ -26,6 +26,12 @@ _last_watch_at: float | None = None
 _last_warning_at: float | None = None
 
 
+def on_session_end(**_: Any) -> None:
+    """Stop the guard daemon on clean session end so orphans do not linger."""
+    with contextlib.suppress(Exception):
+        guard_bridge.stop_daemon()
+
+
 def on_session_start(**_: Any) -> None:
     """Start the guard daemon unless ``CLUXION_GUARD_AUTOSTART=0`` or ``false``.
 
@@ -111,4 +117,4 @@ def _warn(message: str) -> None:
     print(message, file=sys.stderr)
 
 
-__all__ = ["on_session_start", "post_tool_call"]
+__all__ = ["on_session_end", "on_session_start", "post_tool_call"]

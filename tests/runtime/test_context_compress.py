@@ -121,7 +121,59 @@ def test_model_registry_resolution(backend) -> None:
 def test_backend_matches_python_reference(backend) -> None:
     reference = context_compress.compress(dict(_COMPRESSIBLE))
     result = queue_bridge.compress_context(_COMPRESSIBLE)
-    assert result == reference
+    if backend == "python":
+        assert result == reference
+    else:
+        # Stage-1 backends may add reached_target when continuing the pipeline.
+        result_compare = {k: v for k, v in result.items() if k not in {"reached_target", "requires_summary"}}
+        reference_compare = dict(reference)
+        assert result_compare == reference_compare
+
+
+def test_tool_path_continues_when_stage1_above_trigger(monkeypatch) -> None:
+    """Rust Stage-1-only output above trigger must continue into Python pipeline."""
+    messages = [
+        {"role": "user", "content": "task intent"},
+        {"role": "assistant", "content": _long(80_000)},
+        {"role": "tool", "content": _long(80_000)},
+        {"role": "user", "content": "recent question"},
+    ]
+    full_payload = {
+        "messages": messages,
+        "context_limit_tokens": 40_000,
+        "keep_recent_turns": 1,
+        "enable_llm_summary": False,
+        "enable_forget": True,
+    }
+    stage1 = {
+        "ok": True,
+        "compressed": True,
+        "tokens_before": 90_000,
+        "tokens_after": 34_000,
+        "usage_before": 2.25,
+        "usage_after": 0.85,
+        "context_limit": 40_000,
+        "stages_applied": ["truncate", "digest"],
+        "pinned_indices": [0, 3],
+        "messages": messages,
+        "ai_summary_request": {
+            "reason": "deterministic stages insufficient",
+            "current_tokens": 34_000,
+            "target_tokens": 12_000,
+            "summarize_indices": [1, 2],
+            "instructions": "summarize",
+        },
+    }
+    assert float(stage1["usage_after"]) > 0.70
+
+    monkeypatch.setenv(queue_bridge.QUEUE_BACKEND_ENV, "native")
+    monkeypatch.setattr(queue_bridge, "_invoke_native", lambda *a, **k: dict(stage1))
+    monkeypatch.setattr(context_compress, "hermes_available", lambda: False)
+
+    result = queue_bridge.compress_context(full_payload)
+    trigger = 0.70
+    assert result.get("reached_target") is True
+    assert float(result["usage_after"]) <= trigger
 
 
 def test_missing_messages_raises(backend) -> None:

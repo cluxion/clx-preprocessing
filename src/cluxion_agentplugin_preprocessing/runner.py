@@ -247,10 +247,23 @@ def _execute_json(command: Sequence[str], stdin: str | None, command_runner: Com
     except OSError as exc:
         return RuntimeResult(False, tuple(command), {"error": str(exc)})
     if completed.returncode != 0:
+        error = "cluxion-runtime failed"
+        stderr = completed.stderr.strip()
+        stdout = completed.stdout.strip()
+        for payload_text in (stderr, stdout):
+            if not payload_text:
+                continue
+            try:
+                parsed_err = json.loads(payload_text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed_err, dict) and parsed_err.get("error"):
+                error = str(parsed_err["error"])
+                break
         return RuntimeResult(
             False,
             tuple(command),
-            {"error": "cluxion-runtime failed", "stderr": completed.stderr.strip(), "returncode": completed.returncode},
+            {"error": error, "stderr": stderr, "returncode": completed.returncode},
         )
     try:
         parsed = json.loads(completed.stdout)

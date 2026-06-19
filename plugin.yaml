@@ -1,5 +1,5 @@
 name: cluxion-agentplugin-preprocessing
-version: 0.2.0
+version: 0.3.18
 description: "Universal agent preprocessing plugin: honesty, clarification, Rust work queue, resource admission."
 author: cluxion
 kind: standalone
@@ -17,3 +17,11 @@ provides_tools:
   - cluxion_queue_next
   - cluxion_queue_record
   - cluxion_queue_brief
+  - cluxion_context_compress
+  - cluxion_guard
+  - cluxion_web_search
+  - cluxion_browser_open
+  - cluxion_browser_extract
+  - cluxion_browser_click
+  - cluxion_browser_type
+  - cluxion_doctor

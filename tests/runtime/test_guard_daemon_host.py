@@ -11,13 +11,16 @@ from typing import Any
 import pytest
 
 from cluxion_runtime.guard_daemon_host import (
+    DEFAULT_IDLE_TTL_MS,
     HEARTBEAT_FILE_NAME,
     PID_FILE_NAME,
     PROC_SCAN_EVERY_N_TICKS,
+    STATE_WRITE_EVERY_N_TICKS,
     ProcessScanCache,
     _daemon_loop_step,
     _python_daemon_tick,
     _run_python_daemon,
+    _write_state_if_changed,
     is_idle,
 )
 
@@ -178,7 +181,7 @@ def test_daemon_loop_step_exits_idle_and_removes_pidfile(tmp_path: Path) -> None
     pid_path.write_text("4242", encoding="utf-8")
 
     process_cache = ProcessScanCache(process_count=0, zombie_count=0, zombie_pids=[])
-    keep_running, _ = _daemon_loop_step(
+    keep_running, _, _ = _daemon_loop_step(
         tmp_path,
         process_cache=process_cache,
         cpu_window=[],
@@ -218,7 +221,7 @@ def test_daemon_loop_step_keeps_running_with_fresh_heartbeat(tmp_path: Path) -> 
     pid_path.write_text("4242", encoding="utf-8")
 
     process_cache = ProcessScanCache(process_count=0, zombie_count=0, zombie_pids=[])
-    keep_running, refreshed_cache = _daemon_loop_step(
+    keep_running, refreshed_cache, _ = _daemon_loop_step(
         tmp_path,
         process_cache=process_cache,
         cpu_window=[],
@@ -234,3 +237,23 @@ def test_daemon_loop_step_keeps_running_with_fresh_heartbeat(tmp_path: Path) -> 
     assert pid_path.exists()
     assert refreshed_cache.process_count > 0
     assert (tmp_path / "guard_state.json").exists()
+
+
+def test_default_idle_ttl_is_two_minutes() -> None:
+    assert DEFAULT_IDLE_TTL_MS == 120_000
+
+
+def test_write_state_if_changed_skips_identical_fingerprint(tmp_path: Path) -> None:
+    process_cache = ProcessScanCache(process_count=0, zombie_count=0, zombie_pids=[])
+    state, _ = _python_daemon_tick(process_cache, [], [], 5, 1000, tick=0)
+    state_path = tmp_path / "guard_state.json"
+
+    fp = _write_state_if_changed(tmp_path, state, last_fingerprint=None, tick=1)
+    first_mtime = state_path.stat().st_mtime
+    assert state_path.exists()
+
+    _write_state_if_changed(tmp_path, state, last_fingerprint=fp, tick=2)
+    assert state_path.stat().st_mtime == first_mtime
+
+    _write_state_if_changed(tmp_path, state, last_fingerprint=fp, tick=STATE_WRITE_EVERY_N_TICKS)
+    assert state_path.stat().st_mtime >= first_mtime

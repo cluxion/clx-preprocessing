@@ -43,6 +43,7 @@ def test_register_adds_guard_hooks_when_supported() -> None:
 
     assert ctx.hooks == {
         "on_session_start": guard_watch.on_session_start,
+        "on_session_end": guard_watch.on_session_end,
         "post_tool_call": guard_watch.post_tool_call,
     }
     assert "cluxion_guard" in ctx.tools
