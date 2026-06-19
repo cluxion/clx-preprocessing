@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import subprocess
+
 from cluxion_runtime.core import context_compress
 from cluxion_runtime.core.context_compress import _Msg
-from cluxion_runtime.core.hybrid_forget import apply_hybrid_forget
+from cluxion_runtime.core.hybrid_forget import _cold_demote, apply_hybrid_forget
 from cluxion_runtime.core.preprocess import estimate_tokens
 
 
@@ -76,6 +78,45 @@ def test_stage3_via_compress_drops_middle_messages(monkeypatch) -> None:
     assert "forget" in result["stages_applied"]
     assert len(result["messages"]) == 2
     assert result.get("over_target_pinned_only") is True
+
+
+def test_cold_demote_returns_true_on_successful_store_only(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr("cluxion_runtime.core.hybrid_forget.forgetforge_available", lambda: True)
+    monkeypatch.setattr("cluxion_runtime.core.hybrid_forget.subprocess.run", fake_run)
+
+    assert _cold_demote("recoverable content", "sess-abc123") is True
+    assert len(calls) == 1
+    assert calls[0] == ["forgetforge", "store", "sess-abc123", "--content", "recoverable content"]
+
+
+def test_cold_demote_returns_false_when_store_fails(monkeypatch) -> None:
+    def fake_run(cmd, **kwargs):
+        raise subprocess.CalledProcessError(1, cmd)
+
+    monkeypatch.setattr("cluxion_runtime.core.hybrid_forget.forgetforge_available", lambda: True)
+    monkeypatch.setattr("cluxion_runtime.core.hybrid_forget.subprocess.run", fake_run)
+
+    assert _cold_demote("content", "sess-fail") is False
+
+
+def test_cold_demote_skips_subprocess_when_forgetforge_unavailable(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr("cluxion_runtime.core.hybrid_forget.forgetforge_available", lambda: False)
+    monkeypatch.setattr("cluxion_runtime.core.hybrid_forget.subprocess.run", fake_run)
+
+    assert _cold_demote("content", "sess-none") is False
+    assert calls == []
 
 
 def test_stage3_sets_dropped_without_backup_for_recoverable(monkeypatch) -> None:

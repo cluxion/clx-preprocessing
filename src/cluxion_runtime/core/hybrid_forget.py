@@ -167,13 +167,6 @@ def _cold_demote(content: str, store_id: str) -> bool:
             text=True,
             timeout=30,
         )
-        subprocess.run(
-            [_FORGETFORGE_BIN, "cold", store_id],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
         return True
     except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
         return False
