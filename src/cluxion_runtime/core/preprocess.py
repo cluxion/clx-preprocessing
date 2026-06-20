@@ -172,8 +172,8 @@ def preprocess_work(
 
 def estimate_tokens(text: str) -> int:
     """Estimate tokens conservatively without depending on the old Cluxion OS package."""
-    cjk = sum(1 for ch in text if ord(ch) > 127)
-    ascii_chars = max(0, len(text) - cjk)
+    ascii_chars = len(text.encode("ascii", "ignore"))
+    cjk = len(text) - ascii_chars
     return max(1, cjk + ascii_chars // 4)
 
 
