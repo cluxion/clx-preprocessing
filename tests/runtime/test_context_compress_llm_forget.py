@@ -9,7 +9,11 @@ import pytest
 
 from cluxion_runtime.core import context_compress
 from cluxion_runtime.core.context_compress import _Msg
-from cluxion_runtime.core.hybrid_forget import _cold_demote, apply_hybrid_forget
+from cluxion_runtime.core.hybrid_forget import (
+    _FORGETFORGE_BIN,
+    _cold_demote,
+    apply_hybrid_forget,
+)
 from cluxion_runtime.core.preprocess import estimate_tokens
 
 
@@ -95,7 +99,13 @@ def test_cold_demote_returns_true_on_successful_store_only(monkeypatch) -> None:
 
     assert _cold_demote("recoverable content", "sess-abc123") is True
     assert len(calls) == 1
-    assert calls[0] == ["forgetforge", "store", "sess-abc123", "--content", "recoverable content"]
+    assert calls[0] == [
+        _FORGETFORGE_BIN,
+        "store",
+        "sess-abc123",
+        "--content",
+        "recoverable content",
+    ]
 
 
 def test_cold_demote_returns_false_when_store_fails(monkeypatch) -> None:

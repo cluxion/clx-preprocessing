@@ -13,13 +13,23 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
 DEFAULT_TIMEOUT_S = 120.0
-_HERMES_BIN = "hermes"
+
+
+def _resolve_bin(name: str) -> str:
+    candidate = os.path.join(os.path.dirname(sys.executable), name)
+    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        return candidate
+    return shutil.which(name) or name
+
+
+_HERMES_BIN = _resolve_bin("hermes")
 logger = logging.getLogger(__name__)
 
 _SUMMARY_INSTRUCTIONS = (
@@ -54,7 +64,9 @@ class _MessageLike(Protocol):
 
 
 def hermes_available() -> bool:
-    return shutil.which(_HERMES_BIN) is not None
+    return (os.path.isfile(_HERMES_BIN) and os.access(_HERMES_BIN, os.X_OK)) or (
+        shutil.which(_HERMES_BIN) is not None
+    )
 
 
 def summarize_messages(

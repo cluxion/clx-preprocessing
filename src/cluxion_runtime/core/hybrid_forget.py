@@ -6,9 +6,11 @@ is removed permanently. Stage 3 is Python-only; the Rust mirror does not run thi
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
+import sys
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
@@ -18,7 +20,14 @@ from cluxion_runtime.core.preprocess import estimate_tokens
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-_FORGETFORGE_BIN = "forgetforge"
+def _resolve_bin(name: str) -> str:
+    candidate = os.path.join(os.path.dirname(sys.executable), name)
+    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        return candidate
+    return shutil.which(name) or name
+
+
+_FORGETFORGE_BIN = _resolve_bin("forgetforge")
 _JUNK_MARKERS = ("[cluxion: duplicate", "[cluxion digest]")
 _IMPORTANCE_KEYWORDS = (
     "decide",
@@ -75,7 +84,9 @@ class ForgetResult:
 
 
 def forgetforge_available() -> bool:
-    return shutil.which(_FORGETFORGE_BIN) is not None
+    return (os.path.isfile(_FORGETFORGE_BIN) and os.access(_FORGETFORGE_BIN, os.X_OK)) or (
+        shutil.which(_FORGETFORGE_BIN) is not None
+    )
 
 
 def apply_hybrid_forget(
