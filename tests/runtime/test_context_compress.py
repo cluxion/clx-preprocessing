@@ -177,5 +177,10 @@ def test_tool_path_continues_when_stage1_above_trigger(monkeypatch) -> None:
 
 
 def test_missing_messages_raises(backend) -> None:
-    with pytest.raises(RuntimeError, match="messages"):
+    with pytest.raises(RuntimeError, match="missing required field: messages"):
         queue_bridge.compress_context({"context_limit_tokens": 1000})
+
+
+def test_non_list_messages_raises(backend) -> None:
+    with pytest.raises(RuntimeError, match="messages must be a list"):
+        queue_bridge.compress_context({"messages": "not-a-list", "context_limit_tokens": 1000})

@@ -58,8 +58,10 @@ class _Msg:
 
 def compress(payload: Mapping[str, object]) -> dict[str, object]:
     raw_messages = payload.get("messages")
-    if not isinstance(raw_messages, list):
+    if raw_messages is None:
         raise RuntimeError("missing required field: messages")
+    if not isinstance(raw_messages, list):
+        raise RuntimeError("messages must be a list")
     messages = [
         _Msg(
             role=str(raw.get("role", "user")) if isinstance(raw, dict) else "user",

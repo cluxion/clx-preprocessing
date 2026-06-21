@@ -46,10 +46,12 @@ struct Msg {
 }
 
 pub fn compress(payload: &Value) -> Result<Value, QueueError> {
-    let raw_messages = payload
-        .get("messages")
-        .and_then(Value::as_array)
-        .ok_or_else(|| QueueError::Usage("missing required field: messages".into()))?;
+    let raw_messages = match payload.get("messages") {
+        None => return Err(QueueError::Usage("missing required field: messages".into())),
+        Some(value) => value.as_array().ok_or_else(|| {
+            QueueError::Usage("messages must be a list".into())
+        })?,
+    };
     let mut messages: Vec<Msg> = Vec::with_capacity(raw_messages.len());
     for raw in raw_messages {
         messages.push(Msg {
