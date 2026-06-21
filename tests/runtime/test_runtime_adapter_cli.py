@@ -189,6 +189,7 @@ def test_queue_brief_waits_until_all_segments_are_recorded(
 ) -> None:
     """The final briefing becomes ready only after every segment result is recorded."""
     monkeypatch.setenv("CLUXION_PREPROCESS_DISPATCH_DIR", str(tmp_path / "dispatch"))
+    monkeypatch.setenv("CLUXION_LOOP_AUTO", "0")
     prompt = "\n".join(f"REQ-{idx}: 보안 검증 결과를 정리해줘." for idx in range(3_500))
 
     assert (

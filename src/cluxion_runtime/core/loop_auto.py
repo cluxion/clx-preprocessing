@@ -153,13 +153,13 @@ def should_auto_loop_plan(plan_payload: Mapping[str, object], *, loop_auto: bool
 def run_loop_auto(options: LoopAutoOptions) -> LoopAutoResult:
     """Drain the dispatch queue via Hermes oneshot calls until briefing completes."""
     start = time.monotonic()
-    runner = options.segment_runner or _default_segment_runner(options)
     records: list[LoopAutoStepRecord] = []
     processed = 0
     failed = 0
     deadline = start + options.timeout_seconds
 
     try:
+        runner = options.segment_runner or _default_segment_runner(options)
         while time.monotonic() < deadline:
             step_payload = next_dispatch_step(options.work_id)
             if not step_payload.get("ready"):
