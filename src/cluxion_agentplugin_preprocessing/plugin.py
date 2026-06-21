@@ -20,6 +20,7 @@ from cluxion_agentplugin_preprocessing.schemas import (
     CONTEXT_COMPRESS_SCHEMA,
     GUARD_SCHEMA,
     HERMES_CONFIG_SCHEMA,
+    LOOP_AUTO_SCHEMA,
     PLAN_SCHEMA,
     QUEUE_BRIEF_SCHEMA,
     QUEUE_NEXT_SCHEMA,
@@ -32,6 +33,7 @@ from cluxion_runtime.core.context_compress import (
     _resolve_context_limit,
     compress,
 )
+from cluxion_runtime.core.loop_auto import strip_loop_auto_directive
 from cluxion_runtime.core.preprocess import estimate_tokens
 
 if TYPE_CHECKING:
@@ -113,6 +115,14 @@ def register(ctx: object) -> None:
         handler=_handle_queue_brief,
         check_fn=_check_runtime_available,
         emoji="📌",
+    )
+    ctx.register_tool(
+        name="cluxion_loop_auto",
+        toolset="cluxion",
+        schema=LOOP_AUTO_SCHEMA,
+        handler=_handle_loop_auto,
+        check_fn=_check_runtime_available,
+        emoji="🔁",
     )
     ctx.register_tool(
         name="cluxion_context_compress",
@@ -201,7 +211,17 @@ def _check_browser_tool_available() -> bool:
 
 
 def _handle_plan(args: dict[str, object], **_: object) -> str:
-    return _json_result(lambda: runner.plan(args).to_json())
+    return _json_result(lambda: runner.plan(_plan_args_with_loop_auto(args)).to_json())
+
+
+def _plan_args_with_loop_auto(args: dict[str, object]) -> dict[str, object]:
+    payload = dict(args)
+    prompt = str(payload.get("prompt", ""))
+    cleaned, had_directive = strip_loop_auto_directive(prompt)
+    if had_directive:
+        payload["prompt"] = cleaned
+        payload["loop_auto"] = True
+    return payload
 
 
 def _handle_clarify(args: dict[str, object], **_: object) -> str:
@@ -230,6 +250,10 @@ def _handle_queue_record(args: dict[str, object], **_: object) -> str:
 
 def _handle_queue_brief(args: dict[str, object], **_: object) -> str:
     return _json_result(lambda: runner.queue_brief(args).to_json())
+
+
+def _handle_loop_auto(args: dict[str, object], **_: object) -> str:
+    return _json_result(lambda: runner.loop_auto(args).to_json())
 
 
 def _handle_context_compress(args: dict[str, object], **_: object) -> str:

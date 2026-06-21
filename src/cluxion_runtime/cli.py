@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from cluxion_runtime.adapters.contract import work_item_from_adapter_payload
@@ -23,6 +24,12 @@ from cluxion_runtime.core.dispatch_store import (
     record_dispatch_result,
 )
 from cluxion_runtime.core.harness import build_harness_plan
+from cluxion_runtime.core.loop_auto import (
+    LoopAutoOptions,
+    run_loop_auto,
+    should_auto_loop_plan,
+    strip_loop_auto_directive,
+)
 from cluxion_runtime.core.plan_codec import plan_to_dict
 from cluxion_runtime.core.types import AgentSurface, ModelRuntimeProfile
 from cluxion_runtime.models import LocalModelSupervisor, build_vllm_mlx_profile
@@ -49,6 +56,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_queue_record(args)
     if args.command == "queue-brief":
         return _run_queue_brief(args)
+    if args.command == "loop-auto":
+        return _run_loop_auto(args)
     if args.command == "context-compress":
         return _run_context_compress(args)
     if args.command == "guard":
@@ -111,6 +120,18 @@ def _build_parser() -> argparse.ArgumentParser:
         "queue-brief", help="Build the final briefing prompt from stored segment results"
     )
     queue_brief.add_argument("--work-id", required=True)
+    loop_auto = subparsers.add_parser(
+        "loop-auto",
+        help="Autonomously drain the dispatch queue via Hermes oneshot calls (/loopAuto)",
+    )
+    loop_auto.add_argument("--work-id", required=True)
+    loop_auto.add_argument("--cwd", default="")
+    loop_auto.add_argument("--hermes-bin", default="hermes")
+    loop_auto.add_argument("--model", default="")
+    loop_auto.add_argument("--timeout-seconds", type=float, default=600.0)
+    loop_auto.add_argument("--max-segment-retries", type=int, default=2)
+    loop_auto.add_argument("--dry-run", action="store_true")
+    loop_auto.add_argument("--json-stdin", action="store_true")
     context_compress = subparsers.add_parser(
         "context-compress",
         help="Deterministically compress conversation context to the target ratio once past the trigger ratio",
@@ -137,6 +158,7 @@ def _run_bootstrap(args: argparse.Namespace) -> int:
 def _run_plan(args: argparse.Namespace) -> int:
     surface = AgentSurface(str(args.surface))
     payload = _payload_from_stdin() if args.json_stdin else _payload_from_args(args)
+    payload = _apply_loop_auto_directive(payload)
     item = work_item_from_adapter_payload(payload, default_surface=surface)
     plan = build_harness_plan(item)
     persisted = persist_dispatch_bundle(plan)
@@ -146,8 +168,41 @@ def _run_plan(args: argparse.Namespace) -> int:
         if isinstance(item_output, dict):
             item_output["original_prompt_stored"] = True
         output["dispatch_store"] = {"stored": True, "path": str(persisted)}
+    loop_auto_flag = payload.get("loop_auto") if isinstance(payload, dict) else None
+    if should_auto_loop_plan(output, loop_auto=bool(loop_auto_flag) if loop_auto_flag is not None else None):
+        cwd = str(payload.get("cwd", "")) if isinstance(payload, dict) else ""
+        loop_result = run_loop_auto(
+            LoopAutoOptions(
+                work_id=plan.item.work_id,
+                cwd=Path(cwd).expanduser() if cwd else Path.cwd(),
+                hermes_bin=str(payload.get("hermes_bin", "hermes")) if isinstance(payload, dict) else "hermes",
+                model=str(payload.get("model", "")) if isinstance(payload, dict) else "",
+                timeout_seconds=float(payload.get("loop_auto_timeout_s", 600)) if isinstance(payload, dict) else 600.0,
+                dry_run=bool(payload.get("loop_auto_dry_run", False)) if isinstance(payload, dict) else False,
+            )
+        )
+        output["loop_auto"] = loop_result.to_dict()
     print(json.dumps(output, ensure_ascii=False, sort_keys=True))
     return 0
+
+
+def _run_loop_auto(args: argparse.Namespace) -> int:
+    payload = _payload_from_stdin() if args.json_stdin else {}
+    work_id = str(payload.get("work_id", args.work_id))
+    cwd_raw = str(payload.get("cwd", args.cwd))
+    result = run_loop_auto(
+        LoopAutoOptions(
+            work_id=work_id,
+            cwd=Path(cwd_raw).expanduser() if cwd_raw else Path.cwd(),
+            hermes_bin=str(payload.get("hermes_bin", args.hermes_bin)),
+            model=str(payload.get("model", args.model)),
+            timeout_seconds=float(payload.get("timeout_seconds", args.timeout_seconds)),
+            max_segment_retries=int(payload.get("max_segment_retries", args.max_segment_retries)),
+            dry_run=bool(payload.get("dry_run", args.dry_run)),
+        )
+    )
+    print(json.dumps(result.to_dict(), ensure_ascii=False, sort_keys=True))
+    return 0 if result.ok else 1
 
 
 def _run_queue_next(args: argparse.Namespace) -> int:
@@ -387,6 +442,17 @@ def _payload_from_args(args: argparse.Namespace) -> dict[str, object]:
         "context_tokens": int(args.context_tokens),
         "cwd": str(args.cwd),
     }
+
+
+def _apply_loop_auto_directive(payload: dict[str, object]) -> dict[str, object]:
+    prompt = str(payload.get("prompt", ""))
+    cleaned, had_directive = strip_loop_auto_directive(prompt)
+    if not had_directive:
+        return payload
+    updated = dict(payload)
+    updated["prompt"] = cleaned
+    updated["loop_auto"] = True
+    return updated
 
 
 if __name__ == "__main__":

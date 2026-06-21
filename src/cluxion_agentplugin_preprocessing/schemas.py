@@ -58,6 +58,31 @@ PLAN_SCHEMA = {
                 "default": "",
                 "description": "Answers that resolve a prior clarification gate; required to enqueue an ambiguous or large task.",
             },
+            "loop_auto": {
+                "type": "boolean",
+                "default": True,
+                "description": "After a queued plan is stored, autonomously drain segments via Hermes oneshot calls.",
+            },
+            "loop_auto_dry_run": {
+                "type": "boolean",
+                "default": False,
+                "description": "Simulate Hermes segment execution without calling the hermes binary.",
+            },
+            "loop_auto_timeout_s": {
+                "type": "number",
+                "default": 600,
+                "description": "Maximum seconds for the full autonomous drain loop.",
+            },
+            "hermes_bin": {
+                "type": "string",
+                "default": "hermes",
+                "description": "Hermes CLI binary used for each segment oneshot.",
+            },
+            "model": {
+                "type": "string",
+                "default": "",
+                "description": "Optional Hermes model override (-m) for segment oneshots.",
+            },
         },
         "required": ["prompt"],
     },
@@ -137,6 +162,32 @@ QUEUE_BRIEF_SCHEMA = {
         "type": "object",
         "properties": {
             "work_id": {"type": "string"},
+        },
+        "required": ["work_id"],
+    },
+}
+
+LOOP_AUTO_SCHEMA = {
+    "name": "cluxion_loop_auto",
+    "description": (
+        "Autonomously drain the Cluxion dispatch queue via Hermes oneshot calls. "
+        "Equivalent to /loopAuto: next segment -> hermes -z -> record -> ... -> briefing. "
+        "Use after cluxion_plan queued a durable work bundle, or pass loop_auto on plan."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "work_id": {"type": "string", "description": "Queued work bundle id from cluxion_plan."},
+            "cwd": {"type": "string", "default": ""},
+            "hermes_bin": {"type": "string", "default": "hermes"},
+            "model": {"type": "string", "default": ""},
+            "timeout_seconds": {"type": "number", "default": 600},
+            "max_segment_retries": {"type": "integer", "minimum": 0, "default": 2},
+            "dry_run": {
+                "type": "boolean",
+                "default": False,
+                "description": "Simulate Hermes without calling the binary (tests and diagnostics).",
+            },
         },
         "required": ["work_id"],
     },
@@ -370,6 +421,7 @@ __all__ = [
     "CONTEXT_COMPRESS_SCHEMA",
     "GUARD_SCHEMA",
     "HERMES_CONFIG_SCHEMA",
+    "LOOP_AUTO_SCHEMA",
     "PLAN_SCHEMA",
     "QUEUE_BRIEF_SCHEMA",
     "QUEUE_NEXT_SCHEMA",

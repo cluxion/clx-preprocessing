@@ -47,6 +47,7 @@ def test_register_adds_expected_tools() -> None:
         "cluxion_doctor",
         "cluxion_guard",
         "cluxion_hermes_config",
+        "cluxion_loop_auto",
         "cluxion_plan",
         "cluxion_queue_brief",
         "cluxion_queue_next",

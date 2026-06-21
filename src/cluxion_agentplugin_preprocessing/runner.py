@@ -144,6 +144,19 @@ def queue_brief(payload: Mapping[str, object], *, command_runner: CommandRunner 
     return _execute_json(command, None, command_runner)
 
 
+def loop_auto(payload: Mapping[str, object], *, command_runner: CommandRunner | None = None) -> RuntimeResult:
+    """Autonomously drain the dispatch queue via Hermes oneshot calls (/loopAuto)."""
+    command = (
+        _runtime_binary(None),
+        "loop-auto",
+        "--work-id",
+        _required_str(payload, "work_id"),
+        "--json-stdin",
+    )
+    stdin = json.dumps(dict(payload), ensure_ascii=False)
+    return _execute_json(command, stdin, command_runner)
+
+
 def context_compress(payload: Mapping[str, object], *, command_runner: CommandRunner | None = None) -> RuntimeResult:
     """Compress conversation context deterministically once it exceeds the trigger ratio."""
     messages = payload.get("messages")
@@ -367,6 +380,7 @@ __all__ = [
     "context_compress",
     "guard",
     "hermes_config",
+    "loop_auto",
     "plan",
     "queue_brief",
     "queue_next",

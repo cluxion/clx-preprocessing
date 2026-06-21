@@ -1,5 +1,5 @@
 name: cluxion-agentplugin-preprocessing
-version: 0.3.20
+version: 0.3.22
 description: "Universal agent preprocessing plugin: honesty contracts, clarification, Rust work queue, resource-aware harness handoff. Connected AI calls cluxion tools; plugin does not own models."
 author: cluxion
 kind: standalone
@@ -12,6 +12,7 @@ provides_tools:
   - cluxion_queue_next
   - cluxion_queue_record
   - cluxion_queue_brief
+  - cluxion_loop_auto
   - cluxion_context_compress
   - cluxion_guard
   - cluxion_web_search

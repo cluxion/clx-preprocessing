@@ -183,6 +183,7 @@ class HostExecutionPlan:
     next_tool: str = ""
     record_tool: str = ""
     brief_tool: str = ""
+    loop_tool: str = ""
     performance_notes: tuple[str, ...] = ()
 
 

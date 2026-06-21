@@ -201,10 +201,12 @@ def _host_execution_plan_for(
             next_tool="cluxion_queue_next",
             record_tool="cluxion_queue_record",
             brief_tool="cluxion_queue_brief",
+            loop_tool="cluxion_loop_auto",
             performance_notes=(
                 *base_notes,
                 "queued_plan_stores_segment_content_out_of_band",
                 "initial_plan_returns_metadata_not_full_segment_payload",
+                "use_cluxion_loop_auto_or_slash_loopAuto_for_autonomous_drain",
             ),
         )
     return HostExecutionPlan(

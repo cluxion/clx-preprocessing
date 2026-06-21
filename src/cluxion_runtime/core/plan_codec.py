@@ -88,6 +88,7 @@ def plan_to_dict(plan: HarnessPlan) -> dict[str, object]:
             "next_tool": plan.execution.next_tool,
             "record_tool": plan.execution.record_tool,
             "brief_tool": plan.execution.brief_tool,
+            "loop_tool": plan.execution.loop_tool,
             "performance_notes": list(plan.execution.performance_notes),
             "steps": [
                 {

@@ -128,6 +128,7 @@ def test_queued_plan_uses_dispatch_store_without_full_prompt_in_plan(
 ) -> None:
     """Long input is processed sequentially via queue tools, not inlined into the initial plan output."""
     monkeypatch.setenv("CLUXION_PREPROCESS_DISPATCH_DIR", str(tmp_path / "dispatch"))
+    monkeypatch.setenv("CLUXION_LOOP_AUTO", "0")
     prompt = "\n".join(f"REQ-{idx}: 배포 전 검증 항목을 상세히 분석해줘." for idx in range(4_000))
 
     code = main(
