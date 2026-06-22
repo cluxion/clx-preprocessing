@@ -52,6 +52,22 @@ cluxion-preprocess doctor --json   # 구조화 출력
 
 Hermes 안에서는 `cluxion_doctor` 도구로도 노출됩니다.
 
+## Hermes 슬래시 커맨드 (0.3.23+)
+
+`/` 입력 시 🔌로 자동완성됩니다.
+
+| 슬래시 | 용도 |
+|---|---|
+| `/loopauto <prompt>` | plan + 자동 큐 드레인 (`/loopAuto` 지시어와 동일) |
+| `/cluxion-doctor` | doctor (CLI `cluxion-preprocess doctor`와 동일) |
+
+```
+/loopauto 4000줄 요구사항을 순서대로 구현하고 각 항목 증거를 남겨줘
+/cluxion-doctor
+```
+
+비활성: `export CLUXION_LOOP_AUTO=0` · 상세: `Docs/cluxion-plugins-guide.md` §5-A (통합 가이드)
+
 ## 문제 해결
 
 | 증상 | 해결 |
@@ -119,6 +135,22 @@ cluxion-preprocess doctor --json   # structured output
 ```
 
 Also exposed inside Hermes as the `cluxion_doctor` tool.
+
+## Hermes slash commands (0.3.23+)
+
+Type `/` to see plugin commands with a 🔌 badge.
+
+| Slash | Purpose |
+|---|---|
+| `/loopauto <prompt>` | Plan + autonomous queue drain (same as `/loopAuto` directive) |
+| `/cluxion-doctor` | Run doctor (same as `cluxion-preprocess doctor`) |
+
+```
+/loopauto implement every REQ line and record evidence
+/cluxion-doctor
+```
+
+Disable auto-loop: `export CLUXION_LOOP_AUTO=0`.
 
 ## Troubleshooting
 
