@@ -17,7 +17,7 @@
 
 1. 사용자 요청 수신 → `cluxion_plan` (또는 `cluxion-runtime plan`)
 2. `clarification.required`이면 사용자에게 질문, 작업 보류
-3. `queued` 모드면 `cluxion_queue_next` → segment 처리 → `cluxion_queue_record` → `cluxion_queue_brief`
+3. `queued` 모드: 수동이면 `cluxion_queue_next` → … → `cluxion_queue_brief`. Hermes 긴 작업은 `/loopauto` 또는 `loop_auto: true`(기본)로 자동 드레인.
 4. `answer_policy.required_checks`를 지키며 응답
 5. (선택) `cluxion_queue_brief` 결과를 ForgetForge에 저장: `forgetforge import-brief --source preprocessing`
 
@@ -37,7 +37,9 @@ cluxion-preprocess enable   # Hermes
 |------|------|
 | [architecture.md](architecture.md) | 패키지 구조, 데이터 흐름, host 경계 |
 | [design.md](design.md) | 정직함, 명확화, 성능 |
-| [installation.md](installation.md) | 설치, Hermes 활성화, Rust 큐 |
+| [installation.md](installation.md) | 설치, Hermes 활성화, 슬래시, Rust 큐 |
+| [tools.md](tools.md) | 도구·슬래시·loopAuto·queued workflow |
+| 통합 가이드 | MacBot `Docs/cluxion-plugins-guide.md` §2-A (5종 슬래시 전체) |
 | [tools.md](tools.md) | 도구, preprocessing mode, queue |
 | [agent-surfaces.md](agent-surfaces.md) | Hermes / Claude / Codex / Grok |
 | [rust-architecture.md](rust-architecture.md) | Rust 메인 · Python adapter |

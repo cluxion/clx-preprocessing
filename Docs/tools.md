@@ -2,7 +2,16 @@
 
 연결된 AI가 호출하는 도구·모드입니다. 플러그인은 JSON 계약만 반환하고 completion은 host가 수행합니다.
 
-## Plugin tools (`cluxion` toolset, 10 tools)
+## Hermes slash commands (0.3.23+)
+
+| Slash | Maps to |
+|---|---|
+| `/loopauto <prompt>` | `cluxion_plan` with `/loopAuto` + `loop_auto` |
+| `/cluxion-doctor` | `cluxion_doctor` / `cluxion-preprocess doctor` |
+
+`/` 입력 시 🔌 자동완성. 상세: `cluxion-plugins-guide.md` §2-A.
+
+## Plugin tools (`cluxion` toolset, 16 tools)
 
 ### `cluxion_plan`
 
@@ -29,6 +38,10 @@
 | `cluxion_queue_next` | 다음 segment payload |
 | `cluxion_queue_record` | segment 처리 결과 기록 |
 | `cluxion_queue_brief` | 최종 synthesis용 briefing |
+| `cluxion_loop_auto` | 큐 자동 드레인 (`hermes -z` per segment). plan 기본 `loop_auto: true` |
+
+`/loopauto` 슬래시·`/loopAuto` 프롬프트 지시어·`loop_auto: true` 파라미터는 동일 경로.
+비활성: `CLUXION_LOOP_AUTO=0`, `loop_auto: false`, `loop_auto_dry_run: true`(시뮬레이션).
 
 ### `cluxion_bootstrap`
 
@@ -80,9 +93,17 @@ Daemon 시작: `cluxion-queue guard-daemon` 바이너리가 없으면
 
 ## Queued workflow
 
+### 수동 (호스트 반복)
+
 1. `cluxion_plan` — `mode=queued`
 2. `cluxion_queue_next` — segment를 **연결된 AI**가 처리
 3. `cluxion_queue_record` — 결과 저장
 4. `cluxion_queue_brief` — 최종 보고
+
+### 자동 loopAuto (0.3.22+)
+
+1. `cluxion_plan` (또는 `/loopauto` 슬래시) — 큐 등록
+2. `cluxion_loop_auto` / 내장 `loop_auto` — `queue_next` → `hermes -z` → `queue_record` 반복 → `queue_brief`
+3. 완료 마커: `SEGMENT_COMPLETE`, `WORK_REMAINS:`, `TASK_COMPLETE`
 
 segment checksum은 synthesis 시 보존합니다 (`required_checks`).

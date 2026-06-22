@@ -29,6 +29,17 @@ hermes tools list   # cluxion toolset 확인
 
 레거시 entry point `hermes-cluxion`도 호환됩니다.
 
+### 슬래시 커맨드 (0.3.23+)
+
+Hermes 세션에서 `/` 입력 → `/loopauto`, `/cluxion-doctor` 🔌 자동완성.
+
+```
+/loopauto 긴 작업을 순서대로 처리하고 증거를 남겨줘
+/cluxion-doctor
+```
+
+전체 5종 플러그인 슬래시 표: `cluxion-plugins-guide.md` §2-A.
+
 ## 연결된 AI 연동
 
 - Hermes: `cluxion_*` 도구 자동 등록
