@@ -1,0 +1,89 @@
+diff --git a/cli.py b/cli.py
+--- a/cli.py
++++ b/cli.py
+@@ -7655,10 +7655,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
+                 if plugin_handler:
+                     user_args = cmd_original[len(base_cmd):].strip()
+                     try:
++                        from hermes_cli.plugins import get_plugin_commands
++
++                        cmd_key = base_cmd.lstrip("/")
++                        entry = get_plugin_commands().get(cmd_key, {})
+                         result = resolve_plugin_command_result(
+                             plugin_handler(user_args)
+                         )
+-                        if result:
++                        if (
++                            entry.get("deliver") == "agent"
++                            and user_args.strip()
++                            and result
++                            and hasattr(self, "_pending_input")
++                        ):
++                            _cprint(
++                                f"\n⚡ /{cmd_key} → agent "
++                                f"({len(str(result))} chars)"
++                            )
++                            self._pending_input.put(str(result))
++                        elif result:
+                             _cprint(str(result))
+                     except Exception as e:
+                         _cprint(f"\033[1;31mPlugin command error: {e}{_RST}")
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -418,6 +418,7 @@ class PluginContext:
+         handler: Callable,
+         description: str = "",
+         args_hint: str = "",
++        deliver: str = "output",
+     ) -> None:
+         """Register a slash command (e.g. ``/lcm``) available in CLI and gateway sessions.
+ 
+@@ -458,11 +459,15 @@ class PluginContext:
+         except Exception:
+             pass  # If commands module isn't available, skip the check
+ 
++        deliver_mode = (deliver or "output").strip().lower()
++        if deliver_mode not in {"output", "agent"}:
++            deliver_mode = "output"
+         self._manager._plugin_commands[clean] = {
+             "handler": handler,
+             "description": description or "Plugin command",
+             "plugin": self.manifest.name,
+             "args_hint": (args_hint or "").strip(),
++            "deliver": deliver_mode,
+         }
+         logger.debug("Plugin %s registered command: /%s", self.manifest.name, clean)
+ 
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -7608,7 +7608,12 @@ def _(rid, params: dict) -> dict:
+ 
+         handler = get_plugin_command_handler(name)
+         if handler:
++            from hermes_cli.plugins import get_plugin_commands
++
+             result = resolve_plugin_command_result(handler(arg))
++            entry = get_plugin_commands().get(name, {})
++            if entry.get("deliver") == "agent" and arg.strip() and result:
++                return _ok(rid, {"type": "send", "message": str(result)})
+             return _ok(rid, {"type": "plugin", "output": str(result or "")})
+     except Exception:
+         pass
+@@ -8681,6 +8686,15 @@ def _(rid, params: dict) -> dict:
+ 
+     if plugin_handler and resolve_plugin_command_result:
+         try:
++            from hermes_cli.plugins import get_plugin_commands
++
++            entry = get_plugin_commands().get(_cmd_base, {})
++            if entry.get("deliver") == "agent":
++                return _err(
++                    rid,
++                    4018,
++                    f"agent-deliver command: use command.dispatch for /{_cmd_base}",
++                )
+             result = resolve_plugin_command_result(plugin_handler(_cmd_arg))
+             return _ok(rid, {"output": str(result or "(no output)")})
+         except Exception as e:

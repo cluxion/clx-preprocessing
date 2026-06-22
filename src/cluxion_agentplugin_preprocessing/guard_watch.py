@@ -38,6 +38,7 @@ def on_session_start(**_: Any) -> None:
     Startup is idempotent: an already-running daemon is success. Hook failures
     are logged as one concise stderr warning and never propagated to the host.
     """
+    _maybe_apply_hermes_deliver_patch()
     if not _autostart_enabled():
         return
     try:
@@ -49,6 +50,23 @@ def on_session_start(**_: Any) -> None:
     if not result.get("ok", False):
         reason = result.get("reason") or result.get("error") or "unknown"
         _warn(f"cluxion guard autostart failed: {reason}")
+
+
+def _maybe_apply_hermes_deliver_patch() -> None:
+    """Best-effort Hermes deliver=agent patch (``CLUXION_HERMES_PATCH_AUTOFIX``, default on)."""
+    try:
+        from cluxion_agentplugin_preprocessing import hermes_deliver_patch
+
+        if not hermes_deliver_patch.autostart_enabled():
+            return
+        status = hermes_deliver_patch.patch_status()
+        if status.status == "applied":
+            return
+        result = hermes_deliver_patch.ensure_applied()
+        if result.status != "applied" and result.status != "no_hermes":
+            _warn(f"cluxion hermes deliver patch: {result.detail}")
+    except Exception as exc:
+        _warn(f"cluxion hermes deliver patch failed: {exc}")
 
 
 def post_tool_call(**_: Any) -> None:

@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from cluxion_agentplugin_preprocessing import __version__, hermes_config, runner
+from cluxion_agentplugin_preprocessing import __version__, hermes_config, hermes_deliver_patch, runner
 from cluxion_agentplugin_preprocessing.doctor import (
     render_json,
     render_text,
@@ -39,6 +39,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _hermes_config(args)
     if args.command == "doctor":
         return _doctor(args)
+    if args.command == "hermes-patch":
+        return _hermes_patch(args)
     parser.print_help(sys.stderr)
     return 2
 
@@ -83,6 +85,21 @@ def _parser() -> argparse.ArgumentParser:
     doctor = subparsers.add_parser("doctor", help="Run embedded health checks")
     doctor.add_argument("--json", action="store_true")
     doctor.add_argument("--verbose", action="store_true")
+    patch = subparsers.add_parser(
+        "hermes-patch",
+        help="Apply or verify Hermes deliver=agent patch (/supercoder routing)",
+    )
+    patch.add_argument(
+        "--status",
+        action="store_true",
+        help="Only report patch status (default: ensure applied)",
+    )
+    patch.add_argument("--dry-run", action="store_true")
+    patch.add_argument(
+        "--hermes-root",
+        default=None,
+        help="Hermes agent source root (default: auto-detect ~/.hermes/hermes-agent)",
+    )
     return parser
 
 
@@ -117,8 +134,10 @@ def _status(args: argparse.Namespace) -> int:
 
 def _enable(args: argparse.Namespace) -> int:
     result = hermes_config.enable_plugin(args.home, dry_run=bool(args.dry_run))
-    print(json.dumps({"ok": True, **result.to_dict()}, ensure_ascii=False, sort_keys=True))
-    return 0
+    patch = _ensure_hermes_patch(dry_run=bool(args.dry_run))
+    payload = {"ok": True, **result.to_dict(), "hermes_patch": patch.to_dict()}
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    return 0 if patch.status in {"applied", "no_hermes"} or args.dry_run else 1
 
 
 def _disable(args: argparse.Namespace) -> int:
@@ -140,6 +159,27 @@ def _hermes_config(args: argparse.Namespace) -> int:
     )
     print(result.to_json())
     return 0 if result.ok else 1
+
+
+def _hermes_root_arg(args: argparse.Namespace) -> Path | None:
+    raw = getattr(args, "hermes_root", None)
+    return Path(raw).expanduser() if raw else None
+
+
+def _ensure_hermes_patch(*, dry_run: bool, hermes_root: Path | None = None) -> hermes_deliver_patch.PatchResult:
+    if dry_run:
+        return hermes_deliver_patch.patch_status(hermes_root)
+    return hermes_deliver_patch.ensure_applied(hermes_root=hermes_root)
+
+
+def _hermes_patch(args: argparse.Namespace) -> int:
+    root = _hermes_root_arg(args)
+    if args.status:
+        result = hermes_deliver_patch.patch_status(root)
+    else:
+        result = hermes_deliver_patch.ensure_applied(hermes_root=root, dry_run=bool(args.dry_run))
+    print(json.dumps({"ok": result.status == "applied", **result.to_dict()}, ensure_ascii=False, sort_keys=True))
+    return 0 if result.status == "applied" else 1
 
 
 def _doctor(args: argparse.Namespace) -> int:
