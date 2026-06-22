@@ -28,6 +28,7 @@ from cluxion_agentplugin_preprocessing.schemas import (
     SERVE_LOCAL_SCHEMA,
     WEB_SEARCH_SCHEMA,
 )
+from cluxion_agentplugin_preprocessing.slash_commands import register_slash_commands
 from cluxion_runtime.core.context_compress import (
     DEFAULT_TRIGGER_RATIO,
     _resolve_context_limit,
@@ -42,6 +43,7 @@ if TYPE_CHECKING:
 
 def register(ctx: object) -> None:
     """Register Cluxion preprocessing tools with the host agent."""
+    register_slash_commands(ctx)
     register_hook = getattr(ctx, "register_hook", None)
     if callable(register_hook):
         register_hook("on_session_start", guard_watch.on_session_start)

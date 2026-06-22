@@ -11,6 +11,20 @@ from cluxion_agentplugin_preprocessing import plugin
 class FakeContext:
     def __init__(self) -> None:
         self.tools: dict[str, dict[str, object]] = {}
+        self.commands: dict[str, dict[str, object]] = {}
+
+    def register_command(
+        self,
+        name: str,
+        handler: object,
+        description: str = "",
+        args_hint: str = "",
+    ) -> None:
+        self.commands[name] = {
+            "handler": handler,
+            "description": description,
+            "args_hint": args_hint,
+        }
 
     def register_tool(
         self,
@@ -56,6 +70,9 @@ def test_register_adds_expected_tools() -> None:
         "cluxion_web_search",
     ]
     assert {tool["toolset"] for tool in ctx.tools.values()} == {"cluxion"}
+    assert "loopauto" in ctx.commands
+    assert "cluxion-doctor" in ctx.commands
+    assert ctx.commands["loopauto"]["args_hint"] == "<prompt>"
 
 
 def test_handler_returns_json_error_for_missing_model() -> None:
