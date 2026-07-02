@@ -381,7 +381,7 @@ def test_snapshot_prefers_fresh_daemon_state(tmp_path: Path, monkeypatch) -> Non
 
     from cluxion_runtime.resources import rust_bridge
 
-    monkeypatch.setenv(queue_bridge.QUEUE_STORE_ENV, str(tmp_path))
+    monkeypatch.setenv(guard_bridge.GUARD_STORE_ENV, str(tmp_path))
     state = {
         "ok": True,
         "current": {
@@ -395,6 +395,13 @@ def test_snapshot_prefers_fresh_daemon_state(tmp_path: Path, monkeypatch) -> Non
     (tmp_path / guard_bridge.STATE_FILE_NAME).write_text(json.dumps(state), encoding="utf-8")
     snapshot = rust_bridge.collect_resource_snapshot()
     assert snapshot.total_ram_mb == 4096
+
+    # The queue store env alone must no longer steer guard state (contract:
+    # explicit store_dir > CLUXION_GUARD_STORE_DIR > plugin home).
+    monkeypatch.delenv(guard_bridge.GUARD_STORE_ENV, raising=False)
+    monkeypatch.setenv(queue_bridge.QUEUE_STORE_ENV, str(tmp_path))
+    fallback = rust_bridge.collect_resource_snapshot()
+    assert fallback.total_ram_mb != 4096 or not (guard_bridge.DEFAULT_GUARD_STORE / guard_bridge.STATE_FILE_NAME).exists()
     assert snapshot.available_ram_mb == 2048
     assert snapshot.swap_used_mb == 7
     assert snapshot.cpu_percent == 12.5
