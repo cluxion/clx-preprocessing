@@ -234,9 +234,10 @@ def _briefing_step_block(step: dict[str, object]) -> str:
 def _steps(bundle: dict[str, object]) -> list[dict[str, object]]:
     steps = bundle.get("steps")
     if not isinstance(steps, list):
-        raise DispatchStoreError("dispatch bundle has no steps array")
+        raise DispatchStoreError(f"dispatch bundle expected steps array, found {_type_name(steps)}")
     if not all(isinstance(step, dict) for step in steps):
-        raise DispatchStoreError("dispatch bundle steps must be objects")
+        bad = next(step for step in steps if not isinstance(step, dict))
+        raise DispatchStoreError(f"dispatch bundle expected step objects, found {_type_name(bad)}")
     return steps
 
 
@@ -263,8 +264,16 @@ def _load_dispatch_bundle_from_path(path: Path, work_id: str) -> dict[str, objec
     except json.JSONDecodeError as exc:
         raise DispatchStoreError(f"dispatch bundle is invalid JSON: {work_id}") from exc
     if not isinstance(payload, dict):
-        raise DispatchStoreError(f"dispatch bundle must be an object: {work_id}")
+        raise DispatchStoreError(f"dispatch bundle expected object, found {_type_name(payload)}: {work_id}")
     return payload
+
+
+def _type_name(value: object) -> str:
+    if value is None:
+        return "missing"
+    if isinstance(value, list):
+        return "array"
+    return type(value).__name__
 
 
 @contextmanager
@@ -285,13 +294,19 @@ def _exclusive_bundle_lock(path: Path) -> Iterator[None]:
 
 def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
-        json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-        temporary = Path(handle.name)
-    temporary.replace(path)
+    temporary: Path | None = None
+    try:
+        with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary = Path(handle.name)
+        os.replace(temporary, path)
+    except Exception:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
 
 
 __all__ = [

@@ -175,25 +175,45 @@ def _bundle_path(store_dir: Path, work_id: str) -> Path:
 def _read_bundle(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise RuntimeError(f"dispatch bundle not found: {path}")
-    return json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"dispatch bundle expected object, found {_type_name(payload)}: {path}")
+    return payload
 
 
 def _write_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-        temporary = Path(handle.name)
-    temporary.replace(path)
+    temporary: Path | None = None
+    try:
+        with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary = Path(handle.name)
+        os.replace(temporary, path)
+    except Exception:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
 
 
 def _steps(bundle: dict[str, Any]) -> list[dict[str, Any]]:
     steps = bundle.get("steps")
     if not isinstance(steps, list):
-        raise RuntimeError("dispatch bundle has no steps array")
+        raise RuntimeError(f"dispatch bundle expected steps array, found {_type_name(steps)}")
+    if not all(isinstance(step, dict) for step in steps):
+        bad = next(step for step in steps if not isinstance(step, dict))
+        raise RuntimeError(f"dispatch bundle expected step objects, found {_type_name(bad)}")
     return steps
+
+
+def _type_name(value: object) -> str:
+    if value is None:
+        return "missing"
+    if isinstance(value, list):
+        return "array"
+    return type(value).__name__
 
 
 def _remaining(steps: list[dict[str, Any]]) -> int:

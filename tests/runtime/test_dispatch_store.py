@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -22,8 +23,6 @@ from cluxion_runtime.core.harness import build_harness_plan
 from cluxion_runtime.core.types import AgentSurface, ResourceSnapshot, WorkItem
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from cluxion_runtime.core.types import HarnessPlan
 
 _SNAPSHOT = ResourceSnapshot(total_ram_mb=48_000, available_ram_mb=40_000, swap_used_mb=0, cpu_percent=20.0)
@@ -192,6 +191,32 @@ def test_record_unknown_step_raises(tmp_path: Path, queued_plan: HarnessPlan) ->
 def test_load_missing_bundle_raises(tmp_path: Path) -> None:
     with pytest.raises(DispatchStoreError):
         load_dispatch_bundle("w-absent", dispatch_dir=tmp_path)
+
+
+def test_corrupt_bundle_reports_found_vs_expected(tmp_path: Path) -> None:
+    (tmp_path / "w-bad.json").write_text("[]", encoding="utf-8")
+
+    with pytest.raises(DispatchStoreError, match=r"expected object, found array"):
+        load_dispatch_bundle("w-bad", dispatch_dir=tmp_path)
+
+
+def test_bundle_without_steps_reports_found_vs_expected(tmp_path: Path) -> None:
+    (tmp_path / "w-bad.json").write_text('{"steps": "nope"}', encoding="utf-8")
+
+    with pytest.raises(DispatchStoreError, match=r"expected steps array, found str"):
+        next_dispatch_step("w-bad", dispatch_dir=tmp_path)
+
+
+def test_atomic_write_cleans_tempfile_on_replace_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_replace(source: Path, target: Path) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(dispatch_store.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        dispatch_store._atomic_write_json(tmp_path / "bundle.json", {"ok": True})
+
+    assert not list(tmp_path.glob("tmp*"))
 
 
 def test_work_id_traversal_is_neutralized(tmp_path: Path) -> None:

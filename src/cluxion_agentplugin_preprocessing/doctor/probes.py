@@ -9,6 +9,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
@@ -74,12 +75,32 @@ def entry_point_registered(ctx: DoctorContext) -> tuple[str, str]:
 @_register("toolset_valid")
 def toolset_valid(ctx: DoctorContext) -> tuple[str, str]:
     try:
-        cp = ctx.run([ctx.hermes_bin, "tools", "list"])
-        if cp.returncode == 0 and "cluxion" in cp.stdout:
-            return "pass", "cluxion present"
-        return "fail", "cluxion not in tools list"
+        from cluxion_agentplugin_preprocessing.plugin import register
+
+        class FakeContext:
+            def __init__(self) -> None:
+                self.tools: list[tuple[str, str]] = []
+
+            def register_tool(self, *, name: str, toolset: str, **_: object) -> None:
+                self.tools.append((name, toolset))
+
+            def register_command(self, *_: object, **__: object) -> None:
+                return None
+
+            def register_hook(self, *_: object, **__: object) -> None:
+                return None
+
+            def register_middleware(self, *_: object, **__: object) -> None:
+                return None
+
+        fake = FakeContext()
+        register(fake)
+        cluxion_tools = [name for name, toolset in fake.tools if toolset == "cluxion"]
+        if "cluxion_plan" in cluxion_tools and "cluxion_doctor" in cluxion_tools:
+            return "pass", f"{len(cluxion_tools)} cluxion tools registered"
+        return "fail", f"expected cluxion_plan/cluxion_doctor, found {cluxion_tools}"
     except Exception as e:
-        return "fail", f"run error: {e}"
+        return "fail", f"tool registration error: {e}"
 
 
 @_register("install_integrity")
@@ -165,6 +186,64 @@ def guard_daemon_startable(ctx: DoctorContext) -> tuple[str, str]:
         return "pass", "psutil available"
     except Exception:
         return "skip", "psutil not importable"
+
+
+@_register("runtime_binary_accessible")
+def runtime_binary_accessible(ctx: DoctorContext) -> tuple[str, str]:
+    try:
+        from cluxion_runtime.resources import queue_bridge
+
+        backend = queue_bridge.resolve_backend()
+        if backend == "native":
+            return "pass", "native module accessible"
+        if backend == "python":
+            return "warn", "using Python fallback; cluxion-queue binary not found"
+        binary = queue_bridge._queue_binary()
+        resolved = shutil.which(binary)
+        if resolved:
+            return "pass", resolved
+        return "fail", f"expected cluxion-queue on PATH or {queue_bridge.QUEUE_BIN_ENV}, found none"
+    except Exception as e:
+        return "fail", f"runtime binary check error: {e}"
+
+
+@_register("clarification_answers_present")
+def clarification_answers_present(ctx: DoctorContext) -> tuple[str, str]:
+    try:
+        from cluxion_runtime.core.clarification import assess_clarification
+        from cluxion_runtime.core.intent import classify_intent
+        from cluxion_runtime.core.types import WorkItem
+
+        item = WorkItem(
+            "doctor-clarification",
+            "Fix this.",
+            metadata={"clarification_answers": "Fix src/example.py only."},
+        )
+        result = assess_clarification(item, classify_intent(item))
+        if not result.required and result.ready_for_queue:
+            return "pass", "clarification_answers unblocks queue"
+        return "fail", f"expected user_clarified, found required={result.required}"
+    except Exception as e:
+        return "fail", f"clarification check error: {e}"
+
+
+@_register("guard_state_not_stale")
+def guard_state_not_stale(ctx: DoctorContext) -> tuple[str, str]:
+    try:
+        from cluxion_runtime.resources import guard_bridge
+
+        with tempfile.TemporaryDirectory(prefix="cluxion-doctor-guard-") as tmp:
+            state_path = Path(tmp) / guard_bridge.STATE_FILE_NAME
+            state_path.write_text(
+                _json.dumps({"ok": True, "window": {"samples": 1}, "updated_at_ms": int(time.time() * 1000)}),
+                encoding="utf-8",
+            )
+            state = guard_bridge.read_daemon_state(store_dir=tmp)
+        if state is not None and state.get("stale") is False:
+            return "pass", "fresh state recognized"
+        return "fail", f"expected fresh state, found {state}"
+    except Exception as e:
+        return "fail", f"guard state check error: {e}"
 
 
 @_register("handler_exception_coverage")
@@ -294,6 +373,22 @@ def json_serialization_deterministic(ctx: DoctorContext) -> tuple[str, str]:
         return "skip", f"uncertainty: {type(e).__name__}"
 
 
+@_register("temp_file_cleanup")
+def temp_file_cleanup(ctx: DoctorContext) -> tuple[str, str]:
+    try:
+        from cluxion_runtime.core.dispatch_store import _atomic_write_json
+
+        with tempfile.TemporaryDirectory(prefix="cluxion-doctor-temp-") as tmp:
+            target = Path(tmp) / "bundle.json"
+            _atomic_write_json(target, {"test": 1})
+            leftovers = [path.name for path in Path(tmp).glob("tmp*")]
+        if not leftovers:
+            return "pass", "no temporary files left after atomic write"
+        return "fail", f"expected no tmp* files, found {leftovers}"
+    except Exception as e:
+        return "fail", f"temp cleanup check error: {e}"
+
+
 @_register("hermes_plugin_enabled")
 def hermes_plugin_enabled(ctx: DoctorContext) -> tuple[str, str]:
     data, status = _safe_read_hermes_config()
@@ -344,6 +439,7 @@ def version_files_synced(ctx: DoctorContext) -> tuple[str, str]:
             "package plugin.yaml": ctx.cwd / "src" / "cluxion_agentplugin_preprocessing" / "plugin.yaml",
             "claude plugin": ctx.cwd / ".claude-plugin" / "plugin.json",
             "codex plugin": ctx.cwd / ".codex-plugin" / "plugin.json",
+            "marketplace": ctx.cwd / ".claude-plugin" / "marketplace.json",
         }
         drift: list[str] = []
         for label, path in paths.items():
@@ -361,6 +457,8 @@ def version_files_synced(ctx: DoctorContext) -> tuple[str, str]:
 
 
 def _version_from_file(path: Path) -> str:
+    if path.name == "marketplace.json":
+        return str(_json.loads(path.read_text(encoding="utf-8"))["plugins"][0].get("version", ""))
     if path.suffix == ".json":
         return str(_json.loads(path.read_text(encoding="utf-8")).get("version", ""))
     import yaml

@@ -191,12 +191,13 @@ def _doctor(args: argparse.Namespace) -> int:
         plugin="preprocessing",
         version=__version__,
     )
-    text = render_text(result, __import__(
-        "cluxion_agentplugin_preprocessing.doctor.framework", fromlist=["load_catalog"]
-    ).load_catalog(catalog_path), verbose=bool(args.verbose))
-    print(text, file=sys.stderr)
     if args.json:
         print(render_json(result))
+    else:
+        text = render_text(result, __import__(
+            "cluxion_agentplugin_preprocessing.doctor.framework", fromlist=["load_catalog"]
+        ).load_catalog(catalog_path), verbose=bool(args.verbose))
+        print(text)
     return 0 if result.ok else 1
 
 

@@ -72,6 +72,8 @@ context 사용률이 trigger ratio(기본 70%)를 넘으면 target ratio(기본 
 
 실시간 리소스 guard. `action=status`는 RAM/swap/CPU/zombie 샘플과 daemon 상태 반환;
 `owned_roots`로 프로세스 ownership scan (fail-closed). `owned_roots`/`protect`는 **루트 PID 정수 리스트**다 (파일 경로 아님). `action=start`/`stop`은 200ms Rust polling daemon 제어.
+
+Guard runtime state precedence: explicit tool `store_dir` > `CLUXION_GUARD_STORE_DIR` > plugin home `~/.local/share/cluxion-agentplugin-preprocessing/queue`. `CLUXION_QUEUE_STORE_DIR` is for queue data only and does not move `guard_state.json`/`guard_heartbeat`.
 `action=enforce`는 등록된 owned 프로세스만 대상 (기본 dry-run, `apply=true`로 실제 signal).
 `action=auto-enforce`는 daemon rolling window의 sustained pressure에서만 enforce (daemon 없음/ stale 시 fail-closed).
 

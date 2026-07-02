@@ -183,22 +183,41 @@ fn read_bundle(path: &Path) -> Result<Value, QueueError> {
         )));
     }
     let raw = fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&raw)?)
+    let bundle: Value = serde_json::from_str(&raw)?;
+    if !bundle.is_object() {
+        return Err(QueueError::Store(format!(
+            "dispatch bundle expected object, found {}: {}",
+            value_kind(&bundle),
+            path.display()
+        )));
+    }
+    Ok(bundle)
 }
 
 fn steps_mut(bundle: &mut Value) -> Result<&mut Vec<Value>, QueueError> {
+    let found = value_kind(bundle.get("steps").unwrap_or(&Value::Null));
     bundle
         .as_object_mut()
         .and_then(|obj| obj.get_mut("steps"))
         .and_then(Value::as_array_mut)
-        .ok_or_else(|| QueueError::Store("dispatch bundle has no steps array".into()))
+        .ok_or_else(|| {
+            QueueError::Store(format!(
+                "dispatch bundle expected steps array, found {}",
+                found
+            ))
+        })
 }
 
 fn steps_ref(bundle: &Value) -> Result<&Vec<Value>, QueueError> {
     bundle
         .get("steps")
         .and_then(Value::as_array)
-        .ok_or_else(|| QueueError::Store("dispatch bundle has no steps array".into()))
+        .ok_or_else(|| {
+            QueueError::Store(format!(
+                "dispatch bundle expected steps array, found {}",
+                value_kind(bundle.get("steps").unwrap_or(&Value::Null))
+            ))
+        })
 }
 
 fn public_step(step: &Value) -> Value {
@@ -253,10 +272,36 @@ fn write_atomic_json(path: &Path, payload: &Value) -> Result<(), QueueError> {
         fs::create_dir_all(parent)?;
     }
     let serialized = serde_json::to_string_pretty(payload)?;
-    let temp = path.with_extension("json.tmp");
+    let temp = temp_path_for(path);
     fs::write(&temp, format!("{serialized}\n"))?;
-    fs::rename(temp, path)?;
+    if let Err(err) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(err.into());
+    }
     Ok(())
+}
+
+fn temp_path_for(path: &Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let name = path
+        .file_name()
+        .and_then(|part| part.to_str())
+        .unwrap_or("bundle.json");
+    path.with_file_name(format!(".{name}.{}.{}.tmp", std::process::id(), nanos))
+}
+
+fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "missing",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 fn now_secs() -> f64 {

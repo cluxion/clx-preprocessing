@@ -32,6 +32,8 @@ if TYPE_CHECKING:
 STATE_FILE_NAME = "guard_state.json"
 PID_FILE_NAME = "guard_daemon.pid"
 HEARTBEAT_FILE_NAME = "guard_heartbeat"
+GUARD_STORE_ENV = "CLUXION_GUARD_STORE_DIR"
+DEFAULT_GUARD_STORE = Path.home() / ".local" / "share" / "cluxion-agentplugin-preprocessing" / "queue"
 DEFAULT_INTERVAL_MS = 1000
 DEFAULT_WINDOW = 10
 STALE_AFTER_MS = 3_000
@@ -398,9 +400,12 @@ def daemon_status(*, store_dir: Path | str | None = None) -> dict[str, Any]:
 
 
 def _store_base(store_dir: Path | str | None) -> Path:
-    if store_dir is None:
-        return queue_bridge.default_store_dir()
-    return Path(store_dir)
+    if store_dir is not None:
+        return Path(store_dir).expanduser()
+    configured = os.environ.get(GUARD_STORE_ENV, "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return DEFAULT_GUARD_STORE
 
 
 def _is_our_daemon(pid: int) -> bool:
@@ -569,6 +574,8 @@ def _process_rows() -> list[dict[str, Any]] | None:
 
 
 __all__ = [
+    "DEFAULT_GUARD_STORE",
+    "GUARD_STORE_ENV",
     "HEARTBEAT_FILE_NAME",
     "auto_enforce",
     "daemon_status",

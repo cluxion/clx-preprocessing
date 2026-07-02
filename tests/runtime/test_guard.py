@@ -141,6 +141,25 @@ def test_touch_heartbeat_updates_mtime(tmp_path: Path) -> None:
     assert heartbeat.stat().st_mtime > before
 
 
+def test_default_guard_store_ignores_queue_store_env(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv(queue_bridge.QUEUE_STORE_ENV, str(tmp_path / "caller-workspace"))
+    monkeypatch.delenv(guard_bridge.GUARD_STORE_ENV, raising=False)
+
+    guard_bridge.touch_heartbeat()
+
+    assert not (tmp_path / "caller-workspace" / guard_bridge.HEARTBEAT_FILE_NAME).exists()
+    assert guard_bridge._store_base(None) == guard_bridge.DEFAULT_GUARD_STORE
+
+
+def test_guard_store_env_overrides_default(tmp_path: Path, monkeypatch) -> None:
+    custom = tmp_path / "guard"
+    monkeypatch.setenv(guard_bridge.GUARD_STORE_ENV, str(custom))
+
+    guard_bridge.touch_heartbeat()
+
+    assert (custom / guard_bridge.HEARTBEAT_FILE_NAME).exists()
+
+
 def test_start_daemon_touches_heartbeat(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv(queue_bridge.QUEUE_BIN_ENV, "/nonexistent/cluxion-queue")
     monkeypatch.setattr(guard_bridge, "_which", lambda _binary: False)
