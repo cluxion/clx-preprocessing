@@ -153,6 +153,27 @@ def _has_ambiguous(text: str) -> bool:
 
 _SCOPE_KEYWORDS = ("all", "everything", "전부", "전체", "모든")
 _TARGET_MISSING_KEYWORDS = ("fix", "implement", "refactor", "patch", "수정", "구현", "리팩터", "패치")
+# Change-requests with no nameable target: "make it better", "improve this",
+# "optimize", "고쳐줘", "개선해줘". Questions/explanations stay out on purpose.
+_VAGUE_CHANGE_VERBS = (
+    "improve",
+    "make it better",
+    "make this better",
+    "optimize",
+    "optimise",
+    "clean up",
+    "cleanup",
+    "enhance",
+    "polish",
+    "개선",
+    "최적화",
+    "다듬",
+    "고쳐",
+    "좋게",
+    "낫게",
+)
+_VAGUE_PRONOUN_OBJECTS = ("it", "this", "that", "things", "stuff", "이거", "그거", "저거", "이것", "그것")
+_VAGUE_PROMPT_CHAR_LIMIT = 120
 _LOW_CONFIDENCE_THRESHOLD = 0.62
 
 
@@ -173,6 +194,10 @@ def assess_clarification(item: WorkItem, intent: WorkIntent) -> ClarificationRes
 
     if intent.category == "engineering" and _looks_like_coding_without_target(text):
         reasons.append("missing_target_scope")
+        questions.append(_question("target_scope", locale))
+
+    if _looks_like_vague_change_request(text):
+        reasons.append("vague_change_request")
         questions.append(_question("target_scope", locale))
 
     if _has_any(text, _SCOPE_KEYWORDS) and not _has_any(
@@ -221,6 +246,21 @@ def _needs_direction_confirmation(text: str, intent: WorkIntent) -> bool:
     if intent.category in {"engineering", "security", "documentation", "local_model"}:
         return True
     return len(text) > 400
+
+
+def _looks_like_vague_change_request(text: str) -> bool:
+    """Short imperative change-requests without a nameable target must clarify."""
+    if len(text) > _VAGUE_PROMPT_CHAR_LIMIT:
+        return False
+    if not _has_any(text, _VAGUE_CHANGE_VERBS):
+        return False
+    target_markers = (".py", ".rs", ".ts", ".js", "/", "src", "test", "파일", "모듈", "함수", "클래스", "class ", "def ")
+    if _has_any(text, target_markers):
+        return False
+    words = set(re.findall(r"[a-z가-힣]+", text))
+    has_pronoun_object = bool(words & set(_VAGUE_PRONOUN_OBJECTS))
+    has_named_object = any(len(word) > 3 and word not in _VAGUE_PRONOUN_OBJECTS for word in words - set(["make", "better", "improve", "optimize", "clean", "up", "enhance", "polish"]))
+    return has_pronoun_object or not has_named_object
 
 
 def _looks_like_coding_without_target(text: str) -> bool:

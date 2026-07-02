@@ -9,12 +9,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from cluxion_runtime.adapters.contract import work_item_from_adapter_payload
-from cluxion_runtime.adapters.hermes import (
-    build_hermes_local_endpoint_patch,
-    hermes_config_patch_to_dict,
-    hermes_config_set_commands,
-    render_hermes_yaml_fragment,
-)
 from cluxion_runtime.bootstrap import ensure_local_runtime
 from cluxion_runtime.core.dispatch_store import (
     DispatchStoreError,
@@ -32,7 +26,6 @@ from cluxion_runtime.core.loop_auto import (
 )
 from cluxion_runtime.core.plan_codec import plan_to_dict
 from cluxion_runtime.core.types import AgentSurface, ModelRuntimeProfile
-from cluxion_runtime.models import LocalModelSupervisor, build_vllm_mlx_profile
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -122,6 +115,7 @@ def _build_parser() -> argparse.ArgumentParser:
     hermes.add_argument("--display-name", default="Cluxion Local")
     queue_next = subparsers.add_parser("queue-next", help="Return the next segment from the stored dispatch queue")
     queue_next.add_argument("--work-id", required=True)
+    queue_next.add_argument("--full", action="store_true", help="Emit complete field contents instead of a bounded preview")
     queue_record = subparsers.add_parser(
         "queue-record", help="Record a segment execution result into the dispatch queue"
     )
@@ -222,6 +216,32 @@ def _run_loop_auto(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+QUEUE_PREVIEW_CHARS = 2000
+
+
+def _bounded_step_payload(payload: dict[str, object], *, full: bool) -> dict[str, object]:
+    """Terminal-safe preview: long string fields are truncated unless --full."""
+    if full:
+        return payload
+    bounded: dict[str, object] = {}
+    truncated = False
+    for key, value in payload.items():
+        if isinstance(value, str) and len(value) > QUEUE_PREVIEW_CHARS:
+            bounded[key] = value[:QUEUE_PREVIEW_CHARS]
+            truncated = True
+        elif isinstance(value, dict):
+            inner = _bounded_step_payload(value, full=False)
+            if inner.pop("truncated", False):
+                truncated = True
+            bounded[key] = inner
+        else:
+            bounded[key] = value
+    if truncated:
+        bounded["truncated"] = True
+        bounded["truncated_hint"] = "rerun with --full for the complete payload"
+    return bounded
+
+
 def _run_queue_next(args: argparse.Namespace) -> int:
     try:
         payload = next_dispatch_step(str(args.work_id))
@@ -229,6 +249,7 @@ def _run_queue_next(args: argparse.Namespace) -> int:
         payload = {"ok": False, "error": str(exc)}
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return 1
+    payload = _bounded_step_payload(payload, full=bool(getattr(args, "full", False)))
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return 0
 
@@ -352,6 +373,10 @@ def _run_guard(_: argparse.Namespace) -> int:
 
 
 def _run_serve_local(args: argparse.Namespace) -> int:
+    # Local-model serving pulls in the vllm/mlx dependency chain; import it
+    # here so plan/queue/guard commands never pay that startup cost.
+    from cluxion_runtime.models import LocalModelSupervisor, build_vllm_mlx_profile
+
     bootstrap = None
     if args.auto_install and (not args.dry_run or args.upgrade_runtime):
         bootstrap = ensure_local_runtime(upgrade=bool(args.upgrade_runtime))
@@ -409,6 +434,14 @@ def _serve_payload(profile: ModelRuntimeProfile) -> dict[str, object]:
 
 
 def _run_hermes_local_config(args: argparse.Namespace) -> int:
+    from cluxion_runtime.adapters.hermes import (
+        build_hermes_local_endpoint_patch,
+        hermes_config_patch_to_dict,
+        hermes_config_set_commands,
+        render_hermes_yaml_fragment,
+    )
+    from cluxion_runtime.models import build_vllm_mlx_profile
+
     profile = build_vllm_mlx_profile(
         str(args.model),
         host=str(args.host),

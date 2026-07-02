@@ -41,3 +41,14 @@ def test_plan_negative_context_tokens_rejected(capsys, monkeypatch) -> None:
     )
     assert code == 2
     assert payload["error"] == "invalid_input"
+
+
+def test_queue_next_bounds_long_fields() -> None:
+    from cluxion_runtime.cli import _bounded_step_payload
+
+    payload = {"prompt": "x" * 5000, "step": {"content": "y" * 5000}, "id": "w1"}
+    bounded = _bounded_step_payload(payload, full=False)
+    assert len(bounded["prompt"]) == 2000
+    assert bounded["truncated"] is True
+    assert len(bounded["step"]["content"]) == 2000
+    assert _bounded_step_payload(payload, full=True) == payload
