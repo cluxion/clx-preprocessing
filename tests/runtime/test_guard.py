@@ -17,6 +17,17 @@ import pytest
 
 from cluxion_runtime.resources import guard_bridge, queue_bridge
 
+
+def _process_table_available() -> bool:
+    try:
+        next(psutil.process_iter(["pid"]))
+        return True
+    except (StopIteration, PermissionError, psutil.Error):
+        return False
+
+
+pytestmark = pytest.mark.skipif(not _process_table_available(), reason="process table unavailable in sandbox")
+
 _LOCAL_BIN = Path(__file__).resolve().parents[2] / "rust" / "cluxion_queue" / "target" / "release" / "cluxion-queue"
 
 BACKENDS = ["python"]

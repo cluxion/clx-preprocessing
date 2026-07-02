@@ -15,7 +15,7 @@ from typing import Literal
 PATCH_RESOURCE = "patches/hermes-deliver-agent.patch"
 BRANCH_NAME = "cluxion/plugin-deliver-agent"
 
-Status = Literal["applied", "missing", "partial", "no_hermes"]
+Status = Literal["applied", "missing", "partial", "no_hermes", "anchors-mismatch"]
 
 
 @dataclass(frozen=True)
@@ -129,6 +129,15 @@ def ensure_applied(
                 )
 
     after = patch_status(current.hermes_root)
+    if after.status != "applied":
+        return PatchResult(
+            current.hermes_root,
+            "anchors-mismatch",
+            False,
+            False,
+            "failed",
+            after.detail,
+        )
     return PatchResult(
         current.hermes_root,
         after.status,
@@ -358,15 +367,8 @@ def _patch_tui_gateway(root: Path) -> bool:
         path.write_text(text, encoding="utf-8")
     return changed
 
-
-def autostart_enabled() -> bool:
-    value = os.environ.get("CLUXION_HERMES_PATCH_AUTOFIX", "1").strip().lower()
-    return value not in {"0", "false", "no", "off"}
-
-
 __all__ = [
     "PatchResult",
-    "autostart_enabled",
     "ensure_applied",
     "patch_status",
     "resolve_hermes_agent_root",

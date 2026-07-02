@@ -20,8 +20,7 @@ Examples:
   /loopauto refactor auth module with tests
 
 Notes:
-  - Equivalent to prefixing a prompt with /loopAuto on cluxion_plan
-  - Disable auto-loop: export CLUXION_LOOP_AUTO=0
+  - Equivalent to cluxion_plan with loop_auto=true
   - Diagnostics only: add loop_auto_dry_run via cluxion_plan tool
 """
 
@@ -52,9 +51,10 @@ def handle_loopauto(raw_args: str) -> str:
     try:
         result = runner.plan(
             {
-                "prompt": f"/loopAuto {prompt}",
+                "prompt": prompt,
                 "cwd": str(Path.cwd()),
                 "clarification_answers": "confirmed via /loopauto slash command",
+                "loop_auto": True,
             }
         )
         return _format_plan_response(result.to_json())
@@ -108,7 +108,7 @@ def _format_plan_response(raw_json: str) -> str:
     if isinstance(host, dict) and host.get("queue_required"):
         return (
             "Plan queued but loop_auto did not run. "
-            "Check CLUXION_LOOP_AUTO=1 and hermes on PATH (cluxion-preprocess doctor)."
+            "Call cluxion_loop_auto or pass explicit loop_auto=true; check hermes on PATH."
         )
     return json.dumps(body, ensure_ascii=False, indent=2)[:8000]
 

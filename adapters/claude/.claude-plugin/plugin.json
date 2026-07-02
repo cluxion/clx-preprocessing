@@ -1,8 +1,0 @@
-{
-  "name": "cluxion-agentplugin-preprocessing",
-  "version": "0.2.0",
-  "description": "Cluxion preprocessing: honesty, clarification, Rust work queue, resource admission.",
-  "author": "cluxion",
-  "commands": "./commands",
-  "skills": "./skills"
-}

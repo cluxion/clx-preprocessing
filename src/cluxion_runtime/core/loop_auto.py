@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Protocol
 from cluxion_runtime.core.dispatch_store import (
     DispatchStoreError,
     build_briefing_payload,
+    default_dispatch_dir,
     next_dispatch_step,
     record_dispatch_result,
 )
@@ -62,6 +63,7 @@ class LoopAutoOptions:
     model: str = ""
     timeout_seconds: float = 600.0
     max_segment_retries: int = 2
+    max_iterations: int = 25
     dry_run: bool = False
     segment_runner: Callable[[str], HermesSegmentResult] | None = None
 
@@ -118,12 +120,8 @@ class SegmentRunner(Protocol):
 
 def loop_auto_enabled(payload: Mapping[str, object] | None = None) -> bool:
     """Return whether auto-loop should run after a queued plan."""
-    if payload is not None:
-        if "loop_auto" in payload:
-            return bool(payload.get("loop_auto"))
-        prompt = str(payload.get("prompt", ""))
-        if prompt.strip().lower().startswith("/loopauto"):
-            return True
+    if payload is not None and "loop_auto" in payload:
+        return bool(payload.get("loop_auto"))
     default = os.environ.get(LOOP_AUTO_DEFAULT_ENV, "1").strip().lower()
     if default in {"0", "false", "no", "off"}:
         return False
@@ -147,7 +145,7 @@ def should_auto_loop_plan(plan_payload: Mapping[str, object], *, loop_auto: bool
         return False
     if loop_auto is not None:
         return loop_auto
-    return loop_auto_enabled(plan_payload)
+    return False
 
 
 def run_loop_auto(options: LoopAutoOptions) -> LoopAutoResult:
@@ -159,14 +157,44 @@ def run_loop_auto(options: LoopAutoOptions) -> LoopAutoResult:
     deadline = start + options.timeout_seconds
 
     try:
+        preflight_error = _preflight_error(options)
+        if preflight_error:
+            return _fail(options.work_id, "preflight_failed", records, start, error=preflight_error)
         runner = options.segment_runner or _default_segment_runner(options)
+        previous_state: tuple[object, ...] | None = None
+        iterations = 0
         while time.monotonic() < deadline:
+            if iterations >= options.max_iterations:
+                return _finalize(
+                    options.work_id,
+                    status="iteration_cap_exceeded",
+                    records=records,
+                    processed=processed,
+                    failed=failed,
+                    briefing="",
+                    start=start,
+                    error=f"loop_auto exceeded max_iterations={options.max_iterations}",
+                )
             step_payload = next_dispatch_step(options.work_id)
             if not step_payload.get("ready"):
                 break
             step = step_payload.get("step")
             if not isinstance(step, dict):
-                return _fail(options.work_id, "invalid_step_payload", records, start)
+                return _fail(options.work_id, "invalid_step_payload", records, start, error="invalid step payload")
+            state = _queue_state_signature(step_payload)
+            if state == previous_state:
+                return _finalize(
+                    options.work_id,
+                    status="no_progress",
+                    records=records,
+                    processed=processed,
+                    failed=failed,
+                    briefing="",
+                    start=start,
+                    error="dispatch queue made no progress between loop_auto iterations",
+                )
+            previous_state = state
+            iterations += 1
             step_id = str(step.get("step_id", ""))
             segment_id = str(step.get("segment_id", ""))
             prompt = _build_segment_prompt(step, options.work_id)
@@ -189,7 +217,7 @@ def run_loop_auto(options: LoopAutoOptions) -> LoopAutoResult:
                     last_error = marker.removeprefix(WORK_REMAINS_PREFIX).strip()
                     prompt = _build_segment_prompt(step, options.work_id, remainder=last_error)
                     continue
-                last_error = "missing completion marker"
+                last_error = f"missing completion marker after {attempts} attempts"
             if not segment_ok:
                 record_dispatch_result(
                     options.work_id,
@@ -273,6 +301,32 @@ def run_loop_auto(options: LoopAutoOptions) -> LoopAutoResult:
         return _fail(options.work_id, "dispatch_error", records, start, error=str(exc))
     except Exception as exc:
         return _fail(options.work_id, "loop_error", records, start, error=str(exc))
+
+
+def _preflight_error(options: LoopAutoOptions) -> str:
+    if options.segment_runner is None and not options.dry_run and not shutil.which(options.hermes_bin):
+        return f"hermes binary not found: {options.hermes_bin}"
+    try:
+        dispatch_dir = default_dispatch_dir()
+        dispatch_dir.mkdir(parents=True, exist_ok=True)
+        probe = dispatch_dir / ".loop-auto-preflight"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except OSError as exc:
+        return f"dispatch store not writable: {exc}"
+    return ""
+
+
+def _queue_state_signature(step_payload: Mapping[str, object]) -> tuple[object, ...]:
+    step = step_payload.get("step")
+    if not isinstance(step, dict):
+        return (False,)
+    return (
+        step_payload.get("remaining"),
+        step.get("step_id"),
+        step.get("segment_id"),
+        step.get("checksum"),
+    )
 
 
 def _build_segment_prompt(step: Mapping[str, object], work_id: str, *, remainder: str = "") -> str:

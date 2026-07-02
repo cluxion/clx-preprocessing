@@ -17,11 +17,11 @@
 
 1. 사용자 요청 수신 → `cluxion_plan` (또는 `cluxion-runtime plan`)
 2. `clarification.required`이면 사용자에게 질문, 작업 보류
-3. `queued` 모드: 수동이면 `cluxion_queue_next` → … → `cluxion_queue_brief`. Hermes 긴 작업은 `/loopauto` 또는 `loop_auto: true`(기본)로 자동 드레인.
+3. `queued` 모드: 수동이면 `cluxion_queue_next` → … → `cluxion_queue_brief`. 자동 드레인은 `/loopauto`, `loop_auto: true`, 또는 전용 `loop-auto` 명령으로만 실행합니다.
 4. `answer_policy.required_checks`를 지키며 응답
 5. (선택) `cluxion_queue_brief` 결과를 ForgetForge에 저장: `forgetforge import-brief --source preprocessing`
 
-Skill: [`adapters/claude/skills/preprocess/SKILL.md`](../adapters/claude/skills/preprocess/SKILL.md)
+Skill: [`skills/preprocess/SKILL.md`](../skills/preprocess/SKILL.md)
 
 ### 사람(개발자)이 할 일
 

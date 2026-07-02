@@ -58,7 +58,7 @@ Hermes 안에서는 `cluxion_doctor` 도구로도 노출됩니다.
 
 | 슬래시 | 용도 |
 |---|---|
-| `/loopauto <prompt>` | plan + 자동 큐 드레인 (`/loopAuto` 지시어와 동일) |
+| `/loopauto <prompt>` | 명시적 plan + 자동 큐 드레인 |
 | `/cluxion-doctor` | doctor (CLI `cluxion-preprocess doctor`와 동일) |
 
 ```
@@ -66,7 +66,8 @@ Hermes 안에서는 `cluxion_doctor` 도구로도 노출됩니다.
 /cluxion-doctor
 ```
 
-비활성: `export CLUXION_LOOP_AUTO=0` · 상세: `Docs/cluxion-plugins-guide.md` §5-A (통합 가이드)
+`/loopAuto` prompt prefix는 이제 queue 계약만 만들고, blocking drain은 `loop_auto=true` 또는 전용
+`loop-auto` 명령에서만 실행됩니다.
 
 ## 문제 해결
 
@@ -142,7 +143,7 @@ Type `/` to see plugin commands with a 🔌 badge.
 
 | Slash | Purpose |
 |---|---|
-| `/loopauto <prompt>` | Plan + autonomous queue drain (same as `/loopAuto` directive) |
+| `/loopauto <prompt>` | Explicit plan + autonomous queue drain |
 | `/cluxion-doctor` | Run doctor (same as `cluxion-preprocess doctor`) |
 
 ```
@@ -150,7 +151,8 @@ Type `/` to see plugin commands with a 🔌 badge.
 /cluxion-doctor
 ```
 
-Disable auto-loop: `export CLUXION_LOOP_AUTO=0`.
+The `/loopAuto` prompt prefix now only queues work. Blocking drain requires explicit `loop_auto=true`
+or the dedicated `loop-auto` command.
 
 ## Troubleshooting
 

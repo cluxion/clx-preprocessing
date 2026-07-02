@@ -72,6 +72,24 @@ def test_autostart_default_on(monkeypatch: pytest.MonkeyPatch) -> None:
     assert calls == 1
 
 
+def test_session_start_does_not_auto_apply_hermes_patch(monkeypatch: pytest.MonkeyPatch) -> None:
+    from cluxion_agentplugin_preprocessing import hermes_deliver_patch
+
+    patch_calls = 0
+
+    def fake_ensure_applied(**_: object) -> object:
+        nonlocal patch_calls
+        patch_calls += 1
+        raise AssertionError("patch must be explicit")
+
+    monkeypatch.setattr(hermes_deliver_patch, "ensure_applied", fake_ensure_applied)
+    monkeypatch.setattr(guard_watch.guard_bridge, "start_daemon", lambda: {"ok": True})
+
+    guard_watch.on_session_start(session_id="s1", telemetry_schema_version=1)
+
+    assert patch_calls == 0
+
+
 @pytest.mark.parametrize("value", ["0", "false", "False"])
 def test_autostart_env_gate_off(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     calls = 0

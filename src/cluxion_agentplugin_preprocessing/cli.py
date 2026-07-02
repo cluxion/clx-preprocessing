@@ -87,12 +87,13 @@ def _parser() -> argparse.ArgumentParser:
     doctor.add_argument("--verbose", action="store_true")
     patch = subparsers.add_parser(
         "hermes-patch",
-        help="Apply or verify Hermes deliver=agent patch (/supercoder routing)",
+        help="Explicitly apply or verify Hermes deliver=agent patch",
     )
+    patch.add_argument("action", nargs="?", choices=("status", "apply"), default="status")
     patch.add_argument(
         "--status",
         action="store_true",
-        help="Only report patch status (default: ensure applied)",
+        help="Deprecated alias for: hermes-patch status",
     )
     patch.add_argument("--dry-run", action="store_true")
     patch.add_argument(
@@ -134,10 +135,9 @@ def _status(args: argparse.Namespace) -> int:
 
 def _enable(args: argparse.Namespace) -> int:
     result = hermes_config.enable_plugin(args.home, dry_run=bool(args.dry_run))
-    patch = _ensure_hermes_patch(dry_run=bool(args.dry_run))
-    payload = {"ok": True, **result.to_dict(), "hermes_patch": patch.to_dict()}
+    payload = {"ok": True, **result.to_dict()}
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-    return 0 if patch.status in {"applied", "no_hermes"} or args.dry_run else 1
+    return 0
 
 
 def _disable(args: argparse.Namespace) -> int:
@@ -166,15 +166,9 @@ def _hermes_root_arg(args: argparse.Namespace) -> Path | None:
     return Path(raw).expanduser() if raw else None
 
 
-def _ensure_hermes_patch(*, dry_run: bool, hermes_root: Path | None = None) -> hermes_deliver_patch.PatchResult:
-    if dry_run:
-        return hermes_deliver_patch.patch_status(hermes_root)
-    return hermes_deliver_patch.ensure_applied(hermes_root=hermes_root)
-
-
 def _hermes_patch(args: argparse.Namespace) -> int:
     root = _hermes_root_arg(args)
-    if args.status:
+    if args.status or args.action == "status":
         result = hermes_deliver_patch.patch_status(root)
     else:
         result = hermes_deliver_patch.ensure_applied(hermes_root=root, dry_run=bool(args.dry_run))

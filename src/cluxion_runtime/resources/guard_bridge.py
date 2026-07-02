@@ -102,32 +102,38 @@ def enforce(
         return {"ok": False, "error": "owned_roots_required", "dry_run": dry_run}
     protected = _protected_pids(protect, store_dir)
 
-    procs: dict[int, psutil.Process] = {}
-    for proc in psutil.process_iter():
-        try:
-            proc.cpu_percent(None)  # prime the per-process CPU window
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-        procs[proc.pid] = proc
-    time.sleep(_CPU_WINDOW_SECONDS)
-
     parents: dict[int, int] = {}
     rows: list[dict[str, Any]] = []
-    for pid, proc in procs.items():
-        try:
-            with proc.oneshot():
-                info = {
-                    "pid": pid,
-                    "ppid": proc.ppid(),
-                    "name": proc.name(),
-                    "cpu_percent": float(proc.cpu_percent(None)),
-                    "rss_mb": proc.memory_info().rss // 1_048_576,
-                    "zombie": proc.status() == psutil.STATUS_ZOMBIE,
-                }
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-        parents[pid] = int(info["ppid"])
-        rows.append(info)
+    process_rows = _process_rows()
+    if process_rows is None:
+        procs: dict[int, psutil.Process] = {}
+        for proc in psutil.process_iter():
+            try:
+                proc.cpu_percent(None)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            procs[proc.pid] = proc
+        time.sleep(_CPU_WINDOW_SECONDS)
+        for pid, proc in procs.items():
+            try:
+                with proc.oneshot():
+                    info = {
+                        "pid": pid,
+                        "ppid": proc.ppid(),
+                        "name": proc.name(),
+                        "cpu_percent": float(proc.cpu_percent(None)),
+                        "rss_mb": proc.memory_info().rss // 1_048_576,
+                        "zombie": proc.status() == psutil.STATUS_ZOMBIE,
+                    }
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            parents[pid] = int(info["ppid"])
+            rows.append(info)
+    else:
+        rows = process_rows
+        procs = {}
+    for info in rows:
+        parents[int(info["pid"])] = int(info["ppid"])
 
     candidates: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
@@ -163,8 +169,9 @@ def enforce(
 
     to_wait: list[psutil.Process] = []
     for entry in candidates:
-        proc = procs.get(int(entry["pid"]))
-        if proc is None or not _still_owned_and_same(proc, roots):
+        pid = int(entry["pid"])
+        proc = procs.get(pid) if procs else _process_or_none(pid)
+        if proc is None or not _still_owned_for_signal(proc, roots, procs, parents):
             skipped.append({"pid": entry["pid"], "reason": "identity_or_ownership_changed"})
             continue
         try:
@@ -262,14 +269,28 @@ def _still_owned_and_same(proc: psutil.Process, roots: list[int]) -> bool:
         if not proc.is_running():
             return False
         lineage = {parent.pid for parent in proc.parents()}
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
+    except (psutil.NoSuchProcess, psutil.AccessDenied, PermissionError):
         return False
     return any(root in lineage for root in roots)
 
 
+def _still_owned_for_signal(
+    proc: psutil.Process,
+    roots: list[int],
+    procs: dict[int, psutil.Process],
+    parents: dict[int, int],
+) -> bool:
+    if procs:
+        return _still_owned_and_same(proc, roots)
+    try:
+        return proc.is_running() and _is_owned(proc.pid, roots, parents)
+    except (psutil.NoSuchProcess, psutil.AccessDenied, PermissionError):
+        return False
+
+
 def _protected_pids(protect: list[int] | tuple[int, ...], store_dir: Path | str | None) -> set[int]:
     protected = {os.getpid()} | {int(pid) for pid in protect}
-    with contextlib.suppress(psutil.Error):
+    with contextlib.suppress(psutil.Error, PermissionError):
         protected |= {parent.pid for parent in psutil.Process().parents()}
     with contextlib.suppress(OSError, ValueError):
         protected.add(int((_store_base(store_dir) / PID_FILE_NAME).read_text(encoding="utf-8").strip()))
@@ -407,20 +428,24 @@ def _python_sample(body: Mapping[str, Any]) -> dict[str, Any]:
     cpu_sample_ms = int(body.get("cpu_sample_ms", 100))
     interval = None if cpu_sample_ms <= 0 else cpu_sample_ms / 1000.0
     memory = psutil.virtual_memory()
-    swap = psutil.swap_memory()
     cpu = psutil.cpu_percent(interval=interval)
-    zombie_pids: list[int] = []
-    count = 0
-    for proc in psutil.process_iter(["status"]):
-        count += 1
-        if proc.info["status"] == psutil.STATUS_ZOMBIE:
-            zombie_pids.append(proc.pid)
+    process_rows = _process_rows()
+    if process_rows is None:
+        zombie_pids = []
+        processes = list(psutil.process_iter(["status"]))
+        count = len(processes)
+        for proc in processes:
+            if proc.info["status"] == psutil.STATUS_ZOMBIE:
+                zombie_pids.append(proc.pid)
+    else:
+        count = len(process_rows)
+        zombie_pids = [int(row["pid"]) for row in process_rows if row["zombie"]]
     zombie_pids.sort()
     return {
         "ok": True,
         "total_ram_mb": memory.total // 1_048_576,
         "available_ram_mb": memory.available // 1_048_576,
-        "swap_used_mb": swap.used // 1_048_576,
+        "swap_used_mb": _swap_used_mb(),
         "cpu_percent": float(cpu),
         "process_count": count,
         "zombie_count": len(zombie_pids),
@@ -435,20 +460,27 @@ def _python_scan(body: Mapping[str, Any]) -> dict[str, Any]:
     rss_hot_mb = int(body.get("rss_threshold_mb", 1024))
     parents: dict[int, int] = {}
     rows: list[dict[str, Any]] = []
-    for proc in psutil.process_iter(["pid", "ppid", "name", "cpu_percent", "memory_info", "status"]):
-        info = proc.info
-        if info["ppid"] is not None:
-            parents[info["pid"]] = info["ppid"]
-        rows.append(info)
+    process_rows = _process_rows()
+    if process_rows is None:
+        for proc in psutil.process_iter(["pid", "ppid", "name", "cpu_percent", "memory_info", "status"]):
+            info = proc.info
+            if info["ppid"] is not None:
+                parents[info["pid"]] = info["ppid"]
+            rows.append(info)
+    else:
+        rows = process_rows
+        parents = {int(info["pid"]): int(info["ppid"]) for info in rows}
     zombies: list[dict[str, Any]] = []
     hot: list[dict[str, Any]] = []
     owned_alive = 0
     for info in rows:
         owned = _is_owned(info["pid"], owned_roots, parents)
-        is_zombie = info["status"] == psutil.STATUS_ZOMBIE
+        is_zombie = bool(info.get("zombie", False)) or info["status"] == psutil.STATUS_ZOMBIE
         if owned and not is_zombie:
             owned_alive += 1
-        rss_mb = (info["memory_info"].rss // 1_048_576) if info["memory_info"] else 0
+        rss_mb = int(info.get("rss_mb", 0))
+        if "memory_info" in info:
+            rss_mb = (info["memory_info"].rss // 1_048_576) if info["memory_info"] else 0
         entry = {
             "pid": info["pid"],
             "ppid": parents.get(info["pid"]),
@@ -484,6 +516,56 @@ def _is_owned(pid: int, owned_roots: list[int], parents: dict[int, int]) -> bool
             return False
         current = parent
     return False
+
+
+def _swap_used_mb() -> int:
+    try:
+        return int(psutil.swap_memory().used // 1_048_576)
+    except OSError:
+        return 0
+
+
+def _process_or_none(pid: int) -> psutil.Process | None:
+    try:
+        return psutil.Process(pid)
+    except (psutil.NoSuchProcess, psutil.AccessDenied, PermissionError):
+        return None
+
+
+def _process_rows() -> list[dict[str, Any]] | None:
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,pcpu=,rss=,stat=,comm="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if completed.returncode != 0:
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in completed.stdout.splitlines():
+        parts = line.strip().split(None, 5)
+        if len(parts) < 6:
+            continue
+        pid, ppid, cpu, rss_kb, stat, name = parts
+        try:
+            rows.append(
+                {
+                    "pid": int(pid),
+                    "ppid": int(ppid),
+                    "name": name,
+                    "cpu_percent": float(cpu),
+                    "rss_mb": int(rss_kb) // 1024,
+                    "status": stat,
+                    "zombie": stat.upper().startswith("Z"),
+                }
+            )
+        except ValueError:
+            continue
+    return rows
 
 
 __all__ = [

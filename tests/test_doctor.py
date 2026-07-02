@@ -72,6 +72,26 @@ def test_new_probes_non_skip():
         assert statuses[key] in ("pass", "warn", "fail")  # non-skip
 
 
+def test_real_failure_mode_probes_present():
+    cat = _catalog_path()
+    result = run_doctor(
+        cwd=Path.cwd(),
+        catalog_path=cat,
+        probes=PROBES,
+        plugin="preprocessing",
+        version="0.3.24",
+    )
+    statuses = {c.check_id: c.status for c in result.checks}
+    for key in (
+        "hermes_plugin_enabled",
+        "hermes_deliver_patch_status",
+        "dispatch_dir_writable",
+        "version_files_synced",
+    ):
+        assert key in statuses
+        assert statuses[key] in ("pass", "warn", "fail", "skip")
+
+
 def test_probe_exception_becomes_fail():
     def bad_probe(ctx):
         raise RuntimeError("boom")

@@ -26,11 +26,14 @@ def collect_resource_snapshot() -> ResourceSnapshot:
                 cpu_percent=float(current.get("cpu_percent", 0.0)),
             )
     memory = psutil.virtual_memory()
-    swap = psutil.swap_memory()
+    try:
+        swap_used_mb = int(psutil.swap_memory().used // 1_048_576)
+    except OSError:
+        swap_used_mb = 0
     return ResourceSnapshot(
         total_ram_mb=int(memory.total // 1_048_576),
         available_ram_mb=int(memory.available // 1_048_576),
-        swap_used_mb=int(swap.used // 1_048_576),
+        swap_used_mb=swap_used_mb,
         cpu_percent=float(psutil.cpu_percent(interval=None)),
     )
 

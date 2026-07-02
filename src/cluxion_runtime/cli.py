@@ -86,6 +86,7 @@ def _build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--expected-ram-mb", type=int, default=0)
     plan.add_argument("--context-tokens", type=int, default=0)
     plan.add_argument("--cwd", default="")
+    plan.add_argument("--loop-auto", action="store_true")
     plan.add_argument("--json-stdin", action="store_true")
     serve = subparsers.add_parser("serve-local", help="Prepare a vLLM-MLX server endpoint for a local model")
     serve.add_argument("--model", required=True)
@@ -159,6 +160,8 @@ def _run_plan(args: argparse.Namespace) -> int:
     surface = AgentSurface(str(args.surface))
     payload = _payload_from_stdin() if args.json_stdin else _payload_from_args(args)
     payload = _apply_loop_auto_directive(payload)
+    if bool(getattr(args, "loop_auto", False)):
+        payload["loop_auto"] = True
     item = work_item_from_adapter_payload(payload, default_surface=surface)
     plan = build_harness_plan(item)
     persisted = persist_dispatch_bundle(plan)
@@ -441,6 +444,7 @@ def _payload_from_args(args: argparse.Namespace) -> dict[str, object]:
         "expected_ram_mb": int(args.expected_ram_mb),
         "context_tokens": int(args.context_tokens),
         "cwd": str(args.cwd),
+        "loop_auto": bool(args.loop_auto),
     }
 
 
@@ -451,7 +455,6 @@ def _apply_loop_auto_directive(payload: dict[str, object]) -> dict[str, object]:
         return payload
     updated = dict(payload)
     updated["prompt"] = cleaned
-    updated["loop_auto"] = True
     return updated
 
 

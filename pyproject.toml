@@ -67,14 +67,20 @@ packages = ["src/cluxion_agentplugin_preprocessing", "src/cluxion_runtime"]
 [tool.hatch.build.targets.wheel.force-include]
 "cluxion-Docs" = "cluxion_agentplugin_docs/cluxion-Docs"
 ".github/profile/README.md" = "cluxion_agentplugin_docs/github-profile/README.md"
-"adapters" = "cluxion_agentplugin_adapters"
+".claude-plugin" = ".claude-plugin"
+".codex-plugin" = ".codex-plugin"
+"commands" = "commands"
+"skills" = "skills"
 
 [tool.hatch.build.targets.sdist]
 include = [
     "src/cluxion_agentplugin_preprocessing",
     "src/cluxion_runtime",
     "rust/cluxion_queue",
-    "adapters",
+    ".claude-plugin",
+    ".codex-plugin",
+    "commands",
+    "skills",
     "tests",
     "cluxion-Docs",
     ".github/profile",

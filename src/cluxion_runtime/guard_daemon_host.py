@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -37,13 +38,18 @@ def _epoch_ms() -> int:
 def _scan_process_fields() -> ProcessScanCache:
     zombie_pids: list[int] = []
     count = 0
-    for proc in psutil.process_iter(["status"]):
-        count += 1
-        try:
-            if proc.info["status"] == psutil.STATUS_ZOMBIE:
-                zombie_pids.append(proc.pid)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
+    rows = _process_status_rows()
+    if rows is None:
+        for proc in psutil.process_iter(["status"]):
+            count += 1
+            try:
+                if proc.info["status"] == psutil.STATUS_ZOMBIE:
+                    zombie_pids.append(proc.pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    else:
+        count = len(rows)
+        zombie_pids = [pid for pid, status in rows if status.upper().startswith("Z")]
     zombie_pids.sort()
     zombie_count = len(zombie_pids)
     return ProcessScanCache(
@@ -55,14 +61,45 @@ def _scan_process_fields() -> ProcessScanCache:
 
 def _cheap_sample() -> dict[str, Any]:
     memory = psutil.virtual_memory()
-    swap = psutil.swap_memory()
     cpu = psutil.cpu_percent(interval=None)
     return {
         "total_ram_mb": memory.total // 1_048_576,
         "available_ram_mb": memory.available // 1_048_576,
-        "swap_used_mb": swap.used // 1_048_576,
+        "swap_used_mb": _swap_used_mb(),
         "cpu_percent": float(cpu),
     }
+
+
+def _swap_used_mb() -> int:
+    try:
+        return int(psutil.swap_memory().used // 1_048_576)
+    except OSError:
+        return 0
+
+
+def _process_status_rows() -> list[tuple[int, str]] | None:
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "pid=,stat="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if completed.returncode != 0:
+        return []
+    rows: list[tuple[int, str]] = []
+    for line in completed.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        try:
+            rows.append((int(parts[0]), parts[1]))
+        except ValueError:
+            continue
+    return rows
 
 
 def _build_current_snapshot(

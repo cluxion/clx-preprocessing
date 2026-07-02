@@ -171,8 +171,7 @@ LOOP_AUTO_SCHEMA = {
     "name": "cluxion_loop_auto",
     "description": (
         "Autonomously drain the Cluxion dispatch queue via Hermes oneshot calls. "
-        "Equivalent to /loopAuto: next segment -> hermes -z -> record -> ... -> briefing. "
-        "Use after cluxion_plan queued a durable work bundle, or pass loop_auto on plan."
+        "Use after cluxion_plan queued a durable work bundle, or pass explicit loop_auto=true on plan."
     ),
     "parameters": {
         "type": "object",

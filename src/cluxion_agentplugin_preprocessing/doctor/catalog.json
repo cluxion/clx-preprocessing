@@ -514,6 +514,39 @@
     "detection_method": "python -c 'import json; d = {\"z\": 1, \"a\": 2}; j1 = json.dumps(d, sort_keys=True); j2 = json.dumps(d, sort_keys=True); assert j1 == j2, f\"{j1} != {j2}\"'"
   },
   {
+    "check_id": "hermes_deliver_patch_status",
+    "category": "hermes_contract",
+    "severity": "high",
+    "what_it_checks": "Hermes deliver=agent source patch is absent, fully applied, or partially applied",
+    "failure_symptom": "deliver=agent slash behavior silently does not exist or only some Hermes paths support it",
+    "likely_causes": [
+      "Hermes source changed and patch anchors no longer match",
+      "A previous manual patch only touched some files",
+      "HERMES_AGENT_ROOT points at the wrong checkout"
+    ],
+    "fix_steps": [
+      "Run: cluxion-preprocess hermes-patch status",
+      "If needed, run: cluxion-preprocess hermes-patch apply",
+      "If anchors mismatch, restore or update the Hermes checkout before applying"
+    ],
+    "change_robust": "Patch is explicit opt-in and reports applied/partial/no-hermes/anchors-mismatch instead of silently editing on session start"
+  },
+  {
+    "check_id": "version_files_synced",
+    "category": "install",
+    "severity": "high",
+    "what_it_checks": "pyproject, plugin.yaml, package plugin.yaml, and Codex/Claude plugin manifests use the same version",
+    "failure_symptom": "Marketplace plugin metadata, Hermes adapter metadata, and installed Python distribution report different versions",
+    "likely_causes": [
+      "Version bumped in pyproject only",
+      "Root plugin artifact added without updating package metadata"
+    ],
+    "fix_steps": [
+      "Set every plugin manifest version to pyproject.toml project.version"
+    ],
+    "change_robust": "Doctor compares repo metadata files directly and fails on any drift"
+  },
+  {
     "check_id": "temp_file_cleanup",
     "category": "resource",
     "severity": "low",

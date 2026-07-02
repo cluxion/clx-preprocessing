@@ -6,7 +6,7 @@
 
 | Slash | Maps to |
 |---|---|
-| `/loopauto <prompt>` | `cluxion_plan` with `/loopAuto` + `loop_auto` |
+| `/loopauto <prompt>` | `cluxion_plan` with explicit `loop_auto=true` |
 | `/cluxion-doctor` | `cluxion_doctor` / `cluxion-preprocess doctor` |
 
 `/` 입력 시 🔌 자동완성. 상세: `cluxion-plugins-guide.md` §2-A.
@@ -38,10 +38,10 @@
 | `cluxion_queue_next` | 다음 segment payload |
 | `cluxion_queue_record` | segment 처리 결과 기록 |
 | `cluxion_queue_brief` | 최종 synthesis용 briefing |
-| `cluxion_loop_auto` | 큐 자동 드레인 (`hermes -z` per segment). plan 기본 `loop_auto: true` |
+| `cluxion_loop_auto` | 큐 자동 드레인 (`hermes -z` per segment). 명시적 opt-in 전용 |
 
-`/loopauto` 슬래시·`/loopAuto` 프롬프트 지시어·`loop_auto: true` 파라미터는 동일 경로.
-비활성: `CLUXION_LOOP_AUTO=0`, `loop_auto: false`, `loop_auto_dry_run: true`(시뮬레이션).
+`/loopAuto` 프롬프트 지시어는 큐 계약만 만들고 blocking drain을 시작하지 않습니다.
+자동 드레인은 `/loopauto` 슬래시, `loop_auto: true`, 또는 `cluxion_loop_auto`로만 실행합니다.
 
 ### `cluxion_bootstrap`
 
@@ -103,7 +103,7 @@ Daemon 시작: `cluxion-queue guard-daemon` 바이너리가 없으면
 ### 자동 loopAuto (0.3.22+)
 
 1. `cluxion_plan` (또는 `/loopauto` 슬래시) — 큐 등록
-2. `cluxion_loop_auto` / 내장 `loop_auto` — `queue_next` → `hermes -z` → `queue_record` 반복 → `queue_brief`
+2. `cluxion_loop_auto` / 명시적 `loop_auto=true` — `queue_next` → `hermes -z` → `queue_record` 반복 → `queue_brief`
 3. 완료 마커: `SEGMENT_COMPLETE`, `WORK_REMAINS:`, `TASK_COMPLETE`
 
 segment checksum은 synthesis 시 보존합니다 (`required_checks`).

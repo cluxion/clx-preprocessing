@@ -21,14 +21,22 @@ stdin JSON 최소 필드: `{ "prompt": "..." }`
 
 ## Claude Code
 
-`adapters/claude/` 참고:
+Root plugin artifact:
 
 - `.claude-plugin/plugin.json`
-- `skills/preprocess/SKILL.md` — plan 호출 가이드
+- `commands/`
+- `skills/preprocess/SKILL.md`
 
 ## Codex
 
-`adapters/codex/config-snippet.toml` — config 조각 예시
+Codex uses the same root artifact through a marketplace install:
+
+```bash
+codex plugin marketplace add cluxion-local /path/to/cluxion-Agentplugin-preprocessing
+codex plugin add cluxion-agentplugin-preprocessing@cluxion-local
+```
+
+No `[plugins.<name>] command = [...]` schema exists.
 
 ## Grok Build
 

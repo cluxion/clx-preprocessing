@@ -11,6 +11,7 @@ from cluxion_runtime.cli import main
 from cluxion_runtime.core.dispatch_store import persist_dispatch_bundle
 from cluxion_runtime.core.harness import build_harness_plan
 from cluxion_runtime.core.loop_auto import (
+    HermesSegmentResult,
     LoopAutoOptions,
     loop_auto_enabled,
     run_loop_auto,
@@ -82,12 +83,14 @@ def test_plan_cli_auto_loops_queued_plan_dry_run(
     from io import StringIO
 
     monkeypatch.setenv("CLUXION_PREPROCESS_DISPATCH_DIR", str(tmp_path))
+    monkeypatch.setattr("cluxion_runtime.core.harness.collect_resource_snapshot", lambda: _SNAPSHOT)
     prompt = "\n".join(f"REQ-{idx}: implement work item and record evidence token {idx}." for idx in range(1500))
     stdin_payload = json.dumps(
         {
             "prompt": prompt,
             "work_id": "w-cli-loop",
             "clarification_answers": "go",
+            "loop_auto": True,
             "loop_auto_dry_run": True,
         }
     )
@@ -99,6 +102,112 @@ def test_plan_cli_auto_loops_queued_plan_dry_run(
     assert payload["host_execution"]["queue_required"] is True
     assert payload["loop_auto"]["ok"] is True
     assert payload["loop_auto"]["segments_processed"] >= 1
+
+
+def test_plan_cli_loopauto_prefix_enqueues_without_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import sys
+    from io import StringIO
+
+    monkeypatch.setenv("CLUXION_PREPROCESS_DISPATCH_DIR", str(tmp_path))
+    monkeypatch.setattr("cluxion_runtime.core.harness.collect_resource_snapshot", lambda: _SNAPSHOT)
+    prompt = "/loopAuto " + "\n".join(
+        f"REQ-{idx}: implement work item and record evidence token {idx}." for idx in range(1500)
+    )
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        StringIO(json.dumps({"prompt": prompt, "work_id": "w-cli-prefix", "clarification_answers": "go"})),
+    )
+
+    code = main(["plan", "--json-stdin", "--surface", "codex"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["host_execution"]["queue_required"] is True
+    assert "loop_auto" not in payload
+    assert "/loopAuto" not in str(payload["item"]["prompt"])
+    assert "REQ-0" in str(payload["item"]["prompt"])
+
+
+def test_run_loop_auto_missing_binary_fails_fast(tmp_path: Path, queued_plan, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLUXION_PREPROCESS_DISPATCH_DIR", str(tmp_path))
+    persist_dispatch_bundle(queued_plan, dispatch_dir=tmp_path)
+
+    result = run_loop_auto(LoopAutoOptions(work_id="w-loop-auto", hermes_bin="missing-hermes-for-test"))
+
+    assert result.ok is False
+    assert result.status == "preflight_failed"
+    assert "hermes binary not found" in result.error
+    assert result.segments_processed == 0
+
+
+def test_run_loop_auto_marker_missing_fails_after_retry_cap(
+    tmp_path: Path, queued_plan, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CLUXION_PREPROCESS_DISPATCH_DIR", str(tmp_path))
+    persist_dispatch_bundle(queued_plan, dispatch_dir=tmp_path)
+    calls = 0
+
+    def runner(_: str) -> HermesSegmentResult:
+        nonlocal calls
+        calls += 1
+        return HermesSegmentResult(stdout="work output without marker", stderr="", returncode=0)
+
+    result = run_loop_auto(
+        LoopAutoOptions(work_id="w-loop-auto", segment_runner=runner, max_segment_retries=1)
+    )
+
+    assert result.ok is False
+    assert result.status == "segment_failed"
+    assert result.error.endswith("missing completion marker after 2 attempts")
+    assert calls == 2
+
+
+def test_run_loop_auto_iteration_cap_aborts(tmp_path: Path, queued_plan, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLUXION_PREPROCESS_DISPATCH_DIR", str(tmp_path))
+    persist_dispatch_bundle(queued_plan, dispatch_dir=tmp_path)
+
+    def runner(_: str) -> HermesSegmentResult:
+        return HermesSegmentResult(stdout="done\nSEGMENT_COMPLETE\n", stderr="", returncode=0)
+
+    result = run_loop_auto(LoopAutoOptions(work_id="w-loop-auto", segment_runner=runner, max_iterations=0))
+
+    assert result.ok is False
+    assert result.status == "iteration_cap_exceeded"
+    assert result.segments_processed == 0
+
+
+def test_run_loop_auto_no_progress_aborts(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tempfile import TemporaryDirectory
+
+    calls = 0
+
+    def fake_next(_: str) -> dict[str, object]:
+        return {
+            "ready": True,
+            "step": {"step_id": "s1", "segment_id": "seg1", "content": "x", "checksum": "c"},
+        }
+
+    def fake_record(*_: object, **__: object) -> dict[str, object]:
+        return {"recorded": True}
+
+    def runner(_: str) -> HermesSegmentResult:
+        nonlocal calls
+        calls += 1
+        return HermesSegmentResult(stdout="done\nSEGMENT_COMPLETE\n", stderr="", returncode=0)
+
+    monkeypatch.setattr("cluxion_runtime.core.loop_auto.next_dispatch_step", fake_next)
+    monkeypatch.setattr("cluxion_runtime.core.loop_auto.record_dispatch_result", fake_record)
+
+    with TemporaryDirectory() as dispatch_dir:
+        monkeypatch.setenv("CLUXION_PREPROCESS_DISPATCH_DIR", dispatch_dir)
+        result = run_loop_auto(LoopAutoOptions(work_id="w-stuck", segment_runner=runner, max_iterations=25))
+
+    assert result.ok is False
+    assert result.status == "no_progress"
+    assert calls == 1
 
 
 def test_plan_codec_exports_loop_tool(queued_plan) -> None:

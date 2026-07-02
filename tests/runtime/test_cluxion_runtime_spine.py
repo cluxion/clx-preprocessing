@@ -16,7 +16,13 @@ from cluxion_runtime.core import (
 )
 from cluxion_runtime.core.types import ResourceSnapshot, RuntimeKind
 from cluxion_runtime.models import build_vllm_mlx_profile
-from cluxion_runtime.resources import capacity_decision, collect_resource_snapshot, evaluate_pressure
+from cluxion_runtime.resources import (
+    capacity_decision,
+    collect_resource_snapshot,
+    evaluate_pressure,
+    guard_bridge,
+    rust_bridge,
+)
 
 if TYPE_CHECKING:
     import pytest
@@ -72,6 +78,25 @@ def test_short_current_fact_question_uses_verification_answer_policy() -> None:
     assert result.answer_policy.response_contract == "verify_and_cite_before_answer"
     assert "verify_current_or_recent_fact" in result.answer_policy.required_checks
     assert "cite_external_source_or_document" in result.answer_policy.required_checks
+
+
+def test_resource_snapshot_tolerates_swap_probe_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Memory:
+        total = 16 * 1_048_576
+        available = 8 * 1_048_576
+
+    def bad_swap():
+        raise OSError("swap probe unavailable")
+
+    monkeypatch.setattr(guard_bridge, "read_daemon_state", lambda: None)
+    monkeypatch.setattr(rust_bridge.psutil, "virtual_memory", lambda: Memory())
+    monkeypatch.setattr(rust_bridge.psutil, "swap_memory", bad_swap)
+    monkeypatch.setattr(rust_bridge.psutil, "cpu_percent", lambda interval=None: 10.0)
+
+    snapshot = rust_bridge.collect_resource_snapshot()
+
+    assert snapshot.swap_used_mb == 0
+    assert snapshot.total_ram_mb == 16
 
 
 def test_long_prompt_uses_bounded_signal_scan_without_verification_fast_path() -> None:

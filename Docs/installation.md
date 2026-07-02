@@ -43,9 +43,39 @@ Hermes 세션에서 `/` 입력 → `/loopauto`, `/cluxion-doctor` 🔌 자동완
 ## 연결된 AI 연동
 
 - Hermes: `cluxion_*` 도구 자동 등록
-- Claude: `adapters/claude/skills/preprocess/SKILL.md`
-- Codex: `adapters/codex/config-snippet.toml`
+- Claude Code: repo root `.claude-plugin/plugin.json`, `commands/`, `skills/`
+- Codex CLI: repo root `.codex-plugin/plugin.json`, `.claude-plugin/plugin.json`, `commands/`, `skills/`
 - 공통 CLI: `cluxion-runtime plan --surface <hermes|claude|codex|grok_build>`
+
+### Codex marketplace install
+
+Local path example:
+
+```bash
+codex plugin marketplace add cluxion-local /path/to/cluxion-Agentplugin-preprocessing
+codex plugin add cluxion-agentplugin-preprocessing@cluxion-local
+```
+
+Git URL example:
+
+```bash
+codex plugin marketplace add cluxion https://github.com/cluxion/cluxion-Agentplugin-preprocessing
+codex plugin add cluxion-agentplugin-preprocessing@cluxion
+```
+
+Enablement is stored by Codex as:
+
+```toml
+[plugins."cluxion-agentplugin-preprocessing@cluxion-local"]
+enabled = true
+```
+
+Do not use a `[plugins.<name>] command = [...]` block; Codex plugins are marketplace plugins.
+
+### Claude Code plugin install
+
+Install the same repo as a Claude Code plugin from the root `.claude-plugin/plugin.json`, then use
+the `cluxion-preprocess` skill or commands. The commands call `cluxion-runtime` and do not own model execution.
 
 ## CLI
 

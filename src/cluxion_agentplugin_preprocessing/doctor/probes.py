@@ -9,7 +9,9 @@ import os
 import shutil
 import sys
 import tempfile
+import tomllib
 from collections.abc import Callable
+from pathlib import Path
 
 from .framework import DoctorContext
 
@@ -306,10 +308,64 @@ def hermes_plugin_enabled(ctx: DoctorContext) -> tuple[str, str]:
             if n in enabled and n not in disabled:
                 return "pass", f"{n} in enabled"
         if any(n in enabled for n in names):
-            return "warn", "present but also disabled?"
-        return "warn", "not in plugins.enabled"
+            return "warn", "present but also disabled; fix: remove it from plugins.disabled"
+        return "fail", "not in plugins.enabled; fix: run cluxion-preprocess enable"
     except Exception as e:
         return "skip", f"uncertainty: {type(e).__name__}"
+
+
+@_register("hermes_deliver_patch_status")
+def hermes_deliver_patch_status(ctx: DoctorContext) -> tuple[str, str]:
+    del ctx
+    try:
+        from cluxion_agentplugin_preprocessing import hermes_deliver_patch
+
+        result = hermes_deliver_patch.patch_status()
+        if result.status == "applied":
+            return "pass", "applied"
+        if result.status == "no_hermes":
+            return "skip", "no Hermes source tree; fix: set HERMES_AGENT_ROOT or skip deliver=agent patch"
+        if result.status == "partial":
+            return "fail", "partial patch; fix: restore Hermes tree then run cluxion-preprocess hermes-patch apply"
+        return "warn", f"{result.status}; fix: run cluxion-preprocess hermes-patch apply"
+    except Exception as e:
+        return "fail", f"patch status error: {e}; fix: run cluxion-preprocess hermes-patch status"
+
+
+@_register("version_files_synced")
+def version_files_synced(ctx: DoctorContext) -> tuple[str, str]:
+    try:
+        pyproject_path = ctx.cwd / "pyproject.toml"
+        if not pyproject_path.exists():
+            return "skip", "repo files not present"
+        version = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))["project"]["version"]
+        paths = {
+            "plugin.yaml": ctx.cwd / "plugin.yaml",
+            "package plugin.yaml": ctx.cwd / "src" / "cluxion_agentplugin_preprocessing" / "plugin.yaml",
+            "claude plugin": ctx.cwd / ".claude-plugin" / "plugin.json",
+            "codex plugin": ctx.cwd / ".codex-plugin" / "plugin.json",
+        }
+        drift: list[str] = []
+        for label, path in paths.items():
+            if not path.exists():
+                drift.append(f"{label}=missing")
+                continue
+            found = _version_from_file(path)
+            if found != version:
+                drift.append(f"{label}={found}")
+        if drift:
+            return "fail", f"pyproject={version} drift={'; '.join(drift)}; fix: sync plugin versions"
+        return "pass", version
+    except Exception as e:
+        return "fail", f"version check error: {e}; fix: inspect pyproject/plugin metadata"
+
+
+def _version_from_file(path: Path) -> str:
+    if path.suffix == ".json":
+        return str(_json.loads(path.read_text(encoding="utf-8")).get("version", ""))
+    import yaml
+
+    return str(yaml.safe_load(path.read_text(encoding="utf-8")).get("version", ""))
 
 
 @_register("env_var_consistency")

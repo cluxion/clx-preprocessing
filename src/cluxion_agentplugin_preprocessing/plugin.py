@@ -222,7 +222,6 @@ def _plan_args_with_loop_auto(args: dict[str, object]) -> dict[str, object]:
     cleaned, had_directive = strip_loop_auto_directive(prompt)
     if had_directive:
         payload["prompt"] = cleaned
-        payload["loop_auto"] = True
     return payload
 
 

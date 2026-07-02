@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import psutil
 import pytest
 
 from cluxion_runtime.guard_daemon_host import (
@@ -23,6 +24,17 @@ from cluxion_runtime.guard_daemon_host import (
     _write_state_if_changed,
     is_idle,
 )
+
+
+def _process_table_available() -> bool:
+    try:
+        next(psutil.process_iter(["pid"]))
+        return True
+    except (StopIteration, PermissionError, psutil.Error):
+        return False
+
+
+pytestmark = pytest.mark.skipif(not _process_table_available(), reason="process table unavailable in sandbox")
 
 _TOP_LEVEL_KEYS = ("ok", "current", "window", "interval_ms", "updated_at_ms")
 _CURRENT_KEYS = (
