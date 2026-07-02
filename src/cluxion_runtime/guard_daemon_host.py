@@ -31,6 +31,9 @@ class ProcessScanCache:
     zombie_pids: list[int]
 
 
+_FALLBACK_SCAN_BUDGET_S = 3.0
+
+
 def _epoch_ms() -> int:
     return int(time.time() * 1000)
 
@@ -40,7 +43,13 @@ def _scan_process_fields() -> ProcessScanCache:
     count = 0
     rows = _process_status_rows()
     if rows is None:
+        # The psutil fallback iterates every process; on loaded hosts that can
+        # stall the daemon loop, so it runs under a hard time budget and
+        # reports a partial (fail-closed: partial scan never triggers kills).
+        deadline = time.monotonic() + _FALLBACK_SCAN_BUDGET_S
         for proc in psutil.process_iter(["status"]):
+            if time.monotonic() > deadline:
+                break
             count += 1
             try:
                 if proc.info["status"] == psutil.STATUS_ZOMBIE:
