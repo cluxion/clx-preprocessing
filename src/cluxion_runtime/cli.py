@@ -42,6 +42,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point."""
     parser = _build_parser()
     args = parser.parse_args(argv)
+    try:
+        return _dispatch(args, parser)
+    except PayloadError as exc:
+        print(
+            json.dumps(
+                {"ok": False, "error": "invalid_input", "message": str(exc), "hint": exc.hint},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 2
+
+
+def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     if args.command == "bootstrap":
         return _run_bootstrap(args)
     if args.command == "plan":
@@ -294,21 +308,17 @@ def _run_guard(_: argparse.Namespace) -> int:
         elif action == "stop":
             result = guard_bridge.stop_daemon()
         elif action == "enforce":
-            raw_roots = payload.get("owned_roots")
-            raw_protect = payload.get("protect", [])
             result = guard_bridge.enforce(
-                [int(pid) for pid in raw_roots] if isinstance(raw_roots, list) else [],
+                _pid_list(payload, "owned_roots"),
                 cpu_threshold=float(payload.get("cpu_threshold", guard_bridge.DEFAULT_ENFORCE_CPU)),
                 rss_threshold_mb=int(payload.get("rss_threshold_mb", guard_bridge.DEFAULT_ENFORCE_RSS_MB)),
                 grace_seconds=float(payload.get("grace_seconds", guard_bridge.DEFAULT_GRACE_SECONDS)),
                 dry_run=not bool(payload.get("apply", False)),
-                protect=[int(pid) for pid in raw_protect] if isinstance(raw_protect, list) else [],
+                protect=_pid_list(payload, "protect"),
             )
         elif action == "auto-enforce":
-            raw_roots = payload.get("owned_roots")
-            raw_protect = payload.get("protect", [])
             result = guard_bridge.auto_enforce(
-                [int(pid) for pid in raw_roots] if isinstance(raw_roots, list) else [],
+                _pid_list(payload, "owned_roots"),
                 sustained_cpu=float(payload.get("sustained_cpu", guard_bridge.DEFAULT_SUSTAINED_CPU)),
                 ram_floor_mb=int(payload.get("ram_floor_mb", guard_bridge.DEFAULT_RAM_FLOOR_MB)),
                 min_samples=int(payload.get("min_samples", guard_bridge.DEFAULT_WINDOW)),
@@ -316,7 +326,7 @@ def _run_guard(_: argparse.Namespace) -> int:
                 rss_threshold_mb=int(payload.get("rss_threshold_mb", guard_bridge.DEFAULT_ENFORCE_RSS_MB)),
                 grace_seconds=float(payload.get("grace_seconds", guard_bridge.DEFAULT_GRACE_SECONDS)),
                 dry_run=not bool(payload.get("apply", False)),
-                protect=[int(pid) for pid in raw_protect] if isinstance(raw_protect, list) else [],
+                protect=_pid_list(payload, "protect"),
             )
         elif action == "status":
             result = {
@@ -325,9 +335,9 @@ def _run_guard(_: argparse.Namespace) -> int:
                 "daemon": guard_bridge.daemon_status(),
                 "state": guard_bridge.read_daemon_state(),
             }
-            owned_roots = payload.get("owned_roots")
-            if isinstance(owned_roots, list) and owned_roots:
-                result["scan"] = guard_bridge.scan([int(pid) for pid in owned_roots])
+            scan_roots = _pid_list(payload, "owned_roots")
+            if scan_roots:
+                result["scan"] = guard_bridge.scan(scan_roots)
         else:
             print(
                 json.dumps({"ok": False, "error": _guard_action_error(action)}, ensure_ascii=False, sort_keys=True),
@@ -426,11 +436,25 @@ def _run_hermes_local_config(args: argparse.Namespace) -> int:
     return 0
 
 
+class PayloadError(ValueError):
+    """Invalid CLI input that must surface as a JSON error, never a traceback."""
+
+    def __init__(self, message: str, hint: str) -> None:
+        super().__init__(message)
+        self.hint = hint
+
+
 def _payload_from_stdin() -> dict[str, object]:
     raw = sys.stdin.read()
-    payload = json.loads(raw)
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise PayloadError(
+            f"stdin is not valid JSON: {exc}",
+            'pipe a JSON object, e.g. echo \'{"prompt": "..."}\' | cluxion-runtime plan --json-stdin',
+        ) from exc
     if not isinstance(payload, dict):
-        raise ValueError("stdin JSON must be an object.")
+        raise PayloadError("stdin JSON must be an object.", "wrap the payload in {...}")
     return dict(payload)
 
 
@@ -441,11 +465,45 @@ def _payload_from_args(args: argparse.Namespace) -> dict[str, object]:
         "prompt": str(args.prompt),
         "model_route": str(args.model_route),
         "priority": str(args.priority),
-        "expected_ram_mb": int(args.expected_ram_mb),
-        "context_tokens": int(args.context_tokens),
+        "expected_ram_mb": _non_negative_int("expected_ram_mb", args.expected_ram_mb),
+        "context_tokens": _non_negative_int("context_tokens", args.context_tokens),
         "cwd": str(args.cwd),
         "loop_auto": bool(args.loop_auto),
     }
+
+
+def _non_negative_int(name: str, value: object) -> int:
+    try:
+        parsed = int(str(value))
+    except (TypeError, ValueError) as exc:
+        raise PayloadError(
+            f"{name} must be an integer, got {value!r}",
+            f"pass a non-negative integer for {name} (0 = unspecified)",
+        ) from exc
+    if parsed < 0:
+        raise PayloadError(
+            f"{name} must be >= 0, got {parsed}",
+            f"pass a non-negative integer for {name} (0 = unspecified)",
+        )
+    return parsed
+
+
+def _pid_list(payload: dict[str, object], key: str) -> list[int]:
+    raw = payload.get(key)
+    if raw is None or raw == []:
+        return []
+    if not isinstance(raw, list):
+        raise PayloadError(f"{key} must be a list of process IDs (integers)", f'{key} takes root PIDs, e.g. {{"{key}": [1234]}} - not filesystem paths')
+    pids: list[int] = []
+    for entry in raw:
+        try:
+            pids.append(int(str(entry)))
+        except (TypeError, ValueError) as exc:
+            raise PayloadError(
+                f"{key} entry {entry!r} is not a process ID",
+                f'{key} takes root PIDs (integers), e.g. {{"{key}": [1234]}} - not filesystem paths',
+            ) from exc
+    return pids
 
 
 def _apply_loop_auto_directive(payload: dict[str, object]) -> dict[str, object]:

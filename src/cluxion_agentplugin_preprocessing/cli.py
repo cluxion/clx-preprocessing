@@ -128,9 +128,11 @@ def _bootstrap(args: argparse.Namespace) -> int:
 
 
 def _status(args: argparse.Namespace) -> int:
+    # "disabled" is a state the command reports successfully, not a failure:
+    # ok=true must always pair with exit 0 or scripted callers misread it.
     result = hermes_config.plugin_status(args.home)
     print(json.dumps({"ok": True, **result.to_dict()}, ensure_ascii=False, sort_keys=True))
-    return 0 if result.enabled else 1
+    return 0
 
 
 def _enable(args: argparse.Namespace) -> int:
