@@ -126,12 +126,39 @@ def record_dispatch_result(
         steps = _steps(bundle)
         for step in steps:
             if step.get("step_id") == step_id:
-                step["status"] = "succeeded" if succeeded else "failed"
+                status = "succeeded" if succeeded else "failed"
+                if step.get("status") in {"succeeded", "failed"}:
+                    stored_result = str(step.get("result", ""))
+                    stored_error = str(step.get("error", ""))
+                    stored_status = str(step.get("status", ""))
+                    if stored_status == status and stored_result == result and stored_error == error:
+                        return {
+                            "ok": True,
+                            "work_id": work_id,
+                            "step_id": step_id,
+                            "recorded": True,
+                            "idempotent": True,
+                            "status": stored_status,
+                            "remaining": _remaining_count(steps),
+                            "synthesis_ready": all(item.get("status") == "succeeded" for item in steps),
+                        }
+                    return {
+                        "ok": False,
+                        "error": "step_already_recorded",
+                        "work_id": work_id,
+                        "step_id": step_id,
+                        "recorded": False,
+                        "stored_status": stored_status,
+                        "stored_result": stored_result,
+                        "stored_error": stored_error,
+                    }
+                step["status"] = status
                 step["result"] = result
                 step["error"] = error
                 step["updated_at"] = time.time()
                 _atomic_write_json(path, bundle)
                 return {
+                    "ok": True,
                     "work_id": work_id,
                     "step_id": step_id,
                     "recorded": True,

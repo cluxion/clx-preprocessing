@@ -94,6 +94,26 @@ def test_cluxion_runtime_plan_cli_marks_simple_answers(capsys: pytest.CaptureFix
     assert payload["preprocessing"]["answer_policy"]["verification_required"] is False
 
 
+def test_cluxion_runtime_plan_warns_when_cwd_is_missing(capsys: pytest.CaptureFixture[str], tmp_path) -> None:
+    missing = tmp_path / "missing-project"
+    code = main(
+        [
+            "plan",
+            "--surface",
+            "hermes",
+            "--prompt",
+            "이거 가능해?",
+            "--cwd",
+            str(missing),
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["warnings"] == [f"cwd_not_found: {missing}"]
+
+
 def test_cluxion_runtime_plan_cli_marks_verification_answers(capsys: pytest.CaptureFixture[str]) -> None:
     """Short latest/current/source questions stay on the fast path but carry a verification contract."""
     code = main(

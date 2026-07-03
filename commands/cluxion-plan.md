@@ -15,4 +15,4 @@ stdin:
 {"prompt":"$ARGUMENTS","cwd":"$PWD"}
 ```
 
-Return the JSON contract to the host flow. Do not run `loop-auto` unless `loop_auto=true` is explicitly present.
+Return the JSON contract to the host flow. Run `loop-auto` only when `loop_auto=true` is present and the plan is queue-required; `/loopAuto` prefix sets that flag but does not force short prompts into the queue.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from cluxion_runtime.core.ledger_codec import item_to_dict
@@ -12,7 +13,7 @@ if TYPE_CHECKING:
 
 def plan_to_dict(plan: HarnessPlan) -> dict[str, object]:
     """Convert only the public fields of a HarnessPlan into a JSON-safe object."""
-    return {
+    payload: dict[str, object] = {
         "item": _public_item(plan),
         "queue_position": plan.queue_position,
         "queue_backend": plan.queue_backend,
@@ -105,6 +106,10 @@ def plan_to_dict(plan: HarnessPlan) -> dict[str, object]:
             ],
         },
     }
+    warnings = _warnings_for(plan)
+    if warnings:
+        payload["warnings"] = warnings
+    return payload
 
 
 def _public_item(plan: HarnessPlan) -> dict[str, object]:
@@ -117,6 +122,13 @@ def _public_item(plan: HarnessPlan) -> dict[str, object]:
     item["original_prompt_stored"] = False
     item["original_prompt_out_of_band_required"] = True
     return item
+
+
+def _warnings_for(plan: HarnessPlan) -> list[str]:
+    cwd = plan.item.metadata.get("cwd", "")
+    if cwd and not Path(cwd).expanduser().exists():
+        return [f"cwd_not_found: {Path(cwd).expanduser()}"]
+    return []
 
 
 __all__ = ["plan_to_dict"]

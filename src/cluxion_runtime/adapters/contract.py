@@ -66,8 +66,14 @@ def _priority(value: object) -> WorkPriority:
     if value is None or value == "":
         return WorkPriority.NORMAL
     if isinstance(value, int):
-        return WorkPriority(value)
-    return WorkPriority[str(value).upper()]
+        try:
+            return WorkPriority(value)
+        except ValueError as exc:
+            raise ValueError("priority must be one of critical, high, normal, low") from exc
+    try:
+        return WorkPriority[str(value).upper()]
+    except KeyError as exc:
+        raise ValueError("priority must be one of critical, high, normal, low") from exc
 
 
 def _metadata(value: object, cwd: object, clarification_answers: object = None) -> dict[str, str]:

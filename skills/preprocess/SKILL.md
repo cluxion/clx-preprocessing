@@ -22,8 +22,8 @@ Use `--surface claude` in Claude Code. Minimum stdin:
 Rules:
 
 1. If `clarification.required` is true, ask the user before starting work.
-2. If `host_execution.queue_required` is true, process the queue with `queue-next`, `queue-record`, and `queue-brief`, or call `loop-auto` only when the user or payload explicitly opts in with `loop_auto=true`.
-3. A `/loopAuto` prompt prefix only requests queueing and is stripped by `plan`; it does not start a blocking drain.
+2. If `host_execution.queue_required` is true, process the queue with `queue-next`, `queue-record`, and `queue-brief`, or call `loop-auto` only when the user or payload opts in with `loop_auto=true`.
+3. A `/loopAuto` prompt prefix is stripped by `plan` and sets `loop_auto=true`; it drains only queue-eligible plans and does not force short fast-path prompts into the queue.
 4. Never claim checks were run unless the host actually ran them.
 
 ## Queue

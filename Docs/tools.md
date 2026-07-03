@@ -40,8 +40,8 @@
 | `cluxion_queue_brief` | 최종 synthesis용 briefing |
 | `cluxion_loop_auto` | 큐 자동 드레인 (`hermes -z` per segment). 명시적 opt-in 전용 |
 
-`/loopAuto` 프롬프트 지시어는 큐 계약만 만들고 blocking drain을 시작하지 않습니다.
-자동 드레인은 `/loopauto` 슬래시, `loop_auto: true`, 또는 `cluxion_loop_auto`로만 실행합니다.
+`/loopAuto` 프롬프트 지시어는 prefix를 제거하고 `loop_auto=true`를 설정합니다.
+자동 드레인은 큐 대상(`host_execution.queue_required=true`)일 때만 실행되며, 짧은 fast-path prompt는 queue를 강제하지 않습니다.
 
 ### `cluxion_bootstrap`
 
@@ -105,7 +105,7 @@ Daemon 시작: `cluxion-queue guard-daemon` 바이너리가 없으면
 ### 자동 loopAuto (0.3.22+)
 
 1. `cluxion_plan` (또는 `/loopauto` 슬래시) — 큐 등록
-2. `cluxion_loop_auto` / 명시적 `loop_auto=true` — `queue_next` → `hermes -z` → `queue_record` 반복 → `queue_brief`
+2. `cluxion_loop_auto` / `loop_auto=true` / queue-eligible `/loopAuto` prefix — `queue_next` → `hermes -z` → `queue_record` 반복 → `queue_brief`
 3. 완료 마커: `SEGMENT_COMPLETE`, `WORK_REMAINS:`, `TASK_COMPLETE`
 
 segment checksum은 synthesis 시 보존합니다 (`required_checks`).

@@ -182,6 +182,50 @@ def test_concurrent_record_dispatch_results_preserve_both_updates(
     assert steps[step_ids[1]]["result"] == "done:1"
 
 
+def test_concurrent_record_same_step_is_idempotent_for_same_result(tmp_path: Path, queued_plan: HarnessPlan) -> None:
+    persist_dispatch_bundle(queued_plan, dispatch_dir=tmp_path)
+    step_id = str(next_dispatch_step("w-queued", dispatch_dir=tmp_path)["step"]["step_id"])
+
+    results = _run_concurrently(
+        5,
+        lambda _index: record_dispatch_result(
+            "w-queued",
+            step_id,
+            result="same result",
+            dispatch_dir=tmp_path,
+        ),
+    )
+
+    assert all(isinstance(result, dict) and result["recorded"] is True for result in results)
+    assert sum(1 for result in results if isinstance(result, dict) and result.get("idempotent")) == 4
+    steps = {str(step["step_id"]): step for step in load_dispatch_bundle("w-queued", dispatch_dir=tmp_path)["steps"]}
+    assert steps[step_id]["result"] == "same result"
+
+
+def test_concurrent_record_same_step_conflicts_for_different_result(tmp_path: Path, queued_plan: HarnessPlan) -> None:
+    persist_dispatch_bundle(queued_plan, dispatch_dir=tmp_path)
+    step_id = str(next_dispatch_step("w-queued", dispatch_dir=tmp_path)["step"]["step_id"])
+
+    results = _run_concurrently(
+        5,
+        lambda index: record_dispatch_result(
+            "w-queued",
+            step_id,
+            result=f"different:{index}",
+            dispatch_dir=tmp_path,
+        ),
+    )
+
+    successes = [result for result in results if isinstance(result, dict) and result.get("recorded")]
+    conflicts = [result for result in results if isinstance(result, dict) and result.get("ok") is False]
+    assert len(successes) == 1
+    assert len(conflicts) == 4
+    steps = load_dispatch_bundle("w-queued", dispatch_dir=tmp_path)["steps"]
+    stored_result = str(next(step["result"] for step in steps if step["step_id"] == step_id))
+    assert all(conflict["error"] == "step_already_recorded" for conflict in conflicts)
+    assert all(conflict["stored_result"] == stored_result for conflict in conflicts)
+
+
 def test_record_unknown_step_raises(tmp_path: Path, queued_plan: HarnessPlan) -> None:
     persist_dispatch_bundle(queued_plan, dispatch_dir=tmp_path)
     with pytest.raises(DispatchStoreError):

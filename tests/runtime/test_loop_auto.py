@@ -104,7 +104,7 @@ def test_plan_cli_auto_loops_queued_plan_dry_run(
     assert payload["loop_auto"]["segments_processed"] >= 1
 
 
-def test_plan_cli_loopauto_prefix_enqueues_without_blocking(
+def test_plan_cli_loopauto_prefix_auto_loops_queue_eligible_plan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     import sys
@@ -118,7 +118,16 @@ def test_plan_cli_loopauto_prefix_enqueues_without_blocking(
     monkeypatch.setattr(
         sys,
         "stdin",
-        StringIO(json.dumps({"prompt": prompt, "work_id": "w-cli-prefix", "clarification_answers": "go"})),
+        StringIO(
+            json.dumps(
+                {
+                    "prompt": prompt,
+                    "work_id": "w-cli-prefix",
+                    "clarification_answers": "go",
+                    "loop_auto_dry_run": True,
+                }
+            )
+        ),
     )
 
     code = main(["plan", "--json-stdin", "--surface", "codex"])
@@ -126,9 +135,27 @@ def test_plan_cli_loopauto_prefix_enqueues_without_blocking(
 
     assert code == 0
     assert payload["host_execution"]["queue_required"] is True
-    assert "loop_auto" not in payload
+    assert payload["loop_auto"]["ok"] is True
+    assert payload["loop_auto"]["segments_processed"] >= 1
     assert "/loopAuto" not in str(payload["item"]["prompt"])
     assert "REQ-0" in str(payload["item"]["prompt"])
+
+
+def test_plan_cli_loopauto_prefix_does_not_force_short_prompt_queue(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import sys
+    from io import StringIO
+
+    monkeypatch.setattr(sys, "stdin", StringIO(json.dumps({"prompt": "/loopAuto 이거 가능해?"})))
+
+    code = main(["plan", "--json-stdin", "--surface", "codex"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["host_execution"]["queue_required"] is False
+    assert "loop_auto" not in payload
+    assert "/loopAuto" not in str(payload["item"]["prompt"])
 
 
 def test_run_loop_auto_missing_binary_fails_fast(tmp_path: Path, queued_plan, monkeypatch: pytest.MonkeyPatch) -> None:

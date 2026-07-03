@@ -66,8 +66,8 @@ Hermes 안에서는 `cluxion_doctor` 도구로도 노출됩니다.
 /cluxion-doctor
 ```
 
-`/loopAuto` prompt prefix는 이제 queue 계약만 만들고, blocking drain은 `loop_auto=true` 또는 전용
-`loop-auto` 명령에서만 실행됩니다.
+`/loopAuto` prompt prefix는 prefix를 제거하고 `loop_auto=true`를 설정합니다. 자동 드레인은
+`host_execution.queue_required=true`일 때만 실행되며, 짧은 fast-path prompt는 queue를 강제하지 않습니다.
 
 ## 문제 해결
 
@@ -151,8 +151,8 @@ Type `/` to see plugin commands with a 🔌 badge.
 /cluxion-doctor
 ```
 
-The `/loopAuto` prompt prefix now only queues work. Blocking drain requires explicit `loop_auto=true`
-or the dedicated `loop-auto` command.
+The `/loopAuto` prompt prefix is stripped and sets `loop_auto=true`. Autonomous drain runs only when
+`host_execution.queue_required=true`; short fast-path prompts are not forced into the queue.
 
 ## Troubleshooting
 

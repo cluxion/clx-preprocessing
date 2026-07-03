@@ -33,19 +33,20 @@ if TYPE_CHECKING:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point."""
-    parser = _build_parser()
-    args = parser.parse_args(argv)
+    parser = _build_parser(json_mode=_json_mode_requested(argv))
     try:
+        args = parser.parse_args(argv)
         return _dispatch(args, parser)
     except PayloadError as exc:
-        print(
-            json.dumps(
-                {"ok": False, "error": "invalid_input", "message": str(exc), "hint": exc.hint},
-                ensure_ascii=False,
-                sort_keys=True,
+        return _print_payload_error(exc)
+    except ValueError as exc:
+        return _print_payload_error(
+            PayloadError(
+                str(exc),
+                "check prompt, surface, priority, and non-negative numeric payload fields",
+                exit_code=1,
             )
         )
-        return 2
 
 
 def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -73,9 +74,30 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     return 2
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="cluxion-runtime")
-    subparsers = parser.add_subparsers(dest="command")
+def _json_mode_requested(argv: Sequence[str] | None) -> bool:
+    args = sys.argv[1:] if argv is None else argv
+    return any(arg in {"--json", "--json-stdin"} for arg in args)
+
+
+class _RuntimeArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args: object, json_mode: bool = False, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self._json_mode = json_mode
+
+    def error(self, message: str) -> None:
+        if self._json_mode:
+            raise PayloadError(message, "check the command arguments and JSON flags")
+        super().error(message)
+
+
+def _parser_factory(json_mode: bool):
+    return lambda *args, **kwargs: _RuntimeArgumentParser(*args, json_mode=json_mode, **kwargs)
+
+
+def _build_parser(*, json_mode: bool = False) -> argparse.ArgumentParser:
+    parser_class = _parser_factory(json_mode)
+    parser = parser_class(prog="cluxion-runtime")
+    subparsers = parser.add_subparsers(dest="command", parser_class=parser_class)
     bootstrap = subparsers.add_parser("bootstrap", help="Install or upgrade local model runtime dependencies")
     bootstrap.add_argument(
         "--upgrade", action="store_true", help="Upgrade to the latest version even when already installed"
@@ -168,6 +190,7 @@ def _run_plan(args: argparse.Namespace) -> int:
     surface = AgentSurface(str(args.surface))
     payload = _payload_from_stdin() if args.json_stdin else _payload_from_args(args)
     payload = _apply_loop_auto_directive(payload)
+    payload = _apply_plan_numeric_contract(payload)
     if bool(getattr(args, "loop_auto", False)):
         payload["loop_auto"] = True
     item = work_item_from_adapter_payload(payload, default_surface=surface)
@@ -272,7 +295,7 @@ def _run_queue_record(args: argparse.Namespace) -> int:
         print(json.dumps(recorded, ensure_ascii=False, sort_keys=True))
         return 1
     print(json.dumps(recorded, ensure_ascii=False, sort_keys=True))
-    return 0
+    return 0 if recorded.get("ok", True) else 1
 
 
 def _run_queue_brief(args: argparse.Namespace) -> int:
@@ -316,43 +339,58 @@ def _run_guard(_: argparse.Namespace) -> int:
     action = str(payload.get("action", "status"))
     if action not in _VALID_GUARD_ACTIONS:
         print(
-            json.dumps({"ok": False, "error": _guard_action_error(action)}, ensure_ascii=False, sort_keys=True),
-            file=sys.stderr,
+            json.dumps({"ok": False, "error": _guard_action_error(action)}, ensure_ascii=False, sort_keys=True)
         )
         return 1
     try:
         if action == "start":
             result = guard_bridge.start_daemon(
-                interval_ms=int(payload.get("interval_ms", guard_bridge.DEFAULT_INTERVAL_MS)),
-                window=int(payload.get("window", guard_bridge.DEFAULT_WINDOW)),
+                interval_ms=_non_negative_int("interval_ms", payload.get("interval_ms", guard_bridge.DEFAULT_INTERVAL_MS)),
+                window=_non_negative_int("window", payload.get("window", guard_bridge.DEFAULT_WINDOW)),
             )
         elif action == "stop":
             result = guard_bridge.stop_daemon()
         elif action == "enforce":
             result = guard_bridge.enforce(
                 _pid_list(payload, "owned_roots"),
-                cpu_threshold=float(payload.get("cpu_threshold", guard_bridge.DEFAULT_ENFORCE_CPU)),
-                rss_threshold_mb=int(payload.get("rss_threshold_mb", guard_bridge.DEFAULT_ENFORCE_RSS_MB)),
-                grace_seconds=float(payload.get("grace_seconds", guard_bridge.DEFAULT_GRACE_SECONDS)),
+                cpu_threshold=_non_negative_float(
+                    "cpu_threshold", payload.get("cpu_threshold", guard_bridge.DEFAULT_ENFORCE_CPU)
+                ),
+                rss_threshold_mb=_non_negative_int(
+                    "rss_threshold_mb", payload.get("rss_threshold_mb", guard_bridge.DEFAULT_ENFORCE_RSS_MB)
+                ),
+                grace_seconds=_non_negative_float(
+                    "grace_seconds", payload.get("grace_seconds", guard_bridge.DEFAULT_GRACE_SECONDS)
+                ),
                 dry_run=not bool(payload.get("apply", False)),
                 protect=_pid_list(payload, "protect"),
             )
         elif action == "auto-enforce":
             result = guard_bridge.auto_enforce(
                 _pid_list(payload, "owned_roots"),
-                sustained_cpu=float(payload.get("sustained_cpu", guard_bridge.DEFAULT_SUSTAINED_CPU)),
-                ram_floor_mb=int(payload.get("ram_floor_mb", guard_bridge.DEFAULT_RAM_FLOOR_MB)),
-                min_samples=int(payload.get("min_samples", guard_bridge.DEFAULT_WINDOW)),
-                cpu_threshold=float(payload.get("cpu_threshold", guard_bridge.DEFAULT_ENFORCE_CPU)),
-                rss_threshold_mb=int(payload.get("rss_threshold_mb", guard_bridge.DEFAULT_ENFORCE_RSS_MB)),
-                grace_seconds=float(payload.get("grace_seconds", guard_bridge.DEFAULT_GRACE_SECONDS)),
+                sustained_cpu=_non_negative_float(
+                    "sustained_cpu", payload.get("sustained_cpu", guard_bridge.DEFAULT_SUSTAINED_CPU)
+                ),
+                ram_floor_mb=_non_negative_int(
+                    "ram_floor_mb", payload.get("ram_floor_mb", guard_bridge.DEFAULT_RAM_FLOOR_MB)
+                ),
+                min_samples=_non_negative_int("min_samples", payload.get("min_samples", guard_bridge.DEFAULT_WINDOW)),
+                cpu_threshold=_non_negative_float(
+                    "cpu_threshold", payload.get("cpu_threshold", guard_bridge.DEFAULT_ENFORCE_CPU)
+                ),
+                rss_threshold_mb=_non_negative_int(
+                    "rss_threshold_mb", payload.get("rss_threshold_mb", guard_bridge.DEFAULT_ENFORCE_RSS_MB)
+                ),
+                grace_seconds=_non_negative_float(
+                    "grace_seconds", payload.get("grace_seconds", guard_bridge.DEFAULT_GRACE_SECONDS)
+                ),
                 dry_run=not bool(payload.get("apply", False)),
                 protect=_pid_list(payload, "protect"),
             )
         elif action == "status":
             result = {
                 "ok": True,
-                "sample": guard_bridge.sample({"cpu_sample_ms": int(payload.get("cpu_sample_ms", 100))}),
+                "sample": guard_bridge.sample({"cpu_sample_ms": _non_negative_int("cpu_sample_ms", payload.get("cpu_sample_ms", 100))}),
                 "daemon": guard_bridge.daemon_status(),
                 "state": guard_bridge.read_daemon_state(),
             }
@@ -361,8 +399,7 @@ def _run_guard(_: argparse.Namespace) -> int:
                 result["scan"] = guard_bridge.scan(scan_roots)
         else:
             print(
-                json.dumps({"ok": False, "error": _guard_action_error(action)}, ensure_ascii=False, sort_keys=True),
-                file=sys.stderr,
+                json.dumps({"ok": False, "error": _guard_action_error(action)}, ensure_ascii=False, sort_keys=True)
             )
             return 1
     except RuntimeError as exc:
@@ -472,9 +509,21 @@ def _run_hermes_local_config(args: argparse.Namespace) -> int:
 class PayloadError(ValueError):
     """Invalid CLI input that must surface as a JSON error, never a traceback."""
 
-    def __init__(self, message: str, hint: str) -> None:
+    def __init__(self, message: str, hint: str, *, exit_code: int = 2) -> None:
         super().__init__(message)
         self.hint = hint
+        self.exit_code = exit_code
+
+
+def _print_payload_error(exc: PayloadError) -> int:
+    print(
+        json.dumps(
+            {"ok": False, "error": "invalid_input", "message": str(exc), "hint": exc.hint},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return exc.exit_code
 
 
 def _payload_from_stdin() -> dict[str, object]:
@@ -505,18 +554,35 @@ def _payload_from_args(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
-def _non_negative_int(name: str, value: object) -> int:
+def _non_negative_int(name: str, value: object, *, parse_exit_code: int = 2) -> int:
     try:
         parsed = int(str(value))
     except (TypeError, ValueError) as exc:
         raise PayloadError(
             f"{name} must be an integer, got {value!r}",
             f"pass a non-negative integer for {name} (0 = unspecified)",
+            exit_code=parse_exit_code,
         ) from exc
     if parsed < 0:
         raise PayloadError(
             f"{name} must be >= 0, got {parsed}",
             f"pass a non-negative integer for {name} (0 = unspecified)",
+        )
+    return parsed
+
+
+def _non_negative_float(name: str, value: object) -> float:
+    try:
+        parsed = float(str(value))
+    except (TypeError, ValueError) as exc:
+        raise PayloadError(
+            f"{name} must be a number, got {value!r}",
+            f"pass a non-negative number for {name} (0 = unspecified)",
+        ) from exc
+    if parsed < 0:
+        raise PayloadError(
+            f"{name} must be >= 0, got {parsed:g}",
+            f"pass a non-negative number for {name} (0 = unspecified)",
         )
     return parsed
 
@@ -546,6 +612,15 @@ def _apply_loop_auto_directive(payload: dict[str, object]) -> dict[str, object]:
         return payload
     updated = dict(payload)
     updated["prompt"] = cleaned
+    updated["loop_auto"] = True
+    return updated
+
+
+def _apply_plan_numeric_contract(payload: dict[str, object]) -> dict[str, object]:
+    updated = dict(payload)
+    for key in ("expected_ram_mb", "context_tokens"):
+        if key in updated:
+            updated[key] = _non_negative_int(key, updated[key], parse_exit_code=1)
     return updated
 
 

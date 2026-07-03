@@ -330,7 +330,9 @@ def start_daemon(
 ) -> dict[str, Any]:
     """Spawn the Rust guard daemon (detached) and record its pidfile."""
     base = _store_base(store_dir)
-    base.mkdir(parents=True, exist_ok=True)
+    unwritable = _preflight_store_writable(base)
+    if unwritable is not None:
+        return unwritable
     existing = daemon_status(store_dir=base)
     if existing["running"]:
         return {"ok": True, "started": False, "reason": "already_running", **existing}
@@ -363,6 +365,28 @@ def start_daemon(
         "pid": process.pid,
         "interval_ms": int(interval_ms),
         "host": host,
+    }
+
+
+def _preflight_store_writable(base: Path) -> dict[str, Any] | None:
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        if base.stat().st_mode & 0o222 == 0:
+            return _guard_store_unwritable(base, "directory has no write bits")
+        probe = base / f".{PID_FILE_NAME}.write-test-{os.getpid()}"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+    except OSError as exc:
+        return _guard_store_unwritable(base, str(exc))
+    return None
+
+
+def _guard_store_unwritable(base: Path, reason: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": "guard_store_unwritable",
+        "message": f"guard store is not writable: {base}: {reason}",
+        "hint": "set CLUXION_GUARD_STORE_DIR to a writable directory or fix its permissions",
     }
 
 
