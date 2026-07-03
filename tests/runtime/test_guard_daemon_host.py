@@ -122,7 +122,11 @@ def test_python_daemon_tick_cheap_tick_reuses_process_cache() -> None:
 
     _python_daemon_tick(process_cache, cpu_window, ram_window, window, interval_ms, tick=0)
 
-    stale_cache = ProcessScanCache(process_count=1, zombie_count=2, zombie_pids=[99, 100])
+    from cluxion_runtime.guard_daemon_host import _epoch_ms
+
+    stale_cache = ProcessScanCache(
+        process_count=1, zombie_count=2, zombie_pids=[99, 100], scanned_at_ms=_epoch_ms()
+    )
     cheap_state, returned_cache = _python_daemon_tick(
         stale_cache, cpu_window, ram_window, window, interval_ms, tick=1
     )
@@ -132,11 +136,19 @@ def test_python_daemon_tick_cheap_tick_reuses_process_cache() -> None:
     assert cheap_state["current"]["zombie_pids"] == [99, 100]
     assert returned_cache == stale_cache
 
+    from cluxion_runtime.guard_daemon_host import PROC_SCAN_MIN_INTERVAL_MS
+
+    aged_cache = ProcessScanCache(
+        process_count=1,
+        zombie_count=2,
+        zombie_pids=[99, 100],
+        scanned_at_ms=_epoch_ms() - PROC_SCAN_MIN_INTERVAL_MS - 1,
+    )
     rescan_state, refreshed_cache = _python_daemon_tick(
-        stale_cache, cpu_window, ram_window, window, interval_ms, tick=PROC_SCAN_EVERY_N_TICKS
+        aged_cache, cpu_window, ram_window, window, interval_ms, tick=PROC_SCAN_EVERY_N_TICKS
     )
     _assert_state_schema(rescan_state, interval_ms=interval_ms)
-    assert refreshed_cache != stale_cache
+    assert refreshed_cache != aged_cache
     assert refreshed_cache.process_count > 0
     assert rescan_state["current"]["process_count"] == refreshed_cache.process_count
 
@@ -167,13 +179,25 @@ def test_python_daemon_tick_scan_cadence(tick: int) -> None:
     cpu_window: list[float] = []
     ram_window: list[int] = []
 
-    _, cache = _python_daemon_tick(
-        process_cache, cpu_window, ram_window, 5, 1000, tick=tick
+    from cluxion_runtime.guard_daemon_host import PROC_SCAN_MIN_INTERVAL_MS, _epoch_ms
+
+    # Scan throttling is wall-clock based: a fresh cache always scans, a
+    # recently scanned cache is reused, a stale one rescans.
+    _, cache = _python_daemon_tick(process_cache, cpu_window, ram_window, 5, 1000, tick=tick)
+    assert cache.process_count > 0, "fresh cache must trigger a scan regardless of tick"
+
+    recent = cache
+    _, reused = _python_daemon_tick(recent, cpu_window, ram_window, 5, 1000, tick=tick + 1)
+    assert reused == recent, "recent scan must be reused"
+
+    stale = ProcessScanCache(
+        process_count=recent.process_count,
+        zombie_count=recent.zombie_count,
+        zombie_pids=list(recent.zombie_pids),
+        scanned_at_ms=_epoch_ms() - PROC_SCAN_MIN_INTERVAL_MS - 1,
     )
-    if tick % PROC_SCAN_EVERY_N_TICKS == 0:
-        assert cache.process_count > 0
-    else:
-        assert cache.process_count == 0
+    _, rescanned = _python_daemon_tick(stale, cpu_window, ram_window, 5, 1000, tick=tick + 2)
+    assert rescanned.scanned_at_ms > stale.scanned_at_ms, "stale cache must rescan"
 
 
 def test_is_idle_detects_stale_and_fresh_heartbeats() -> None:

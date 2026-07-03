@@ -17,7 +17,9 @@ STATE_FILE_NAME = "guard_state.json"
 HEARTBEAT_FILE_NAME = "guard_heartbeat"
 PID_FILE_NAME = "guard_daemon.pid"
 DEFAULT_IDLE_TTL_MS = 120_000
-PROC_SCAN_EVERY_N_TICKS = 5
+PROC_SCAN_EVERY_N_TICKS = 5  # retained for tick-based callers/tests
+PROC_SCAN_MIN_INTERVAL_MS = 5_000
+_STATE_WRITE_FAILURE_LIMIT = 10
 STATE_WRITE_EVERY_N_TICKS = 30
 _MAX_REPORTED_PIDS = 50
 _MIN_INTERVAL_MS = 100
@@ -29,6 +31,7 @@ class ProcessScanCache:
     process_count: int
     zombie_count: int
     zombie_pids: list[int]
+    scanned_at_ms: int = 0
 
 
 _FALLBACK_SCAN_BUDGET_S = 3.0
@@ -65,6 +68,7 @@ def _scan_process_fields() -> ProcessScanCache:
         process_count=count,
         zombie_count=zombie_count,
         zombie_pids=zombie_pids[:_MAX_REPORTED_PIDS],
+        scanned_at_ms=_epoch_ms(),
     )
 
 
@@ -170,7 +174,11 @@ def _python_daemon_tick(
     interval_ms: int,
     tick: int,
 ) -> tuple[dict[str, Any], ProcessScanCache]:
-    if tick % PROC_SCAN_EVERY_N_TICKS == 0:
+    # The full process scan costs ~90ms on busy hosts; throttling by wall
+    # clock keeps the daemon cheap at any interval_ms (was: every 5 ticks,
+    # which at 200ms meant one 90ms scan per second - a measured 10-20% CPU).
+    now = _epoch_ms()
+    if process_cache.scanned_at_ms == 0 or now - process_cache.scanned_at_ms >= PROC_SCAN_MIN_INTERVAL_MS:
         process_cache = _scan_process_fields()
     cheap = _cheap_sample()
     current = _build_current_snapshot(process_cache, cheap)
@@ -246,11 +254,18 @@ def _remove_pidfile(base: Path) -> None:
     (base / PID_FILE_NAME).unlink(missing_ok=True)
 
 
-def _check_idle_exit(base: Path, idle_ttl_ms: int, *, now_ms: int | None = None) -> bool:
+def _check_idle_exit(
+    base: Path, idle_ttl_ms: int, *, now_ms: int | None = None, started_ms: int | None = None
+) -> bool:
     heartbeat_path = base / HEARTBEAT_FILE_NAME
     mtime = _heartbeat_mtime_ms(heartbeat_path)
     if mtime is None:
-        return False
+        # No client ever wrote a heartbeat: measure idleness from daemon
+        # start, or a daemon nobody uses runs forever (observed live: an
+        # orphan burned 49 CPU-minutes because this returned False).
+        if started_ms is None:
+            return False
+        mtime = started_ms
     now = _epoch_ms() if now_ms is None else now_ms
     if is_idle(mtime, now, idle_ttl_ms):
         _remove_pidfile(base)
@@ -270,8 +285,9 @@ def _daemon_loop_step(
     idle_ttl_ms: int,
     last_fingerprint: str | None = None,
     now_ms: int | None = None,
+    started_ms: int | None = None,
 ) -> tuple[bool, ProcessScanCache, str]:
-    if _check_idle_exit(base, idle_ttl_ms, now_ms=now_ms):
+    if _check_idle_exit(base, idle_ttl_ms, now_ms=now_ms, started_ms=started_ms):
         return False, process_cache, last_fingerprint or ""
     state, process_cache = _python_daemon_tick(
         process_cache,
@@ -302,21 +318,35 @@ def _run_python_daemon(store_dir: str, interval_ms: int, window: int) -> None:
     ram_window: list[int] = []
     tick = 0
     last_fingerprint: str | None = None
+    started_ms = _epoch_ms()
+    write_failures = 0
 
     while True:
-        keep_running, process_cache, last_fingerprint = _daemon_loop_step(
-            base,
-            process_cache=process_cache,
-            cpu_window=cpu_window,
-            ram_window=ram_window,
-            window=window,
-            interval_ms=interval_ms,
-            tick=tick,
-            idle_ttl_ms=idle_ttl_ms,
-            last_fingerprint=last_fingerprint,
-        )
-        if not keep_running:
-            return
+        try:
+            keep_running, process_cache, last_fingerprint = _daemon_loop_step(
+                base,
+                process_cache=process_cache,
+                cpu_window=cpu_window,
+                ram_window=ram_window,
+                window=window,
+                interval_ms=interval_ms,
+                tick=tick,
+                idle_ttl_ms=idle_ttl_ms,
+                last_fingerprint=last_fingerprint,
+                started_ms=started_ms,
+            )
+            write_failures = 0
+        except OSError as exc:
+            # A daemon that cannot publish state is useless; retry briefly,
+            # then exit instead of spinning against a broken store forever.
+            write_failures += 1
+            if write_failures >= _STATE_WRITE_FAILURE_LIMIT:
+                print(f"guard daemon exiting: state writes failing ({exc})", file=sys.stderr)
+                _remove_pidfile(base)
+                return
+        else:
+            if not keep_running:
+                return
         tick += 1
         time.sleep(interval_ms / 1000.0)
 
