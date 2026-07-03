@@ -25,6 +25,7 @@ QUEUE_BIN_ENV = "CLUXION_QUEUE_BIN"
 QUEUE_STORE_ENV = "CLUXION_QUEUE_STORE_DIR"
 QUEUE_BACKEND_ENV = "CLUXION_QUEUE_BACKEND"
 _DEFAULT_STORE = Path.home() / ".local" / "share" / "cluxion-agentplugin-preprocessing" / "queue"
+_SUBPROCESS_TIMEOUT_SECONDS = 15.0
 
 _logger = logging.getLogger(__name__)
 
@@ -189,7 +190,13 @@ def _invoke(command: str, payload: Mapping[str, object], *, store_dir: Path | No
     if backend == "native":
         return _invoke_native(command, body)
     if backend == "subprocess":
-        return _invoke_subprocess(command, body)
+        try:
+            return _invoke_subprocess(command, body)
+        except subprocess.TimeoutExpired as exc:
+            if os.environ.get(QUEUE_BACKEND_ENV, "").strip().lower() == "subprocess":
+                raise RuntimeError(_timeout_error(command, exc.timeout)) from exc
+            _logger.warning("%s; using Python queue fallback", _timeout_error(command, exc.timeout))
+            return py_queue.run(command, body)
     return py_queue.run(command, body)
 
 
@@ -213,6 +220,7 @@ def _invoke_subprocess(command: str, body: dict[str, object]) -> dict[str, objec
         text=True,
         capture_output=True,
         check=False,
+        timeout=_SUBPROCESS_TIMEOUT_SECONDS,
     )
     if completed.returncode != 0:
         stdout = completed.stdout.strip()
@@ -225,6 +233,10 @@ def _invoke_subprocess(command: str, body: dict[str, object]) -> dict[str, objec
     if not isinstance(parsed, dict):
         raise RuntimeError(f"cluxion-queue {command} returned non-object JSON")
     return parsed
+
+
+def _timeout_error(command: str, timeout: float | None) -> str:
+    return f"cluxion-queue {command} timed out after {timeout or _SUBPROCESS_TIMEOUT_SECONDS:g}s"
 
 
 def _queue_binary() -> str:

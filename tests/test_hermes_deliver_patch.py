@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 from cluxion_agentplugin_preprocessing import hermes_deliver_patch
@@ -55,3 +56,20 @@ def test_ensure_applied_reports_anchor_mismatch(tmp_path: Path) -> None:
 
     assert result.status == "anchors-mismatch"
     assert result.applied is False
+
+
+def test_ensure_applied_reports_git_timeout(tmp_path: Path, monkeypatch) -> None:
+    root = _mismatched_root(tmp_path)
+    (root / ".git").mkdir()
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(hermes_deliver_patch.subprocess, "run", timeout)
+
+    result = hermes_deliver_patch.ensure_applied(hermes_root=root)
+
+    assert result.status == "timeout"
+    assert result.applied is False
+    assert "git rev-parse" in result.detail
+    assert "60s" in result.detail

@@ -125,8 +125,11 @@ def test_python_queue_uses_shared_lock_instead_of_per_bundle_locks(tmp_path: Pat
 
     dispatch_dir = store_dir / "dispatch"
     assert not (dispatch_dir / "py-race.json.lock").exists()
+    assert ((dispatch_dir / "py-race.json").stat().st_mode & 0o777) == 0o600
     if py_queue._fcntl is not None:
-        assert (dispatch_dir / ".dispatch.lock").exists()
+        lock_path = dispatch_dir / ".dispatch.lock"
+        assert lock_path.exists()
+        assert (lock_path.stat().st_mode & 0o777) == 0o600
 
 
 def test_python_queue_concurrent_dequeue_serializes_select_update(

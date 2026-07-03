@@ -14,8 +14,9 @@ from typing import Literal
 
 PATCH_RESOURCE = "patches/hermes-deliver-agent.patch"
 BRANCH_NAME = "cluxion/plugin-deliver-agent"
+_GIT_TIMEOUT_SECONDS = 60.0
 
-Status = Literal["applied", "missing", "partial", "no_hermes", "anchors-mismatch"]
+Status = Literal["applied", "missing", "partial", "no_hermes", "anchors-mismatch", "timeout"]
 
 
 @dataclass(frozen=True)
@@ -111,22 +112,26 @@ def ensure_applied(
             f"would apply ({current.detail})",
         )
 
-    for method, result in (
-        ("git_branch", _apply_via_git_branch(current.hermes_root)),
-        ("git_apply", _apply_via_git_patch(current.hermes_root)),
-        ("inline", _apply_inline(current.hermes_root)),
-    ):
-        if result:
-            after = patch_status(current.hermes_root)
-            if after.status == "applied":
-                return PatchResult(
-                    current.hermes_root,
-                    "applied",
-                    True,
-                    True,
-                    method,
-                    "patch applied successfully",
-                )
+    try:
+        for method, apply_method in (
+            ("git_branch", _apply_via_git_branch),
+            ("git_apply", _apply_via_git_patch),
+            ("inline", _apply_inline),
+        ):
+            result = apply_method(current.hermes_root)
+            if result:
+                after = patch_status(current.hermes_root)
+                if after.status == "applied":
+                    return PatchResult(
+                        current.hermes_root,
+                        "applied",
+                        True,
+                        True,
+                        method,
+                        "patch applied successfully",
+                    )
+    except subprocess.TimeoutExpired as exc:
+        return PatchResult(current.hermes_root, "timeout", False, False, "timeout", _timeout_detail(exc))
 
     after = patch_status(current.hermes_root)
     if after.status != "applied":
@@ -178,8 +183,16 @@ def _apply_via_git_branch(root: Path) -> bool:
             check=True,
             capture_output=True,
             text=True,
+            timeout=_GIT_TIMEOUT_SECONDS,
         )
-        subprocess.run(["git", "checkout", BRANCH_NAME], cwd=root, check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "checkout", BRANCH_NAME],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_SECONDS,
+        )
         return True
     except (subprocess.CalledProcessError, OSError):
         return False
@@ -202,13 +215,26 @@ def _apply_via_git_patch(root: Path) -> bool:
             check=True,
             capture_output=True,
             text=True,
+            timeout=_GIT_TIMEOUT_SECONDS,
         )
-        subprocess.run(["git", "apply", str(patch_path)], cwd=root, check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "apply", str(patch_path)],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_SECONDS,
+        )
         return True
     except (subprocess.CalledProcessError, OSError):
         return False
     finally:
         patch_path.unlink(missing_ok=True)
+
+
+def _timeout_detail(exc: subprocess.TimeoutExpired) -> str:
+    cmd = exc.cmd if isinstance(exc.cmd, str) else " ".join(str(part) for part in exc.cmd)
+    return f"{cmd} timed out after {exc.timeout or _GIT_TIMEOUT_SECONDS:g}s"
 
 
 def _apply_inline(root: Path) -> bool:

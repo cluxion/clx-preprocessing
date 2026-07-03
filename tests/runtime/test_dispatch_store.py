@@ -113,8 +113,11 @@ def test_dispatch_store_uses_shared_lock_instead_of_per_bundle_locks(tmp_path: P
     record_dispatch_result("w-queued", str(payload["step"]["step_id"]), result="done", dispatch_dir=tmp_path)
 
     assert not (tmp_path / "w-queued.json.lock").exists()
+    assert ((tmp_path / "w-queued.json").stat().st_mode & 0o777) == 0o600
     if dispatch_store._fcntl is not None:
-        assert (tmp_path / ".dispatch.lock").exists()
+        lock_path = tmp_path / ".dispatch.lock"
+        assert lock_path.exists()
+        assert (lock_path.stat().st_mode & 0o777) == 0o600
 
 
 def test_concurrent_next_dispatch_steps_do_not_claim_same_step(

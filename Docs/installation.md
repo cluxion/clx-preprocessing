@@ -84,7 +84,7 @@ the `cluxion-preprocess` skill or commands. The commands call `cluxion-runtime` 
 | `cluxion-preprocess check` | runtime·Rust 큐 가용성 |
 | `cluxion-preprocess enable` / `disable` | Hermes config |
 | `cluxion-runtime plan` | harness plan JSON |
-| `cluxion-runtime queue-next` | 다음 segment |
+| `cluxion-runtime queue-next` | 다음 미기록 segment (`--full`은 해당 호출의 truncation만 해제) |
 
 ## Rust work queue (선택)
 

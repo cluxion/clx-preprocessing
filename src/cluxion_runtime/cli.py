@@ -137,7 +137,11 @@ def _build_parser(*, json_mode: bool = False) -> argparse.ArgumentParser:
     hermes.add_argument("--display-name", default="Cluxion Local")
     queue_next = subparsers.add_parser("queue-next", help="Return the next segment from the stored dispatch queue")
     queue_next.add_argument("--work-id", required=True)
-    queue_next.add_argument("--full", action="store_true", help="Emit complete field contents instead of a bounded preview")
+    queue_next.add_argument(
+        "--full",
+        action="store_true",
+        help="Emit complete fields for this queue-next call only; it still advances to the next unrecorded step",
+    )
     queue_record = subparsers.add_parser(
         "queue-record", help="Record a segment execution result into the dispatch queue"
     )
@@ -243,7 +247,7 @@ QUEUE_PREVIEW_CHARS = 2000
 
 
 def _bounded_step_payload(payload: dict[str, object], *, full: bool) -> dict[str, object]:
-    """Terminal-safe preview: long string fields are truncated unless --full."""
+    """Terminal-safe preview: --full disables truncation for this call only."""
     if full:
         return payload
     bounded: dict[str, object] = {}
@@ -261,7 +265,7 @@ def _bounded_step_payload(payload: dict[str, object], *, full: bool) -> dict[str
             bounded[key] = value
     if truncated:
         bounded["truncated"] = True
-        bounded["truncated_hint"] = "rerun with --full for the complete payload"
+        bounded["truncated_hint"] = "--full disables truncation for the current queue-next call only"
     return bounded
 
 

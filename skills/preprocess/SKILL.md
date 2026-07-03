@@ -34,6 +34,8 @@ cluxion-runtime queue-record --work-id <work_id> --step-id <step_id> --json-stdi
 cluxion-runtime queue-brief --work-id <work_id>
 ```
 
+`queue-next --full` only disables field truncation for that call. Every `queue-next` call still advances to the next unrecorded step; it does not re-fetch the previous step.
+
 ## Explicit loop_auto
 
 ```bash

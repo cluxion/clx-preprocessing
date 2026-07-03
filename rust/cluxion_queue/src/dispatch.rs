@@ -1,4 +1,6 @@
 use std::fs::{self, OpenOptions};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
@@ -149,11 +151,13 @@ fn with_dispatch_lock<T>(
     f: impl FnOnce() -> Result<T, QueueError>,
 ) -> Result<T, QueueError> {
     let lock_path = dispatch_dir.join(".dispatch.lock");
-    let lockfile = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(&lock_path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let lockfile = options.open(&lock_path)?;
+    #[cfg(unix)]
+    lockfile.set_permissions(fs::Permissions::from_mode(0o600))?;
     lockfile.lock_exclusive()?;
     let result = f();
     let _ = lockfile.unlock();

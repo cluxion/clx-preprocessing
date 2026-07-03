@@ -96,11 +96,22 @@ fn scan_process_fields(sys: &System) -> ProcessScanCache {
     }
 }
 
+fn available_memory_bytes(sys: &System) -> u64 {
+    // sysinfo's available_memory() can report 0 on macOS hosts; a guard that
+    // believes memory is exhausted would misjudge every RAM-floor decision,
+    // so fall back to total-used when the direct reading is missing.
+    let direct = sys.available_memory();
+    if direct > 0 {
+        return direct;
+    }
+    sys.total_memory().saturating_sub(sys.used_memory())
+}
+
 fn build_current_snapshot(sys: &System, process_cache: &ProcessScanCache) -> Value {
     json!({
         "ok": true,
         "total_ram_mb": sys.total_memory() / 1_048_576,
-        "available_ram_mb": sys.available_memory() / 1_048_576,
+        "available_ram_mb": available_memory_bytes(sys) / 1_048_576,
         "swap_used_mb": sys.used_swap() / 1_048_576,
         "cpu_percent": f64::from(sys.global_cpu_usage()),
         "process_count": process_cache.process_count,

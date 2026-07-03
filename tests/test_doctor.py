@@ -114,7 +114,7 @@ def test_run_doctor_parallelizes_slow_probes(tmp_path: Path):
         catalog_path=catalog,
         probes={f"slow_{idx}": slow for idx in range(4)},
         plugin="preprocessing",
-        version="0.3.27",
+        version="0.3.28",
     )
 
     assert result.ok is True

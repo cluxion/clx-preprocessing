@@ -311,7 +311,9 @@ def _exclusive_bundle_lock(path: Path) -> Iterator[None]:
         yield
         return
     lock_path = path.parent / ".dispatch.lock"
-    with lock_path.open("a+b") as lock_file:
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "r+b") as lock_file:
         _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
         try:
             yield

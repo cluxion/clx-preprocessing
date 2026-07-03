@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -108,6 +109,35 @@ def test_dispatch_lifecycle(backend) -> None:
 def test_missing_required_field_raises(backend) -> None:
     with pytest.raises(RuntimeError, match="work_id"):
         queue_bridge.enqueue_work({"prompt": "no id"})
+
+
+def test_subprocess_timeout_falls_back_to_python(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv(queue_bridge.QUEUE_BACKEND_ENV, raising=False)
+    monkeypatch.setattr(queue_bridge, "resolve_backend", lambda: "subprocess")
+    monkeypatch.setattr(queue_bridge.shutil, "which", lambda _binary: "/tmp/cluxion-queue")
+
+    def timeout(*_args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=["cluxion-queue", "enqueue"], timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(queue_bridge.subprocess, "run", timeout)
+
+    result = queue_bridge.enqueue_work({"work_id": "timeout-fallback", "prompt": "hello"}, store_dir=tmp_path)
+
+    assert result["ok"] is True
+    assert result["accepted"] is True
+
+
+def test_forced_subprocess_timeout_reports_command(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv(queue_bridge.QUEUE_BACKEND_ENV, "subprocess")
+    monkeypatch.setattr(queue_bridge.shutil, "which", lambda _binary: "/tmp/cluxion-queue")
+
+    def timeout(*_args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=["cluxion-queue", "enqueue"], timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(queue_bridge.subprocess, "run", timeout)
+
+    with pytest.raises(RuntimeError, match="cluxion-queue enqueue timed out after 15s"):
+        queue_bridge.enqueue_work({"work_id": "timeout-forced", "prompt": "hello"}, store_dir=tmp_path)
 
 
 def test_resolve_backend_honors_env(backend) -> None:
