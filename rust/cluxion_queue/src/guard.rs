@@ -22,6 +22,9 @@ const DEFAULT_RSS_HOT_THRESHOLD_MB: u64 = 1024;
 pub const DEFAULT_DAEMON_INTERVAL_MS: u64 = 1000;
 pub const DEFAULT_DAEMON_WINDOW: usize = 10;
 pub const PROC_SCAN_EVERY_N_TICKS: u64 = 5;
+/// Full process scans cost ~90ms on busy hosts; throttle them by wall clock
+/// so the daemon stays cheap at any interval_ms.
+pub const PROC_SCAN_MIN_INTERVAL_MS: u64 = 5_000;
 pub const STATE_FILE_NAME: &str = "guard_state.json";
 pub const HEARTBEAT_FILE_NAME: &str = "guard_heartbeat";
 pub const PID_FILE_NAME: &str = "guard_daemon.pid";
@@ -77,6 +80,7 @@ struct ProcessScanCache {
     process_count: usize,
     zombie_count: usize,
     zombie_pids: Vec<u64>,
+    scanned_at_ms: u64,
 }
 
 fn scan_process_fields(sys: &System) -> ProcessScanCache {
@@ -93,6 +97,7 @@ fn scan_process_fields(sys: &System) -> ProcessScanCache {
         process_count: sys.processes().len(),
         zombie_count,
         zombie_pids,
+        scanned_at_ms: epoch_ms(),
     }
 }
 
@@ -169,7 +174,11 @@ fn daemon_tick(
     interval_ms: u64,
     tick: u64,
 ) -> Value {
-    if tick % PROC_SCAN_EVERY_N_TICKS == 0 {
+    let now = epoch_ms();
+    let scan_due = process_cache.scanned_at_ms == 0
+        || now.saturating_sub(process_cache.scanned_at_ms) >= PROC_SCAN_MIN_INTERVAL_MS;
+    let _ = tick; // cadence is wall-clock based; tick retained for call compatibility
+    if scan_due {
         sys.refresh_processes(ProcessesToUpdate::All, true);
         *process_cache = scan_process_fields(sys);
     }
@@ -290,17 +299,21 @@ pub fn run_daemon(store_dir: &Path, interval_ms: u64, window: usize) -> Result<(
         process_count: 0,
         zombie_count: 0,
         zombie_pids: Vec::new(),
+        scanned_at_ms: 0,
     };
     let mut cpu_window: Vec<f64> = Vec::with_capacity(window);
     let mut ram_window: Vec<u64> = Vec::with_capacity(window);
     let mut tick: u64 = 0;
+    let started_ms = epoch_ms();
 
     loop {
-        if let Some(mtime) = heartbeat_mtime_ms(&heartbeat_path) {
-            if is_idle(mtime, epoch_ms(), idle_ttl) {
-                let _ = std::fs::remove_file(&pid_path);
-                return Ok(());
-            }
+        // A missing heartbeat means no client ever attached; measuring
+        // idleness from daemon start prevents immortal orphans (a live one
+        // burned 49 CPU-minutes when this only checked existing heartbeats).
+        let last_activity = heartbeat_mtime_ms(&heartbeat_path).unwrap_or(started_ms);
+        if is_idle(last_activity, epoch_ms(), idle_ttl) {
+            let _ = std::fs::remove_file(&pid_path);
+            return Ok(());
         }
         let state = daemon_tick(
             &mut sys,
@@ -403,6 +416,7 @@ mod tests {
             process_count: 1,
             zombie_count: 2,
             zombie_pids: vec![99, 100],
+            scanned_at_ms: epoch_ms(),
         };
         process_cache = stale_cache.clone();
 
@@ -428,6 +442,10 @@ mod tests {
             json!([99, 100])
         );
 
+        // Cadence is wall-clock based: age the cache past the scan window
+        // to force a rescan regardless of tick number.
+        process_cache.scanned_at_ms = epoch_ms().saturating_sub(PROC_SCAN_MIN_INTERVAL_MS + 1);
+        let aged_cache = process_cache.clone();
         let rescan_tick_state = daemon_tick(
             &mut sys,
             &mut process_cache,
@@ -437,7 +455,7 @@ mod tests {
             1000,
             PROC_SCAN_EVERY_N_TICKS,
         );
-        assert_ne!(process_cache, stale_cache);
+        assert_ne!(process_cache, aged_cache);
         assert!(process_cache.process_count > 0);
         assert_eq!(
             rescan_tick_state["current"]["process_count"].as_u64(),
@@ -452,6 +470,23 @@ mod tests {
         assert!(is_idle(now - ttl - 1, now, ttl));
         assert!(!is_idle(now - ttl, now, ttl));
         assert!(!is_idle(now - 1, now, ttl));
+    }
+
+
+    #[test]
+    fn daemon_without_heartbeat_idles_out_from_start() {
+        let dir = std::env::temp_dir().join(format!("guard-idle-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("CLUXION_GUARD_IDLE_TTL_MS", "300");
+        let started = std::time::Instant::now();
+        let result = run_daemon(&dir, 100, 3);
+        std::env::remove_var("CLUXION_GUARD_IDLE_TTL_MS");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.is_ok());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "daemon must exit shortly after the idle TTL when no heartbeat ever appears"
+        );
     }
 
     #[test]
