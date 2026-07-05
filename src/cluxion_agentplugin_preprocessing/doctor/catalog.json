@@ -14,7 +14,7 @@
       "If missing, install/repair Hermes Agent and ensure its bin dir is on PATH",
       "For agents, confirm the spawned shell inherits PATH"
     ],
-    "change_robust": "Uses shutil.which at runtime \u2014 independent of any hardcoded path",
+    "change_robust": "Uses shutil.which at runtime — independent of any hardcoded path",
     "detection_method": "shutil.which(ctx.hermes_bin) is not None"
   },
   {
@@ -47,7 +47,7 @@
       "Run: hermes --help | grep -- -z",
       "If absent, pin to a compatible Hermes version or update the plugin to the new flag"
     ],
-    "change_robust": "Greps live --help output each run \u2014 detects a Hermes update that breaks the contract",
+    "change_robust": "Greps live --help output each run — detects a Hermes update that breaks the contract",
     "detection_method": "'-z' and '--oneshot' present in `hermes --help`"
   },
   {
@@ -84,7 +84,7 @@
       "If missing, reinstall cluxion-agentplugin-preprocessing and restart the host",
       "Verify register_tool used a valid toolset name"
     ],
-    "change_robust": "Queries live `hermes tools list` for 'cluxion' \u2014 catches contract drift on Hermes upgrade",
+    "change_robust": "Queries live `hermes tools list` for 'cluxion' — catches contract drift on Hermes upgrade",
     "detection_method": "'cluxion' appears under plugin toolsets in `hermes tools list`"
   },
   {
@@ -101,7 +101,7 @@
       "Run: pip show cluxion-agentplugin-preprocessing",
       "Force a clean reinstall: pip install --force-reinstall cluxion-agentplugin-preprocessing"
     ],
-    "change_robust": "Compares live importlib.metadata.version() to __version__ \u2014 no hardcoding",
+    "change_robust": "Compares live importlib.metadata.version() to __version__ — no hardcoding",
     "detection_method": "importlib.metadata.version('cluxion-agentplugin-preprocessing') == __version__"
   },
   {
@@ -115,6 +115,7 @@
       "native package not installed"
     ],
     "fix_steps": [
+      "Build+install the native backend: cd <plugin-root> && uv pip install ./rust/cluxion_queue --python .venv/bin/python (or pip install ./rust/cluxion_queue)",
       "Run: python -c 'import cluxion_queue_native'",
       "If ImportError, reinstall the bundled wheel; fallback keeps working meanwhile"
     ],
@@ -125,7 +126,7 @@
     "check_id": "handler_exception_coverage",
     "category": "handler",
     "severity": "low",
-    "what_it_checks": "_json_result guard catches TypeError too (args=None / wrong-typed) \u2192 error JSON, never raises to host",
+    "what_it_checks": "_json_result guard catches TypeError too (args=None / wrong-typed) → error JSON, never raises to host",
     "failure_symptom": "Traceback escapes into the host on malformed args",
     "likely_causes": [
       "_json_result only caught ValueError"

@@ -165,3 +165,13 @@ The `/loopAuto` prompt prefix is stripped and sets `loop_auto=true`. Autonomous 
 ## License
 
 Apache-2.0
+
+## Native backend (optional, faster)
+
+The Rust backend is not built automatically. After install, run once:
+
+```bash
+uv pip install ./rust/cluxion_queue --python .venv/bin/python
+```
+
+Without it the plugin falls back to a slower pure-Python path (`doctor` reports `native_module_importable`).
