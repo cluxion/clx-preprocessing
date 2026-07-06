@@ -141,3 +141,14 @@ def test_queue_next_bounds_long_fields() -> None:
     assert bounded["truncated"] is True
     assert len(bounded["step"]["content"]) == 2000
     assert _bounded_step_payload(payload, full=True) == payload
+
+
+def test_plan_deeply_nested_json_returns_structured_error(capsys, monkeypatch) -> None:
+    # adversarial: ~10k nesting must be a clean error, not a raw RecursionError traceback
+    deep = "{\"x\":" + "[" * 10000 + "]" * 10000 + "}"
+    code, payload, stderr = _run(["plan", "--surface", "codex", "--json-stdin"], deep, capsys, monkeypatch)
+    assert code == 2
+    assert stderr == ""
+    assert payload["ok"] is False
+    assert payload["error"] == "invalid_input"
+    assert "nesting too deep" in payload["message"]

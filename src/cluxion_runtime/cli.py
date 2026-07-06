@@ -330,10 +330,7 @@ _VALID_GUARD_ACTIONS = frozenset({"status", "start", "stop", "enforce", "auto-en
 
 
 def _guard_action_error(action: str) -> str:
-    return (
-        f"unknown guard action: {action} "
-        "(expected: status|start|stop|enforce|auto-enforce)"
-    )
+    return f"unknown guard action: {action} (expected: status|start|stop|enforce|auto-enforce)"
 
 
 def _run_guard(_: argparse.Namespace) -> int:
@@ -342,14 +339,14 @@ def _run_guard(_: argparse.Namespace) -> int:
     payload = _payload_from_stdin()
     action = str(payload.get("action", "status"))
     if action not in _VALID_GUARD_ACTIONS:
-        print(
-            json.dumps({"ok": False, "error": _guard_action_error(action)}, ensure_ascii=False, sort_keys=True)
-        )
+        print(json.dumps({"ok": False, "error": _guard_action_error(action)}, ensure_ascii=False, sort_keys=True))
         return 1
     try:
         if action == "start":
             result = guard_bridge.start_daemon(
-                interval_ms=_non_negative_int("interval_ms", payload.get("interval_ms", guard_bridge.DEFAULT_INTERVAL_MS)),
+                interval_ms=_non_negative_int(
+                    "interval_ms", payload.get("interval_ms", guard_bridge.DEFAULT_INTERVAL_MS)
+                ),
                 window=_non_negative_int("window", payload.get("window", guard_bridge.DEFAULT_WINDOW)),
             )
         elif action == "stop":
@@ -394,7 +391,9 @@ def _run_guard(_: argparse.Namespace) -> int:
         elif action == "status":
             result = {
                 "ok": True,
-                "sample": guard_bridge.sample({"cpu_sample_ms": _non_negative_int("cpu_sample_ms", payload.get("cpu_sample_ms", 100))}),
+                "sample": guard_bridge.sample(
+                    {"cpu_sample_ms": _non_negative_int("cpu_sample_ms", payload.get("cpu_sample_ms", 100))}
+                ),
                 "daemon": guard_bridge.daemon_status(),
                 "state": guard_bridge.read_daemon_state(),
             }
@@ -402,9 +401,7 @@ def _run_guard(_: argparse.Namespace) -> int:
             if scan_roots:
                 result["scan"] = guard_bridge.scan(scan_roots)
         else:
-            print(
-                json.dumps({"ok": False, "error": _guard_action_error(action)}, ensure_ascii=False, sort_keys=True)
-            )
+            print(json.dumps({"ok": False, "error": _guard_action_error(action)}, ensure_ascii=False, sort_keys=True))
             return 1
     except RuntimeError as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, sort_keys=True))
@@ -539,6 +536,11 @@ def _payload_from_stdin() -> dict[str, object]:
             f"stdin is not valid JSON: {exc}",
             'pipe a JSON object, e.g. echo \'{"prompt": "..."}\' | cluxion-runtime plan --json-stdin',
         ) from exc
+    except RecursionError as exc:
+        raise PayloadError(
+            "stdin JSON nesting too deep",
+            "reduce the nesting depth of the JSON payload",
+        ) from exc
     if not isinstance(payload, dict):
         raise PayloadError("stdin JSON must be an object.", "wrap the payload in {...}")
     return dict(payload)
@@ -596,7 +598,10 @@ def _pid_list(payload: dict[str, object], key: str) -> list[int]:
     if raw is None or raw == []:
         return []
     if not isinstance(raw, list):
-        raise PayloadError(f"{key} must be a list of process IDs (integers)", f'{key} takes root PIDs, e.g. {{"{key}": [1234]}} - not filesystem paths')
+        raise PayloadError(
+            f"{key} must be a list of process IDs (integers)",
+            f'{key} takes root PIDs, e.g. {{"{key}": [1234]}} - not filesystem paths',
+        )
     pids: list[int] = []
     for entry in raw:
         try:
