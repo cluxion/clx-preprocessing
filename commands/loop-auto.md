@@ -1,6 +1,7 @@
 ---
 description: Explicitly drain a queued Cluxion work bundle.
 argument-hint: "<work_id>"
+disable-model-invocation: true
 ---
 
 Run:

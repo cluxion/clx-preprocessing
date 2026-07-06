@@ -1,6 +1,7 @@
 ---
 description: Run Cluxion preprocessing and return the JSON contract.
 argument-hint: "<prompt>"
+disable-model-invocation: true
 ---
 
 Run:
