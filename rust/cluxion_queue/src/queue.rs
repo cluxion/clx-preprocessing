@@ -35,6 +35,7 @@ fn open_db(store_dir: &Path) -> Result<Connection, QueueError> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA synchronous=NORMAL;
+         PRAGMA busy_timeout=30000;
          CREATE TABLE IF NOT EXISTS work_queue (
              work_id TEXT PRIMARY KEY,
              prompt TEXT NOT NULL,
@@ -66,29 +67,46 @@ pub fn enqueue(store_dir: &Path, payload: &Value) -> Result<Value, QueueError> {
         .unwrap_or_else(|| "{}".into());
     let now = now_secs();
     with_db(store_dir, |conn| {
-        let sequence: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM work_queue",
-            [],
-            |row| row.get(0),
-        )?;
-        conn.execute(
-        "INSERT INTO work_queue (work_id, prompt, surface, priority, status, metadata_json, sequence, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?7)
-         ON CONFLICT(work_id) DO UPDATE SET
-             prompt=excluded.prompt,
-             surface=excluded.surface,
-             priority=excluded.priority,
-             metadata_json=excluded.metadata_json,
-             status='pending',
-             updated_at=excluded.updated_at",
-        params![work_id, prompt, surface, priority, metadata_json, sequence, now],
-    )?;
-        Ok(ok_payload(json!({
-            "accepted": true,
-            "work_id": work_id,
-            "sequence": sequence,
-            "reason": "queued",
-        })))
+        // BEGIN IMMEDIATE so the MAX(sequence) read and the INSERT are atomic
+        // across processes (matches py_queue._enqueue); the CONN_CACHE mutex
+        // only serializes within this process.
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let inserted = conn
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM work_queue",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .and_then(|sequence| {
+                conn.execute(
+                    "INSERT INTO work_queue (work_id, prompt, surface, priority, status, metadata_json, sequence, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?7)
+                     ON CONFLICT(work_id) DO UPDATE SET
+                         prompt=excluded.prompt,
+                         surface=excluded.surface,
+                         priority=excluded.priority,
+                         metadata_json=excluded.metadata_json,
+                         status='pending',
+                         updated_at=excluded.updated_at",
+                    params![work_id, prompt, surface, priority, metadata_json, sequence, now],
+                )?;
+                Ok(sequence)
+            });
+        match inserted {
+            Ok(sequence) => {
+                conn.execute_batch("COMMIT;")?;
+                Ok(ok_payload(json!({
+                    "accepted": true,
+                    "work_id": work_id,
+                    "sequence": sequence,
+                    "reason": "queued",
+                })))
+            }
+            Err(err) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(QueueError::Sqlite(err))
+            }
+        }
     })
 }
 
@@ -198,4 +216,77 @@ fn now_secs() -> f64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_enqueue_assigns_unique_monotonic_sequences() {
+        let store = std::env::temp_dir().join(format!(
+            "cluxion-queue-enqueue-race-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&store);
+
+        let threads = 8;
+        let per_thread = 25;
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    for i in 0..per_thread {
+                        let payload = json!({
+                            "work_id": format!("w-{t}-{i}"),
+                            "prompt": "x",
+                        });
+                        enqueue(&store, &payload).expect("enqueue must succeed");
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("enqueue thread panicked");
+        }
+
+        let total = (threads * per_thread) as i64;
+        let (rows, distinct, min_seq, max_seq) = with_db(&store, |conn| {
+            conn.query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT sequence), MIN(sequence), MAX(sequence) FROM work_queue",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .map_err(QueueError::Sqlite)
+        })
+        .expect("count query");
+        assert_eq!(rows, total);
+        assert_eq!(distinct, total, "duplicate sequence values assigned");
+        assert_eq!(min_seq, 1);
+        assert_eq!(max_seq, total);
+
+        // Deterministic FIFO: first dequeue must claim sequence 1.
+        let first = dequeue(&store, &json!({})).expect("dequeue");
+        let claimed = first["item"]["work_id"].as_str().unwrap().to_string();
+        let seq: i64 = with_db(&store, |conn| {
+            conn.query_row(
+                "SELECT sequence FROM work_queue WHERE work_id = ?1",
+                params![claimed],
+                |row| row.get(0),
+            )
+            .map_err(QueueError::Sqlite)
+        })
+        .expect("sequence lookup");
+        assert_eq!(seq, 1);
+
+        let _ = std::fs::remove_dir_all(&store);
+    }
 }
