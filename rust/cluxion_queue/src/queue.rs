@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, ErrorCode};
 use serde_json::{json, Value};
 
 use crate::types::{ok_payload, require_str, QueueError};
@@ -11,6 +12,18 @@ use crate::types::{ok_payload, require_str, QueueError};
 // when this crate runs as an extension module. Keyed by store_dir; WAL keeps
 // cross-process access safe.
 static CONN_CACHE: OnceLock<Mutex<HashMap<PathBuf, Connection>>> = OnceLock::new();
+
+const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+// Absorbs instant SQLITE_BUSY_SNAPSHOT rejections and unique-sequence
+// collisions; genuine lock waits already block inside SQLite via BUSY_TIMEOUT.
+const ENQUEUE_RETRY_ATTEMPTS: u32 = 5;
+// The rollback->WAL switch only lasts until the first process wins it, but
+// its EXCLUSIVE upgrade bypasses the busy handler (see open_db), so give the
+// schema batch a longer runway: 20 attempts * 10ms*n backoff ~= 2.1s total.
+const OPEN_RETRY_ATTEMPTS: u32 = 20;
+
+const UNIQUE_SEQUENCE_INDEX: &str =
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_work_queue_sequence ON work_queue(sequence);";
 
 fn with_db<T>(
     store_dir: &Path,
@@ -32,25 +45,76 @@ fn open_db(store_dir: &Path) -> Result<Connection, QueueError> {
     std::fs::create_dir_all(store_dir)?;
     let db_path = store_dir.join("work_queue.sqlite");
     let conn = Connection::open(db_path)?;
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         PRAGMA synchronous=NORMAL;
-         PRAGMA busy_timeout=30000;
-         CREATE TABLE IF NOT EXISTS work_queue (
-             work_id TEXT PRIMARY KEY,
-             prompt TEXT NOT NULL,
-             surface TEXT NOT NULL DEFAULT 'api',
-             priority INTEGER NOT NULL DEFAULT 2,
-             status TEXT NOT NULL DEFAULT 'pending',
-             metadata_json TEXT NOT NULL DEFAULT '{}',
-             sequence INTEGER NOT NULL,
-             created_at REAL NOT NULL,
-             updated_at REAL NOT NULL
-         );
-         CREATE INDEX IF NOT EXISTS idx_work_queue_status_priority
-             ON work_queue(status, priority, sequence);",
-    )?;
+    // busy_timeout must be installed before any other statement: on a fresh
+    // store the journal-mode switch and table creation are write operations,
+    // and concurrent one-shot processes racing them with the default timeout
+    // (0) fail instantly with "database is locked" and lose the enqueue.
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    // busy_timeout alone cannot protect the rollback->WAL switch: PRAGMA
+    // journal_mode=WAL upgrades an already-open read txn to EXCLUSIVE inside
+    // sqlite3BtreeSetVersion, and that path returns SQLITE_BUSY without ever
+    // consulting the busy handler. A fresh-store multi-process burst hits it
+    // reliably, so retry the (idempotent) schema batch explicitly.
+    let mut attempt = 0;
+    loop {
+        let schema = conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             CREATE TABLE IF NOT EXISTS work_queue (
+                 work_id TEXT PRIMARY KEY,
+                 prompt TEXT NOT NULL,
+                 surface TEXT NOT NULL DEFAULT 'api',
+                 priority INTEGER NOT NULL DEFAULT 2,
+                 status TEXT NOT NULL DEFAULT 'pending',
+                 metadata_json TEXT NOT NULL DEFAULT '{}',
+                 sequence INTEGER NOT NULL,
+                 created_at REAL NOT NULL,
+                 updated_at REAL NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_work_queue_status_priority
+                 ON work_queue(status, priority, sequence);",
+        );
+        match schema {
+            Ok(()) => break,
+            Err(err) if attempt < OPEN_RETRY_ATTEMPTS && is_transient(&err) => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(10 * u64::from(attempt)));
+            }
+            Err(err) => return Err(QueueError::Sqlite(err)),
+        }
+    }
+    ensure_unique_sequence_index(&conn);
     Ok(conn)
+}
+
+/// Sequence uniqueness backstop: with the index in place a racing writer that
+/// somehow computed a stale MAX fails with SQLITE_CONSTRAINT instead of
+/// silently committing a duplicate (enqueue retries with a fresh MAX).
+/// Stores written by pre-0.3.41 builds can already hold duplicate sequences:
+/// resequence them order-preserving and retry; if the index still cannot be
+/// built, skip it — enqueue stays correct via BEGIN IMMEDIATE.
+fn ensure_unique_sequence_index(conn: &Connection) {
+    match conn.execute_batch(UNIQUE_SEQUENCE_INDEX) {
+        Ok(()) => return,
+        Err(err) if err.sqlite_error_code() == Some(ErrorCode::ConstraintViolation) => {}
+        // Transient (e.g. lock contention): the next open_db retries.
+        Err(_) => return,
+    }
+    // ponytail: O(n^2) correlated resequence — one-shot migration, queues are small.
+    let migrated = conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         UPDATE work_queue SET sequence = (
+             SELECT COUNT(*) FROM work_queue AS w2
+             WHERE w2.sequence < work_queue.sequence
+                OR (w2.sequence = work_queue.sequence AND w2.rowid <= work_queue.rowid)
+         );
+         COMMIT;",
+    );
+    if migrated.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return;
+    }
+    let _ = conn.execute_batch(UNIQUE_SEQUENCE_INDEX);
 }
 
 pub fn enqueue(store_dir: &Path, payload: &Value) -> Result<Value, QueueError> {
@@ -69,45 +133,87 @@ pub fn enqueue(store_dir: &Path, payload: &Value) -> Result<Value, QueueError> {
     with_db(store_dir, |conn| {
         // BEGIN IMMEDIATE so the MAX(sequence) read and the INSERT are atomic
         // across processes (matches py_queue._enqueue); the CONN_CACHE mutex
-        // only serializes within this process.
-        conn.execute_batch("BEGIN IMMEDIATE;")?;
-        let inserted = conn
-            .query_row(
-                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM work_queue",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .and_then(|sequence| {
-                conn.execute(
-                    "INSERT INTO work_queue (work_id, prompt, surface, priority, status, metadata_json, sequence, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?7)
-                     ON CONFLICT(work_id) DO UPDATE SET
-                         prompt=excluded.prompt,
-                         surface=excluded.surface,
-                         priority=excluded.priority,
-                         metadata_json=excluded.metadata_json,
-                         status='pending',
-                         updated_at=excluded.updated_at",
-                    params![work_id, prompt, surface, priority, metadata_json, sequence, now],
-                )?;
-                Ok(sequence)
-            });
-        match inserted {
-            Ok(sequence) => {
-                conn.execute_batch("COMMIT;")?;
-                Ok(ok_payload(json!({
-                    "accepted": true,
-                    "work_id": work_id,
-                    "sequence": sequence,
-                    "reason": "queued",
-                })))
+        // only serializes within this process. The retry loop absorbs
+        // transient SQLITE_BUSY (a burst must not lose enqueues) and
+        // unique-sequence collisions (recompute MAX and try again).
+        let mut last_err = None;
+        for attempt in 0..ENQUEUE_RETRY_ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(10 * u64::from(attempt)));
             }
-            Err(err) => {
-                let _ = conn.execute_batch("ROLLBACK;");
-                Err(QueueError::Sqlite(err))
+            match enqueue_txn(
+                conn,
+                work_id,
+                prompt,
+                surface,
+                priority,
+                &metadata_json,
+                now,
+            ) {
+                Ok(sequence) => {
+                    return Ok(ok_payload(json!({
+                        "accepted": true,
+                        "work_id": work_id,
+                        "sequence": sequence,
+                        "reason": "queued",
+                    })))
+                }
+                Err(err) if is_transient(&err) => last_err = Some(err),
+                Err(err) => return Err(QueueError::Sqlite(err)),
             }
         }
+        Err(QueueError::Sqlite(
+            last_err.expect("retry loop always records an error"),
+        ))
     })
+}
+
+fn enqueue_txn(
+    conn: &Connection,
+    work_id: &str,
+    prompt: &str,
+    surface: &str,
+    priority: i64,
+    metadata_json: &str,
+    now: f64,
+) -> Result<i64, rusqlite::Error> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let inserted = conn
+        .query_row(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM work_queue",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .and_then(|sequence| {
+            conn.execute(
+                "INSERT INTO work_queue (work_id, prompt, surface, priority, status, metadata_json, sequence, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?7)
+                 ON CONFLICT(work_id) DO UPDATE SET
+                     prompt=excluded.prompt,
+                     surface=excluded.surface,
+                     priority=excluded.priority,
+                     metadata_json=excluded.metadata_json,
+                     status='pending',
+                     updated_at=excluded.updated_at",
+                params![work_id, prompt, surface, priority, metadata_json, sequence, now],
+            )?;
+            Ok(sequence)
+        })
+        .and_then(|sequence| {
+            conn.execute_batch("COMMIT;")?;
+            Ok(sequence)
+        });
+    if inserted.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    inserted
+}
+
+fn is_transient(err: &rusqlite::Error) -> bool {
+    matches!(
+        err.sqlite_error_code(),
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked | ErrorCode::ConstraintViolation)
+    )
 }
 
 pub fn dequeue(store_dir: &Path, _payload: &Value) -> Result<Value, QueueError> {

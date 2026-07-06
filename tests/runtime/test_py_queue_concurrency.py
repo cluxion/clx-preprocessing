@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
@@ -173,3 +176,47 @@ def test_python_queue_concurrent_dequeue_serializes_select_update(
 
     assert len(work_ids) == 2
     assert len(set(work_ids)) == 2
+
+
+_CROSS_PROCESS_WORKER = """
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from cluxion_runtime.resources import py_queue
+store, prefix, count = sys.argv[2], sys.argv[3], int(sys.argv[4])
+results = []
+for index in range(count):
+    results.append(py_queue.run("enqueue", {"store_dir": store, "work_id": f"{prefix}-{index}", "prompt": "x"}))
+print(json.dumps(results))
+"""
+
+
+def test_python_queue_cross_process_enqueue_is_lossless_and_duplicate_free(tmp_path: Path) -> None:
+    """Real processes (own connections, fresh store) — threads cannot cover this race."""
+    processes, per_process = 12, 4
+    store_dir = tmp_path / "queue"
+    src_dir = str(Path(py_queue.__file__).resolve().parents[3])
+
+    children = [
+        subprocess.Popen(
+            [sys.executable, "-c", _CROSS_PROCESS_WORKER, src_dir, str(store_dir), f"p{index}", str(per_process)],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        for index in range(processes)
+    ]
+    accepted = 0
+    for child in children:
+        stdout, _ = child.communicate(timeout=120)
+        assert child.returncode == 0, stdout
+        accepted += sum(1 for result in json.loads(stdout) if result.get("accepted"))
+
+    total = processes * per_process
+    rows, distinct, min_seq, max_seq = (
+        sqlite3.connect(store_dir / "work_queue.sqlite")
+        .execute("SELECT COUNT(*), COUNT(DISTINCT sequence), MIN(sequence), MAX(sequence) FROM work_queue")
+        .fetchone()
+    )
+    assert accepted == total
+    assert rows == total
+    assert distinct == total
+    assert (min_seq, max_seq) == (1, total)

@@ -26,6 +26,11 @@ except ImportError:  # pragma: no cover - exercised only on non-POSIX platforms.
 # Mirrors dispatch_store.RUNNING_LEASE_SECONDS and dispatch.rs RUNNING_LEASE_SECS.
 _RUNNING_LEASE_SECONDS = 600.0
 
+# Mirrors queue.rs ENQUEUE_RETRY_ATTEMPTS / OPEN_RETRY_ATTEMPTS / UNIQUE_SEQUENCE_INDEX.
+_ENQUEUE_RETRY_ATTEMPTS = 5
+_OPEN_RETRY_ATTEMPTS = 20
+_UNIQUE_SEQUENCE_INDEX = "CREATE UNIQUE INDEX IF NOT EXISTS idx_work_queue_sequence ON work_queue(sequence)"
+
 
 def run(command: str, payload: dict[str, Any]) -> dict[str, Any]:
     store_dir = Path(payload.get("store_dir") or _default_store())
@@ -53,27 +58,68 @@ def _default_store() -> str:
 def _open_db(store_dir: Path) -> sqlite3.Connection:
     store_dir.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(store_dir / "work_queue.sqlite", timeout=30.0)
-    conn.executescript(
-        """
-        PRAGMA journal_mode=WAL;
-        -- NORMAL+WAL can lose the latest commit on OS crash, but avoids corruption and keeps queue throughput balanced.
-        PRAGMA synchronous=NORMAL;
-        CREATE TABLE IF NOT EXISTS work_queue (
-            work_id TEXT PRIMARY KEY,
-            prompt TEXT NOT NULL,
-            surface TEXT NOT NULL DEFAULT 'api',
-            priority INTEGER NOT NULL DEFAULT 2,
-            status TEXT NOT NULL DEFAULT 'pending',
-            metadata_json TEXT NOT NULL DEFAULT '{}',
-            sequence INTEGER NOT NULL,
-            created_at REAL NOT NULL,
-            updated_at REAL NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_work_queue_status_priority
-            ON work_queue(status, priority, sequence);
-        """
-    )
+    # The rollback->WAL switch upgrades a read txn to EXCLUSIVE inside SQLite
+    # (sqlite3BtreeSetVersion) and that path returns SQLITE_BUSY without
+    # consulting the busy handler, so the connect timeout cannot protect a
+    # fresh-store multi-process burst: retry the (idempotent) schema script.
+    for attempt in range(_OPEN_RETRY_ATTEMPTS + 1):
+        if attempt:
+            time.sleep(0.01 * attempt)
+        try:
+            conn.executescript(
+                """
+                PRAGMA journal_mode=WAL;
+                -- NORMAL+WAL can lose the latest commit on OS crash, but avoids corruption and keeps queue throughput balanced.
+                PRAGMA synchronous=NORMAL;
+                CREATE TABLE IF NOT EXISTS work_queue (
+                    work_id TEXT PRIMARY KEY,
+                    prompt TEXT NOT NULL,
+                    surface TEXT NOT NULL DEFAULT 'api',
+                    priority INTEGER NOT NULL DEFAULT 2,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    sequence INTEGER NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_work_queue_status_priority
+                    ON work_queue(status, priority, sequence);
+                """
+            )
+            break
+        except sqlite3.OperationalError as err:
+            if attempt >= _OPEN_RETRY_ATTEMPTS or ("locked" not in str(err) and "busy" not in str(err)):
+                raise
+    _ensure_unique_sequence_index(conn)
     return conn
+
+
+def _ensure_unique_sequence_index(conn: sqlite3.Connection) -> None:
+    """Sequence uniqueness backstop, mirroring queue.rs.
+
+    Stores written by pre-0.3.41 builds can hold duplicate sequences:
+    resequence them order-preserving and retry; if the index still cannot
+    be built, skip it — enqueue stays correct via BEGIN IMMEDIATE.
+    """
+    try:
+        with conn:
+            conn.execute(_UNIQUE_SEQUENCE_INDEX)
+        return
+    except sqlite3.IntegrityError:
+        pass
+    except sqlite3.OperationalError:
+        return  # transient (e.g. lock contention): the next open retries
+    try:
+        with conn:
+            conn.execute(
+                """UPDATE work_queue SET sequence = (
+                       SELECT COUNT(*) FROM work_queue AS w2
+                       WHERE w2.sequence < work_queue.sequence
+                          OR (w2.sequence = work_queue.sequence AND w2.rowid <= work_queue.rowid))"""
+            )
+            conn.execute(_UNIQUE_SEQUENCE_INDEX)
+    except sqlite3.Error:
+        pass
 
 
 def _begin_immediate(conn: sqlite3.Connection) -> None:
@@ -98,19 +144,34 @@ def _enqueue(store_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
     priority = payload.get("priority", 2)
     metadata_json = json.dumps(payload.get("metadata", {}), ensure_ascii=False)
     now = time.time()
-    with _open_db(store_dir) as conn:
-        _begin_immediate(conn)
-        sequence = conn.execute("SELECT COALESCE(MAX(sequence), 0) + 1 FROM work_queue").fetchone()[0]
-        conn.execute(
-            """INSERT INTO work_queue (work_id, prompt, surface, priority, status, metadata_json, sequence, created_at, updated_at)
-               VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)
-               ON CONFLICT(work_id) DO UPDATE SET
-                   prompt=excluded.prompt, surface=excluded.surface,
-                   priority=excluded.priority, metadata_json=excluded.metadata_json,
-                   status='pending', updated_at=excluded.updated_at""",
-            (work_id, prompt, surface, priority, metadata_json, sequence, now, now),
-        )
-    return _ok({"accepted": True, "work_id": work_id, "sequence": sequence, "reason": "queued"})
+    # Retry absorbs transient "database is locked" (a burst must not lose
+    # enqueues) and unique-sequence collisions (recompute MAX and try again),
+    # mirroring queue.rs enqueue.
+    last_error: Exception | None = None
+    for attempt in range(_ENQUEUE_RETRY_ATTEMPTS):
+        if attempt:
+            time.sleep(0.01 * attempt)
+        try:
+            with _open_db(store_dir) as conn:
+                _begin_immediate(conn)
+                sequence = conn.execute("SELECT COALESCE(MAX(sequence), 0) + 1 FROM work_queue").fetchone()[0]
+                conn.execute(
+                    """INSERT INTO work_queue (work_id, prompt, surface, priority, status, metadata_json, sequence, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+                       ON CONFLICT(work_id) DO UPDATE SET
+                           prompt=excluded.prompt, surface=excluded.surface,
+                           priority=excluded.priority, metadata_json=excluded.metadata_json,
+                           status='pending', updated_at=excluded.updated_at""",
+                    (work_id, prompt, surface, priority, metadata_json, sequence, now, now),
+                )
+            return _ok({"accepted": True, "work_id": work_id, "sequence": sequence, "reason": "queued"})
+        except sqlite3.IntegrityError as err:
+            last_error = err
+        except sqlite3.OperationalError as err:
+            if "locked" not in str(err) and "busy" not in str(err):
+                raise
+            last_error = err
+    raise RuntimeError(f"enqueue failed after {_ENQUEUE_RETRY_ATTEMPTS} attempts: {last_error}")
 
 
 def _dequeue(store_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
