@@ -269,3 +269,29 @@ def test_serve_local_dry_run_outputs_openai_compatible_endpoint(
         "serve",
         "mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit",
     ]
+
+
+def test_serve_local_missing_binary_emits_json_error_not_traceback(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """A missing vllm-mlx binary yields the normal JSON contract and exit 1."""
+    monkeypatch.setenv("PATH", str(tmp_path))
+    code = main(
+        [
+            "serve-local",
+            "--model",
+            "mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit",
+            "--port",
+            "23003",
+            "--no-auto-install",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 1
+    assert payload["started"] is False
+    assert payload["pid"] == 0
+    assert payload["reason"].startswith("binary_not_found:")

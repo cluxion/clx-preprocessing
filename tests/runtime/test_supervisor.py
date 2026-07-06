@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
+from pathlib import Path
 
 from cluxion_runtime.core.types import ModelRuntimeProfile, RuntimeKind
 from cluxion_runtime.models.supervisor import LocalModelSupervisor
@@ -119,3 +121,43 @@ def test_health_url_does_not_duplicate_v1() -> None:
 
     LocalModelSupervisor(_profile(), health_getter=capture).health_check()
     assert seen == ["http://127.0.0.1:8080/v1/models"]
+
+
+def test_start_reports_binary_not_found_instead_of_raising() -> None:
+    def missing(*_: object) -> FakeProcess:
+        raise FileNotFoundError("[Errno 2] No such file or directory: 'vllm-mlx'")
+
+    supervisor = LocalModelSupervisor(_profile(), process_factory=missing)
+    result = supervisor.start()
+    assert result.started is False
+    assert result.pid == 0
+    assert result.reason.startswith("binary_not_found:")
+    assert supervisor.is_running() is False
+
+
+def test_start_reports_binary_not_found_on_permission_error() -> None:
+    def denied(*_: object) -> FakeProcess:
+        raise PermissionError("[Errno 13] Permission denied: 'vllm-mlx'")
+
+    result = LocalModelSupervisor(_profile(), process_factory=denied).start()
+    assert result.started is False
+    assert result.reason.startswith("binary_not_found:")
+
+
+def test_default_factory_missing_binary_returns_clean_result(tmp_path: Path) -> None:
+    missing = tmp_path / "vllm-mlx"
+    result = LocalModelSupervisor(_profile(command=(str(missing), "serve", "demo"))).start()
+    assert result.started is False
+    assert result.pid == 0
+    assert result.reason.startswith("binary_not_found:")
+
+
+def test_default_factory_spawns_real_process() -> None:
+    supervisor = LocalModelSupervisor(_profile(command=(sys.executable, "-c", "import time; time.sleep(30)")))
+    result = supervisor.start()
+    try:
+        assert result.started is True
+        assert result.pid > 0
+        assert supervisor.is_running() is True
+    finally:
+        supervisor.stop()

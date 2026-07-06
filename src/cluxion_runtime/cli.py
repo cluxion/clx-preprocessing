@@ -447,11 +447,13 @@ def _run_serve_local(args: argparse.Namespace) -> int:
     payload = _serve_payload(profile)
     if bootstrap is not None:
         payload["bootstrap"] = bootstrap.to_dict()
+    exit_code = 0
     if not args.dry_run:
         result = LocalModelSupervisor(profile).start()
         payload.update({"started": result.started, "pid": result.pid, "reason": result.reason})
+        exit_code = 0 if result.started else 1
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-    return 0
+    return exit_code
 
 
 def _runtime_executable(bootstrap: object) -> str | None:

@@ -171,7 +171,7 @@ wheels = [
 
 [[package]]
 name = "cluxion-agentplugin-preprocessing"
-version = "0.3.37"
+version = "0.3.38"
 source = { editable = "." }
 dependencies = [
     { name = "psutil" },
