@@ -100,9 +100,9 @@ def _process_status_rows() -> list[tuple[int, str]] | None:
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        return []
+        return None
     if completed.returncode != 0:
-        return []
+        return None
     rows: list[tuple[int, str]] = []
     for line in completed.stdout.splitlines():
         parts = line.strip().split(None, 1)
@@ -221,10 +221,7 @@ def _write_state_if_changed(
     tick: int,
 ) -> str:
     fingerprint = _state_write_fingerprint(state)
-    if (
-        fingerprint != last_fingerprint
-        or tick % STATE_WRITE_EVERY_N_TICKS == 0
-    ):
+    if fingerprint != last_fingerprint or tick % STATE_WRITE_EVERY_N_TICKS == 0:
         _write_state_atomically(store_dir, state)
     return fingerprint
 
@@ -254,9 +251,7 @@ def _remove_pidfile(base: Path) -> None:
     (base / PID_FILE_NAME).unlink(missing_ok=True)
 
 
-def _check_idle_exit(
-    base: Path, idle_ttl_ms: int, *, now_ms: int | None = None, started_ms: int | None = None
-) -> bool:
+def _check_idle_exit(base: Path, idle_ttl_ms: int, *, now_ms: int | None = None, started_ms: int | None = None) -> bool:
     heartbeat_path = base / HEARTBEAT_FILE_NAME
     mtime = _heartbeat_mtime_ms(heartbeat_path)
     if mtime is None:

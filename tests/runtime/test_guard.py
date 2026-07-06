@@ -430,3 +430,25 @@ def test_guard_python_sample_with_cpu_sample_ms_0_is_nonblocking(monkeypatch):
     assert seen["interval"] is None, "cpu_sample_ms=0 must not use a blocking interval"
     assert "cpu_percent" in res
     assert res["ok"]
+
+
+def test_process_rows_failure_returns_none_and_engages_psutil_fallback(monkeypatch) -> None:
+    # regression: [] here made _python_sample treat a failed ps as an empty
+    # process table instead of falling back to psutil (process_count=0).
+    def broken_ps(*_args, **_kwargs):
+        raise OSError("ps unavailable")
+
+    monkeypatch.setattr(guard_bridge.subprocess, "run", broken_ps)
+    assert guard_bridge._process_rows() is None
+    report = guard_bridge._python_sample({"cpu_sample_ms": 0})
+    assert report["ok"] is True
+    assert report["process_count"] > 0
+
+
+def test_process_rows_nonzero_exit_returns_none(monkeypatch) -> None:
+    monkeypatch.setattr(
+        guard_bridge.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 1, stdout="", stderr=""),
+    )
+    assert guard_bridge._process_rows() is None

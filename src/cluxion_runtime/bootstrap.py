@@ -121,7 +121,7 @@ def ensure_local_runtime(
                 "runtime_venv_failed",
             )
         completed = runner(install_command, timeout_sec)
-    except OSError as exc:
+    except (OSError, subprocess.TimeoutExpired) as exc:
         return BootstrapResult(
             False,
             False,
@@ -134,7 +134,7 @@ def ensure_local_runtime(
             1,
             "",
             str(exc),
-            "install_failed",
+            "install_timeout" if isinstance(exc, subprocess.TimeoutExpired) else "install_failed",
         )
     ok = completed.returncode == 0 and all(Path(path).exists() for path in command_paths.values())
     reason = "installed" if ok and missing else "upgraded" if ok else "install_failed"

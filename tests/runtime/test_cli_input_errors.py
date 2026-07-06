@@ -152,3 +152,23 @@ def test_plan_deeply_nested_json_returns_structured_error(capsys, monkeypatch) -
     assert payload["ok"] is False
     assert payload["error"] == "invalid_input"
     assert "nesting too deep" in payload["message"]
+
+
+@pytest.mark.parametrize(
+    ("argv", "body"),
+    [
+        (["plan", "--surface", "codex", "--json-stdin"], {"prompt": "x", "loop_auto_timeout_s": {"s": 600}}),
+        (["loop-auto", "--work-id", "w1", "--json-stdin"], {"timeout_seconds": {"s": 600}}),
+        (["loop-auto", "--work-id", "w1", "--json-stdin"], {"max_segment_retries": [2]}),
+    ],
+)
+def test_wrong_typed_numeric_payload_fields_return_structured_error(
+    argv: list[str], body: dict[str, object], capsys, monkeypatch
+) -> None:
+    # regression: dict/list numeric fields raised TypeError past main()'s
+    # except clause, violating the JSON error contract with a raw traceback
+    code, payload, stderr = _run(argv, json.dumps(body), capsys, monkeypatch)
+    assert code == 2
+    assert stderr == ""
+    assert payload["ok"] is False
+    assert payload["error"] == "invalid_input"

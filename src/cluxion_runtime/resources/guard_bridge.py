@@ -571,9 +571,9 @@ def _process_rows() -> list[dict[str, Any]] | None:
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        return []
+        return None
     if completed.returncode != 0:
-        return []
+        return None
     rows: list[dict[str, Any]] = []
     for line in completed.stdout.splitlines():
         parts = line.strip().split(None, 5)

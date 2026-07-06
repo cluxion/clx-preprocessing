@@ -293,3 +293,17 @@ def test_write_state_if_changed_skips_identical_fingerprint(tmp_path: Path) -> N
 
     _write_state_if_changed(tmp_path, state, last_fingerprint=fp, tick=STATE_WRITE_EVERY_N_TICKS)
     assert state_path.stat().st_mtime >= first_mtime
+
+
+def test_process_status_rows_failure_returns_none_and_engages_psutil_fallback(monkeypatch) -> None:
+    # regression: [] here made _scan_process_fields report zero processes
+    # instead of falling back to the budgeted psutil walk.
+    from cluxion_runtime import guard_daemon_host
+
+    def broken_ps(*_args, **_kwargs):
+        raise OSError("ps unavailable")
+
+    monkeypatch.setattr(guard_daemon_host.subprocess, "run", broken_ps)
+    assert guard_daemon_host._process_status_rows() is None
+    cache = guard_daemon_host._scan_process_fields()
+    assert cache.process_count > 0

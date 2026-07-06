@@ -234,8 +234,12 @@ def _run_loop_auto(args: argparse.Namespace) -> int:
             cwd=Path(cwd_raw).expanduser() if cwd_raw else Path.cwd(),
             hermes_bin=str(payload.get("hermes_bin", args.hermes_bin)),
             model=str(payload.get("model", args.model)),
-            timeout_seconds=float(payload.get("timeout_seconds", args.timeout_seconds)),
-            max_segment_retries=int(payload.get("max_segment_retries", args.max_segment_retries)),
+            timeout_seconds=_non_negative_float(
+                "timeout_seconds", payload.get("timeout_seconds", args.timeout_seconds)
+            ),
+            max_segment_retries=_non_negative_int(
+                "max_segment_retries", payload.get("max_segment_retries", args.max_segment_retries)
+            ),
             dry_run=bool(payload.get("dry_run", args.dry_run)),
         )
     )
@@ -630,6 +634,8 @@ def _apply_plan_numeric_contract(payload: dict[str, object]) -> dict[str, object
     for key in ("expected_ram_mb", "context_tokens"):
         if key in updated:
             updated[key] = _non_negative_int(key, updated[key], parse_exit_code=1)
+    if "loop_auto_timeout_s" in updated:
+        updated["loop_auto_timeout_s"] = _non_negative_float("loop_auto_timeout_s", updated["loop_auto_timeout_s"])
     return updated
 
 

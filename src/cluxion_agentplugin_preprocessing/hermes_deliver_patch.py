@@ -47,7 +47,11 @@ def resolve_hermes_agent_root(home: str | os.PathLike[str] | None = None) -> Pat
         candidates.append(Path(env_root).expanduser())
     if home is not None:
         candidates.append(Path(home).expanduser() / "hermes-agent")
-    hermes_home = Path(os.environ.get("HERMES_HOME", "")).expanduser() if os.environ.get("HERMES_HOME") else Path.home() / ".hermes"
+    hermes_home = (
+        Path(os.environ.get("HERMES_HOME", "")).expanduser()
+        if os.environ.get("HERMES_HOME")
+        else Path.home() / ".hermes"
+    )
     candidates.append(hermes_home / "hermes-agent")
 
     hermes_bin = shutil.which("hermes")
@@ -153,24 +157,30 @@ def ensure_applied(
     )
 
 
+def _has_markers(path: Path, *markers: str) -> bool:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        # Partial checkout: a missing file means the marker is absent, so
+        # patch_status degrades to missing/partial instead of crashing.
+        return False
+    return all(marker in text for marker in markers)
+
+
 def _plugins_applied(root: Path) -> bool:
-    text = (root / "hermes_cli" / "plugins.py").read_text(encoding="utf-8")
-    return 'deliver: str = "output"' in text and '"deliver": deliver_mode' in text
+    return _has_markers(root / "hermes_cli" / "plugins.py", 'deliver: str = "output"', '"deliver": deliver_mode')
 
 
 def _cli_applied(root: Path) -> bool:
-    text = (root / "cli.py").read_text(encoding="utf-8")
-    return 'entry.get("deliver") == "agent"' in text and "_pending_input.put(str(result))" in text
+    return _has_markers(root / "cli.py", 'entry.get("deliver") == "agent"', "_pending_input.put(str(result))")
 
 
 def _gateway_dispatch_applied(root: Path) -> bool:
-    text = (root / "tui_gateway" / "server.py").read_text(encoding="utf-8")
-    return '"type": "send"' in text and 'entry.get("deliver") == "agent"' in text
+    return _has_markers(root / "tui_gateway" / "server.py", '"type": "send"', 'entry.get("deliver") == "agent"')
 
 
 def _gateway_slash_exec_applied(root: Path) -> bool:
-    text = (root / "tui_gateway" / "server.py").read_text(encoding="utf-8")
-    return "agent-deliver command: use command.dispatch" in text
+    return _has_markers(root / "tui_gateway" / "server.py", "agent-deliver command: use command.dispatch")
 
 
 def _apply_via_git_branch(root: Path) -> bool:
@@ -271,7 +281,7 @@ def _patch_plugins_py(root: Path) -> bool:
         "        }"
     )
     new = (
-        "        deliver_mode = (deliver or \"output\").strip().lower()\n"
+        '        deliver_mode = (deliver or "output").strip().lower()\n'
         '        if deliver_mode not in {"output", "agent"}:\n'
         '            deliver_mode = "output"\n'
         "        self._manager._plugin_commands[clean] = {\n"
@@ -327,7 +337,7 @@ def _patch_cli_py(root: Path) -> bool:
         '                                f"\\n⚡ /{cmd_key} → agent "\n'
         '                                f"({len(str(result))} chars)"\n'
         "                            )\n"
-        '                            self._pending_input.put(str(result))\n'
+        "                            self._pending_input.put(str(result))\n"
         "                        elif result:\n"
         "                            _cprint(str(result))"
     )
@@ -392,6 +402,7 @@ def _patch_tui_gateway(root: Path) -> bool:
     if changed:
         path.write_text(text, encoding="utf-8")
     return changed
+
 
 __all__ = [
     "PatchResult",

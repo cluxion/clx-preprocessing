@@ -73,3 +73,18 @@ def test_ensure_applied_reports_git_timeout(tmp_path: Path, monkeypatch) -> None
     assert result.applied is False
     assert "git rev-parse" in result.detail
     assert "60s" in result.detail
+
+
+def test_patch_status_degrades_on_partial_checkout(tmp_path: Path) -> None:
+    # regression: missing cli.py / tui_gateway crashed with FileNotFoundError
+    root = tmp_path / "hermes-agent"
+    (root / "hermes_cli").mkdir(parents=True)
+    (root / "hermes_cli" / "plugins.py").write_text(
+        'deliver: str = "output"\n"deliver": deliver_mode\n',
+        encoding="utf-8",
+    )
+
+    status = hermes_deliver_patch.patch_status(root)
+
+    assert status.status == "partial"
+    assert status.applied is False

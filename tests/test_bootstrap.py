@@ -110,3 +110,23 @@ def test_bootstrap_falls_back_to_uv_when_pip_module_is_missing(monkeypatch: pyte
 def test_bootstrap_rejects_unsafe_package_name() -> None:
     with pytest.raises(ValueError, match="unsafe package"):
         ensure_local_runtime(packages=("vllm-mlx;rm -rf /",), dry_run=True)
+
+
+def test_bootstrap_reports_install_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    runtime = tmp_path / "runtime"
+    monkeypatch.setattr("shutil.which", lambda command: "/usr/local/bin/uv" if command == "uv" else None)
+    monkeypatch.setenv(RUNTIME_VENV_ENV, str(runtime))
+    monkeypatch.setattr("cluxion_runtime.bootstrap._python_module_available", lambda _python, _module: False)
+
+    def timeout_runner(command: Sequence[str], timeout_sec: float) -> subprocess.CompletedProcess[str]:
+        if command[:2] == ("/usr/local/bin/uv", "venv"):
+            (runtime / "bin").mkdir(parents=True)
+            (runtime / "bin" / "python").write_text("", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        raise subprocess.TimeoutExpired(cmd=list(command), timeout=timeout_sec)
+
+    result = ensure_local_runtime(command_runner=timeout_runner)
+
+    assert result.ok is False
+    assert result.reason == "install_timeout"
+    assert result.returncode == 1
