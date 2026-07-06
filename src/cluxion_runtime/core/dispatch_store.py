@@ -23,6 +23,11 @@ if TYPE_CHECKING:
 DISPATCH_DIR_ENV = "CLUXION_PREPROCESS_DISPATCH_DIR"
 _LEGACY_DISPATCH_DIR_ENV = "HERMES_CLUXION_DISPATCH_DIR"
 _DEFAULT_BASE_DIR = Path.home() / ".local" / "share" / "cluxion-agentplugin-preprocessing" / "queue" / "dispatch"
+# A step abandoned in 'running' (crashed or killed worker) becomes claimable
+# again after this lease; matches the LoopAutoOptions.timeout_seconds default,
+# so no live worker can legitimately hold a step longer. Mirrored in
+# py_queue._RUNNING_LEASE_SECONDS and dispatch.rs RUNNING_LEASE_SECS.
+RUNNING_LEASE_SECONDS = 600.0
 
 
 @dataclass(frozen=True)
@@ -58,7 +63,11 @@ def persist_dispatch_bundle(plan: HarnessPlan, *, dispatch_dir: Path | None = No
         return None
     bundle = _bundle_from_plan(plan)
     target_dir = default_dispatch_dir() if dispatch_dir is None else dispatch_dir
-    if plan.queue_backend in ("native", "subprocess") and dispatch_dir is None and not _custom_dispatch_dir_configured():
+    if (
+        plan.queue_backend in ("native", "subprocess")
+        and dispatch_dir is None
+        and not _custom_dispatch_dir_configured()
+    ):
         try:
             from cluxion_runtime.resources.queue_bridge import default_store_dir
             from cluxion_runtime.resources.queue_bridge import persist_dispatch_bundle as rust_persist
@@ -85,11 +94,12 @@ def next_dispatch_step(work_id: str, *, dispatch_dir: Path | None = None) -> dic
     """Mark the next queued segment as running and return the payload for Hermes."""
     target_dir = default_dispatch_dir() if dispatch_dir is None else dispatch_dir
     path = _bundle_path(work_id, target_dir)
+    now = time.time()
     with _exclusive_bundle_lock(path):
         bundle = _load_dispatch_bundle_from_path(path, work_id)
         steps = _steps(bundle)
         for step in steps:
-            if step.get("status") in {"queued", "retry_wait"}:
+            if step.get("status") in {"queued", "retry_wait"} or _stale_running(step, now):
                 step["status"] = "running"
                 step["updated_at"] = time.time()
                 _atomic_write_json(path, bundle)
@@ -116,9 +126,14 @@ def record_dispatch_result(
     result: str = "",
     error: str = "",
     succeeded: bool = True,
+    retryable: bool = False,
     dispatch_dir: Path | None = None,
 ) -> dict[str, object]:
-    """Store the segment result produced by the Hermes model."""
+    """Store the segment result produced by the Hermes model.
+
+    A failure recorded with ``retryable=True`` parks the step in 'retry_wait'
+    so the next drain re-claims it, instead of the terminal 'failed'.
+    """
     target_dir = default_dispatch_dir() if dispatch_dir is None else dispatch_dir
     path = _bundle_path(work_id, target_dir)
     with _exclusive_bundle_lock(path):
@@ -126,7 +141,7 @@ def record_dispatch_result(
         steps = _steps(bundle)
         for step in steps:
             if step.get("step_id") == step_id:
-                status = "succeeded" if succeeded else "failed"
+                status = "succeeded" if succeeded else ("retry_wait" if retryable else "failed")
                 if step.get("status") in {"succeeded", "failed"}:
                     stored_result = str(step.get("result", ""))
                     stored_error = str(step.get("error", ""))
@@ -272,6 +287,14 @@ def _remaining_count(steps: list[dict[str, object]]) -> int:
     return sum(1 for step in steps if step.get("status") in {"queued", "retry_wait", "running"})
 
 
+def _stale_running(step: dict[str, object], now: float) -> bool:
+    if step.get("status") != "running":
+        return False
+    updated = step.get("updated_at")
+    updated_at = float(updated) if isinstance(updated, (int, float)) else 0.0
+    return now - updated_at > RUNNING_LEASE_SECONDS
+
+
 def _custom_dispatch_dir_configured() -> bool:
     return bool(os.environ.get(DISPATCH_DIR_ENV, "").strip() or os.environ.get(_LEGACY_DISPATCH_DIR_ENV, "").strip())
 
@@ -340,6 +363,7 @@ def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
 
 __all__ = [
     "DISPATCH_DIR_ENV",
+    "RUNNING_LEASE_SECONDS",
     "DispatchStepRecord",
     "DispatchStoreError",
     "build_briefing_payload",

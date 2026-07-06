@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from pathlib import Path
@@ -134,6 +136,52 @@ def test_concurrent_next_dispatch_steps_do_not_claim_same_step(
     assert len(set(step_ids)) == 2
     statuses = [step["status"] for step in load_dispatch_bundle("w-queued", dispatch_dir=tmp_path)["steps"]]
     assert statuses.count("running") == 2
+
+
+def _backdate_running_step(dispatch_dir: Path, work_id: str, step_id: str) -> None:
+    path = dispatch_dir / f"{work_id}.json"
+    bundle = json.loads(path.read_text(encoding="utf-8"))
+    for step in bundle["steps"]:
+        if step["step_id"] == step_id:
+            step["updated_at"] = time.time() - dispatch_store.RUNNING_LEASE_SECONDS - 1
+    path.write_text(json.dumps(bundle), encoding="utf-8")
+
+
+def test_stale_running_step_is_reclaimed(tmp_path: Path, queued_plan: HarnessPlan) -> None:
+    """A step orphaned in 'running' (killed worker) is claimable again after the lease."""
+    persist_dispatch_bundle(queued_plan, dispatch_dir=tmp_path)
+    step_id = str(next_dispatch_step("w-queued", dispatch_dir=tmp_path)["step"]["step_id"])
+    _backdate_running_step(tmp_path, "w-queued", step_id)
+
+    reclaimed = next_dispatch_step("w-queued", dispatch_dir=tmp_path)
+
+    assert reclaimed["ready"] is True
+    assert str(reclaimed["step"]["step_id"]) == step_id
+    record_dispatch_result("w-queued", step_id, result="done after reclaim", dispatch_dir=tmp_path)
+    steps = {str(step["step_id"]): step for step in load_dispatch_bundle("w-queued", dispatch_dir=tmp_path)["steps"]}
+    assert steps[step_id]["status"] == "succeeded"
+
+
+def test_fresh_running_step_is_not_reclaimed(tmp_path: Path, queued_plan: HarnessPlan) -> None:
+    persist_dispatch_bundle(queued_plan, dispatch_dir=tmp_path)
+    first = str(next_dispatch_step("w-queued", dispatch_dir=tmp_path)["step"]["step_id"])
+    second = str(next_dispatch_step("w-queued", dispatch_dir=tmp_path)["step"]["step_id"])
+    assert second != first
+
+
+def test_record_retryable_failure_requeues_step(tmp_path: Path, queued_plan: HarnessPlan) -> None:
+    persist_dispatch_bundle(queued_plan, dispatch_dir=tmp_path)
+    step_id = str(next_dispatch_step("w-queued", dispatch_dir=tmp_path)["step"]["step_id"])
+
+    recorded = record_dispatch_result(
+        "w-queued", step_id, error="worker crashed", succeeded=False, retryable=True, dispatch_dir=tmp_path
+    )
+
+    assert recorded["ok"] is True
+    assert recorded["status"] == "retry_wait"
+    assert recorded["synthesis_ready"] is False
+    retaken = next_dispatch_step("w-queued", dispatch_dir=tmp_path)
+    assert str(retaken["step"]["step_id"]) == step_id
 
 
 def test_next_reports_not_ready_when_nothing_queued(tmp_path: Path, queued_plan: HarnessPlan) -> None:
@@ -276,6 +324,7 @@ def test_work_id_traversal_is_neutralized(tmp_path: Path) -> None:
 def test_work_id_with_no_safe_chars_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(DispatchStoreError, match="empty"):
         load_dispatch_bundle("../..", dispatch_dir=tmp_path)
+
 
 from cluxion_runtime.core.types import ResourceSnapshot
 from cluxion_runtime.resources.queue_bridge import resolve_backend

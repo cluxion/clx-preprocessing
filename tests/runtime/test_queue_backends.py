@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
+from cluxion_runtime.core.dispatch_store import RUNNING_LEASE_SECONDS
 from cluxion_runtime.resources import queue_bridge
 
 _LOCAL_BIN = Path(__file__).resolve().parents[2] / "rust" / "cluxion_queue" / "target" / "release" / "cluxion-queue"
@@ -104,6 +107,68 @@ def test_dispatch_lifecycle(backend) -> None:
     assert brief["ready"] is True
     assert "done-1" in brief["briefing_prompt"]
     assert "done-2" in brief["briefing_prompt"]
+
+
+def _two_step_bundle(work_id: str) -> dict:
+    return {
+        "work_id": work_id,
+        "steps": [
+            {
+                "step_id": "s1",
+                "segment_id": "g1",
+                "checksum": "c1",
+                "token_estimate": 10,
+                "content": "one",
+                "status": "queued",
+                "result": "",
+                "error": "",
+            },
+            {
+                "step_id": "s2",
+                "segment_id": "g2",
+                "checksum": "c2",
+                "token_estimate": 12,
+                "content": "two",
+                "status": "queued",
+                "result": "",
+                "error": "",
+            },
+        ],
+    }
+
+
+def test_dispatch_stale_running_step_reclaimed(backend, tmp_path: Path) -> None:
+    """All backends must re-claim a 'running' step whose lease expired (killed worker)."""
+    queue_bridge.persist_dispatch_bundle("d-stale", _two_step_bundle("d-stale"))
+    assert queue_bridge.next_dispatch_step("d-stale")["step"]["step_id"] == "s1"
+
+    bundle_path = tmp_path / "queue" / "dispatch" / "d-stale.json"
+    stored = json.loads(bundle_path.read_text(encoding="utf-8"))
+    for step in stored["steps"]:
+        if step["step_id"] == "s1":
+            step["updated_at"] = time.time() - RUNNING_LEASE_SECONDS - 1
+    bundle_path.write_text(json.dumps(stored), encoding="utf-8")
+
+    reclaimed = queue_bridge.next_dispatch_step("d-stale")
+    assert reclaimed["ready"] is True
+    assert reclaimed["step"]["step_id"] == "s1"
+
+    fresh = queue_bridge.next_dispatch_step("d-stale")
+    assert fresh["step"]["step_id"] == "s2"  # freshly re-leased s1 must not be reclaimed
+
+
+def test_dispatch_retryable_failure_requeues_step(backend) -> None:
+    """failed+retryable parks the step in retry_wait so the next drain retries it."""
+    queue_bridge.persist_dispatch_bundle("d-retry", _two_step_bundle("d-retry"))
+    assert queue_bridge.next_dispatch_step("d-retry")["step"]["step_id"] == "s1"
+
+    rec = queue_bridge.record_dispatch_step("d-retry", "s1", error="worker crashed", failed=True, retryable=True)
+    assert rec["recorded"] is True
+    assert rec["status"] == "retry_wait"
+    assert rec["synthesis_ready"] is False
+
+    retaken = queue_bridge.next_dispatch_step("d-retry")
+    assert retaken["step"]["step_id"] == "s1"
 
 
 def test_missing_required_field_raises(backend) -> None:

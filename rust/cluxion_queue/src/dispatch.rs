@@ -8,6 +8,9 @@ use serde_json::{json, Value};
 
 use crate::types::{ok_payload, require_str, QueueError};
 
+/// Mirrors dispatch_store.RUNNING_LEASE_SECONDS and py_queue._RUNNING_LEASE_SECONDS.
+const RUNNING_LEASE_SECS: f64 = 600.0;
+
 pub fn persist_bundle(store_dir: &Path, payload: &Value) -> Result<Value, QueueError> {
     let work_id = require_str(payload, "work_id")?;
     let bundle = payload
@@ -31,6 +34,7 @@ pub fn next_step(store_dir: &Path, payload: &Value) -> Result<Value, QueueError>
     let dispatch_dir = dispatch_dir(store_dir);
     fs::create_dir_all(&dispatch_dir)?;
     let path = bundle_path(&dispatch_dir, work_id)?;
+    let now = now_secs();
     with_dispatch_lock(&dispatch_dir, || {
         let mut bundle = read_bundle(&path)?;
         let mut selected: Option<Value> = None;
@@ -38,7 +42,7 @@ pub fn next_step(store_dir: &Path, payload: &Value) -> Result<Value, QueueError>
             let steps = steps_mut(&mut bundle)?;
             for step in steps.iter_mut() {
                 let status = step.get("status").and_then(Value::as_str).unwrap_or("");
-                if status == "queued" || status == "retry_wait" {
+                if status == "queued" || status == "retry_wait" || stale_running(step, now) {
                     step["status"] = json!("running");
                     step["updated_at"] = json!(now_secs());
                     selected = Some(public_step(step));
@@ -77,6 +81,10 @@ pub fn record_step(store_dir: &Path, payload: &Value) -> Result<Value, QueueErro
         .get("failed")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let retryable = payload
+        .get("retryable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let dispatch_dir = dispatch_dir(store_dir);
     fs::create_dir_all(&dispatch_dir)?;
     let path = bundle_path(&dispatch_dir, work_id)?;
@@ -87,7 +95,15 @@ pub fn record_step(store_dir: &Path, payload: &Value) -> Result<Value, QueueErro
             let steps = steps_mut(&mut bundle)?;
             for step in steps.iter_mut() {
                 if step.get("step_id") == Some(&json!(step_id)) {
-                    step["status"] = json!(if failed { "failed" } else { "succeeded" });
+                    step["status"] = json!(if failed {
+                        if retryable {
+                            "retry_wait"
+                        } else {
+                            "failed"
+                        }
+                    } else {
+                        "succeeded"
+                    });
                     step["result"] = json!(result);
                     step["error"] = json!(error);
                     step["updated_at"] = json!(now_secs());
@@ -233,6 +249,17 @@ fn public_step(step: &Value) -> Value {
         "content": step.get("content").cloned().unwrap_or(json!("")),
         "instruction": "Process this segment with the current host model. Preserve checksum and do not claim checks were run unless they were run.",
     })
+}
+
+fn stale_running(step: &Value, now: f64) -> bool {
+    if step.get("status").and_then(Value::as_str) != Some("running") {
+        return false;
+    }
+    let updated_at = step
+        .get("updated_at")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    now - updated_at > RUNNING_LEASE_SECS
 }
 
 fn remaining_count(steps: &[Value]) -> i64 {

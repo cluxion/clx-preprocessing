@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from cluxion_runtime.cli import main
-from cluxion_runtime.core.dispatch_store import persist_dispatch_bundle
+from cluxion_runtime.core.dispatch_store import load_dispatch_bundle, persist_dispatch_bundle
 from cluxion_runtime.core.harness import build_harness_plan
 from cluxion_runtime.core.loop_auto import (
     HermesSegmentResult,
@@ -182,14 +182,42 @@ def test_run_loop_auto_marker_missing_fails_after_retry_cap(
         calls += 1
         return HermesSegmentResult(stdout="work output without marker", stderr="", returncode=0)
 
-    result = run_loop_auto(
-        LoopAutoOptions(work_id="w-loop-auto", segment_runner=runner, max_segment_retries=1)
-    )
+    result = run_loop_auto(LoopAutoOptions(work_id="w-loop-auto", segment_runner=runner, max_segment_retries=1))
 
     assert result.ok is False
     assert result.status == "segment_failed"
     assert result.error.endswith("missing completion marker after 2 attempts")
     assert calls == 2
+
+
+def test_run_loop_auto_runner_crash_releases_step_for_next_run(
+    tmp_path: Path, queued_plan, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash between queue-next and queue-record must not wedge the bundle."""
+    monkeypatch.setenv("CLUXION_PREPROCESS_DISPATCH_DIR", str(tmp_path))
+    persist_dispatch_bundle(queued_plan, dispatch_dir=tmp_path)
+
+    def crashing_runner(_: str) -> HermesSegmentResult:
+        raise RuntimeError("hermes worker crashed")
+
+    crashed = run_loop_auto(LoopAutoOptions(work_id="w-loop-auto", segment_runner=crashing_runner))
+
+    assert crashed.ok is False
+    assert crashed.status == "loop_error"
+    assert "hermes worker crashed" in crashed.error
+    steps = load_dispatch_bundle("w-loop-auto", dispatch_dir=tmp_path)["steps"]
+    statuses = [step["status"] for step in steps]
+    assert "running" not in statuses
+    assert statuses.count("retry_wait") == 1
+    released = next(step for step in steps if step["status"] == "retry_wait")
+    assert "hermes worker crashed" in str(released["error"])
+
+    recovered = run_loop_auto(LoopAutoOptions(work_id="w-loop-auto", dry_run=True))
+
+    assert recovered.ok is True
+    assert recovered.status in {"complete", "complete_unmarked"}
+    assert recovered.segments_processed == len(steps)
+    assert recovered.briefing_answer
 
 
 def test_run_loop_auto_iteration_cap_aborts(tmp_path: Path, queued_plan, monkeypatch: pytest.MonkeyPatch) -> None:

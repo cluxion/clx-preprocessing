@@ -197,67 +197,73 @@ def run_loop_auto(options: LoopAutoOptions) -> LoopAutoResult:
             iterations += 1
             step_id = str(step.get("step_id", ""))
             segment_id = str(step.get("segment_id", ""))
-            prompt = _build_segment_prompt(step, options.work_id)
-            attempts = 0
-            last_error = ""
-            segment_ok = False
-            result_text = ""
-            while attempts <= options.max_segment_retries and time.monotonic() < deadline:
-                attempts += 1
-                hermes_result = runner(prompt if attempts == 1 else _resume_segment_prompt(prompt, last_error))
-                if hermes_result.timed_out or hermes_result.returncode != 0:
-                    last_error = hermes_result.stderr or f"hermes exit {hermes_result.returncode}"
-                    continue
-                marker = _parse_segment_marker(hermes_result.stdout)
-                result_text = _strip_markers(hermes_result.stdout)
-                if marker == SEGMENT_COMPLETE_MARKER:
-                    segment_ok = True
-                    break
-                if marker and marker.startswith(WORK_REMAINS_PREFIX):
-                    last_error = marker.removeprefix(WORK_REMAINS_PREFIX).strip()
-                    prompt = _build_segment_prompt(step, options.work_id, remainder=last_error)
-                    continue
-                last_error = f"missing completion marker after {attempts} attempts"
-            if not segment_ok:
-                record_dispatch_result(
-                    options.work_id,
-                    step_id,
-                    result=result_text,
-                    error=last_error or "segment_failed",
-                    succeeded=False,
-                )
-                failed += 1
+            try:
+                prompt = _build_segment_prompt(step, options.work_id)
+                attempts = 0
+                last_error = ""
+                segment_ok = False
+                result_text = ""
+                while attempts <= options.max_segment_retries and time.monotonic() < deadline:
+                    attempts += 1
+                    hermes_result = runner(prompt if attempts == 1 else _resume_segment_prompt(prompt, last_error))
+                    if hermes_result.timed_out or hermes_result.returncode != 0:
+                        last_error = hermes_result.stderr or f"hermes exit {hermes_result.returncode}"
+                        continue
+                    marker = _parse_segment_marker(hermes_result.stdout)
+                    result_text = _strip_markers(hermes_result.stdout)
+                    if marker == SEGMENT_COMPLETE_MARKER:
+                        segment_ok = True
+                        break
+                    if marker and marker.startswith(WORK_REMAINS_PREFIX):
+                        last_error = marker.removeprefix(WORK_REMAINS_PREFIX).strip()
+                        prompt = _build_segment_prompt(step, options.work_id, remainder=last_error)
+                        continue
+                    last_error = f"missing completion marker after {attempts} attempts"
+                if not segment_ok:
+                    record_dispatch_result(
+                        options.work_id,
+                        step_id,
+                        result=result_text,
+                        error=last_error or "segment_failed",
+                        succeeded=False,
+                    )
+                    failed += 1
+                    records.append(
+                        LoopAutoStepRecord(
+                            step_id=step_id,
+                            segment_id=segment_id,
+                            status="failed",
+                            attempts=attempts,
+                            result_preview=_preview(result_text),
+                            error=last_error,
+                        )
+                    )
+                    return _finalize(
+                        options.work_id,
+                        status="segment_failed",
+                        records=records,
+                        processed=processed,
+                        failed=failed,
+                        briefing="",
+                        start=start,
+                        error=f"segment {step_id} failed: {last_error}",
+                    )
+                record_dispatch_result(options.work_id, step_id, result=result_text, succeeded=True)
+                processed += 1
                 records.append(
                     LoopAutoStepRecord(
                         step_id=step_id,
                         segment_id=segment_id,
-                        status="failed",
+                        status="succeeded",
                         attempts=attempts,
                         result_preview=_preview(result_text),
-                        error=last_error,
                     )
                 )
-                return _finalize(
-                    options.work_id,
-                    status="segment_failed",
-                    records=records,
-                    processed=processed,
-                    failed=failed,
-                    briefing="",
-                    start=start,
-                    error=f"segment {step_id} failed: {last_error}",
-                )
-            record_dispatch_result(options.work_id, step_id, result=result_text, succeeded=True)
-            processed += 1
-            records.append(
-                LoopAutoStepRecord(
-                    step_id=step_id,
-                    segment_id=segment_id,
-                    status="succeeded",
-                    attempts=attempts,
-                    result_preview=_preview(result_text),
-                )
-            )
+            except BaseException as exc:
+                # The step is marked 'running' on disk; without this release a
+                # crash here wedges the bundle for every subsequent run.
+                _release_crashed_step(options.work_id, step_id, exc)
+                raise
 
         brief = build_briefing_payload(options.work_id)
         if not brief.get("ready"):
@@ -301,6 +307,24 @@ def run_loop_auto(options: LoopAutoOptions) -> LoopAutoResult:
         return _fail(options.work_id, "dispatch_error", records, start, error=str(exc))
     except Exception as exc:
         return _fail(options.work_id, "loop_error", records, start, error=str(exc))
+
+
+def _release_crashed_step(work_id: str, step_id: str, exc: BaseException) -> None:
+    """Park a step whose worker crashed mid-flight in 'retry_wait' for the next run."""
+    if not step_id:
+        return
+    try:
+        record_dispatch_result(
+            work_id,
+            step_id,
+            error=f"loop_auto crashed mid-step: {exc}",
+            succeeded=False,
+            retryable=True,
+        )
+    except Exception:
+        # Best-effort: if the store itself is broken, the stale-running lease
+        # in next_dispatch_step reclaims the step instead.
+        pass
 
 
 def _preflight_error(options: LoopAutoOptions) -> str:
@@ -375,8 +399,7 @@ def _strip_markers(text: str) -> str:
     lines = [
         line
         for line in text.rstrip().splitlines()
-        if line.strip()
-        not in {SEGMENT_COMPLETE_MARKER, TASK_COMPLETE_MARKER}
+        if line.strip() not in {SEGMENT_COMPLETE_MARKER, TASK_COMPLETE_MARKER}
         and not line.strip().startswith(WORK_REMAINS_PREFIX)
     ]
     return "\n".join(lines).strip()
@@ -423,7 +446,9 @@ def _dry_run_runner(work_id: str) -> SegmentRunner:
     def run(prompt: str) -> HermesSegmentResult:
         counter["n"] += 1
         if "[cluxion_final_briefing]" in prompt or "[cluxion_loop_auto_briefing_contract]" in prompt:
-            return HermesSegmentResult(stdout=f"Dry-run briefing for {work_id}\n{TASK_COMPLETE_MARKER}\n", stderr="", returncode=0)
+            return HermesSegmentResult(
+                stdout=f"Dry-run briefing for {work_id}\n{TASK_COMPLETE_MARKER}\n", stderr="", returncode=0
+            )
         return HermesSegmentResult(
             stdout=f"Dry-run segment {counter['n']} for {work_id}\n{SEGMENT_COMPLETE_MARKER}\n",
             stderr="",

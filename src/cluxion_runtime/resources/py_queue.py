@@ -23,6 +23,9 @@ try:
 except ImportError:  # pragma: no cover - exercised only on non-POSIX platforms.
     _fcntl = None
 
+# Mirrors dispatch_store.RUNNING_LEASE_SECONDS and dispatch.rs RUNNING_LEASE_SECS.
+_RUNNING_LEASE_SECONDS = 600.0
+
 
 def run(command: str, payload: dict[str, Any]) -> dict[str, Any]:
     store_dir = Path(payload.get("store_dir") or _default_store())
@@ -244,14 +247,23 @@ def _public_step(step: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _stale_running(step: dict[str, Any], now: float) -> bool:
+    if step.get("status") != "running":
+        return False
+    updated = step.get("updated_at")
+    updated_at = float(updated) if isinstance(updated, (int, float)) else 0.0
+    return now - updated_at > _RUNNING_LEASE_SECONDS
+
+
 def _next_step(store_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
     work_id = _require_str(payload, "work_id")
     path = _bundle_path(store_dir, work_id)
+    now = time.time()
     with _exclusive_bundle_lock(path):
         bundle = _read_bundle(path)
         steps = _steps(bundle)
         for step in steps:
-            if step.get("status") in ("queued", "retry_wait"):
+            if step.get("status") in ("queued", "retry_wait") or _stale_running(step, now):
                 step["status"] = "running"
                 step["updated_at"] = time.time()
                 _write_atomic(path, bundle)
@@ -279,13 +291,14 @@ def _record_step(store_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
     work_id = _require_str(payload, "work_id")
     step_id = _require_str(payload, "step_id")
     failed = bool(payload.get("failed", False))
+    retryable = bool(payload.get("retryable", False))
     path = _bundle_path(store_dir, work_id)
     with _exclusive_bundle_lock(path):
         bundle = _read_bundle(path)
         steps = _steps(bundle)
         for step in steps:
             if step.get("step_id") == step_id:
-                step["status"] = "failed" if failed else "succeeded"
+                step["status"] = ("retry_wait" if retryable else "failed") if failed else "succeeded"
                 step["result"] = payload.get("result", "")
                 step["error"] = payload.get("error", "")
                 step["updated_at"] = time.time()

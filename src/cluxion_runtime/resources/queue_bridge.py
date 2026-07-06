@@ -90,6 +90,7 @@ def record_dispatch_step(
     result: str = "",
     error: str = "",
     failed: bool = False,
+    retryable: bool = False,
     store_dir: Path | None = None,
 ) -> dict[str, object]:
     return _invoke(
@@ -100,6 +101,7 @@ def record_dispatch_step(
             "result": result,
             "error": error,
             "failed": failed,
+            "retryable": retryable,
         },
         store_dir=store_dir,
     )
