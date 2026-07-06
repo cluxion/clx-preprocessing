@@ -136,7 +136,7 @@ def test_stage3_sets_dropped_without_backup_for_recoverable(monkeypatch) -> None
     monkeypatch.setattr("cluxion_runtime.core.hybrid_forget.forgetforge_available", lambda: False)
     messages = [
         _Msg("user", "intent", False),
-        _Msg("assistant", _long(3000), False),
+        _Msg("assistant", "recoverable discussion about the auth flow " * 80, False),
         _Msg("user", "recent", False),
     ]
     pinned = [0, 2]
@@ -144,6 +144,34 @@ def test_stage3_sets_dropped_without_backup_for_recoverable(monkeypatch) -> None
     result = apply_hybrid_forget(messages, pinned, total, 100)
     assert result.dropped_without_backup is True
     assert 1 in result.dropped_indices
+
+
+def test_stage3_skips_store_for_degenerate_payloads(monkeypatch) -> None:
+    """Single chars and pure-repeat padding must never reach the forgetforge store."""
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr("cluxion_runtime.core.hybrid_forget.forgetforge_available", lambda: True)
+    monkeypatch.setattr("cluxion_runtime.core.hybrid_forget.subprocess.run", fake_run)
+
+    real = "decision: keep the JWT auth path and revisit caching later"
+    messages = [
+        _Msg("user", "intent", False),
+        _Msg("assistant", "x" * 4000, False),
+        _Msg("assistant", "s", False),
+        _Msg("assistant", real, False),
+        _Msg("user", "recent", False),
+    ]
+    pinned = [0, 4]
+    total = sum(estimate_tokens(m.content) for m in messages)
+
+    result = apply_hybrid_forget(messages, pinned, total, 10)
+    assert {1, 2, 3} <= set(result.dropped_indices)
+    assert [cmd[4] for cmd in calls] == [real]
+    assert result.dropped_without_backup is False
 
 
 def test_stage3_drops_low_importance_until_target() -> None:
@@ -241,9 +269,7 @@ def test_hallucination_guard_strips_fabricated_port(monkeypatch) -> None:
     from cluxion_runtime.core import llm_compress
 
     source = "Connect to Redis on port 5433 for caching. File: recon_v4.py"
-    llm_json = (
-        '{"0": "Redis caching on port 5433. recon_v4.py. Hot: Redis:6390"}'
-    )
+    llm_json = '{"0": "Redis caching on port 5433. recon_v4.py. Hot: Redis:6390"}'
     monkeypatch.setattr(llm_compress, "hermes_available", lambda: True)
     monkeypatch.setattr(llm_compress, "_call_hermes_oneshot", lambda *a, **k: llm_json)
 

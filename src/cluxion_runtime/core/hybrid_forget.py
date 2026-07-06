@@ -20,6 +20,7 @@ from cluxion_runtime.core.preprocess import estimate_tokens
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+
 def _resolve_bin(name: str) -> str:
     candidate = os.path.join(os.path.dirname(sys.executable), name)
     if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
@@ -121,7 +122,7 @@ def apply_hybrid_forget(
             break
         msg = messages[idx]
         tokens = estimate_tokens(msg.content)
-        if not _is_true_junk(msg.content):
+        if not _is_true_junk(msg.content) and not _is_degenerate(msg.content):
             backed_up = _cold_demote(msg.content, f"{prefix}-{uuid.uuid4().hex[:12]}")
             if not backed_up:
                 dropped_without_backup = True
@@ -149,9 +150,7 @@ def _importance_score(idx: int, msg: _MessageLike, total: int) -> float:
     lowered = content.lower()
     if any(kw in lowered for kw in _IMPORTANCE_KEYWORDS):
         score += 25.0
-    if re.search(r"/[\w./-]+", content) or re.search(
-        r"\b[\w.-]+\.(py|rs|ts|js|md|yaml|yml|toml)\b", content
-    ):
+    if re.search(r"/[\w./-]+", content) or re.search(r"\b[\w.-]+\.(py|rs|ts|js|md|yaml|yml|toml)\b", content):
         score += 20.0
     if _is_true_junk(content):
         score -= 60.0
@@ -165,6 +164,18 @@ def _is_true_junk(content: str) -> bool:
     if not stripped:
         return True
     return any(marker in stripped for marker in _JUNK_MARKERS)
+
+
+def _is_degenerate(content: str) -> bool:
+    """Degenerate payloads (stray chars, pure-repeat padding) never earn a cold store.
+
+    Kept separate from _is_true_junk so importance scoring (which penalizes
+    junk by -60) and drop ordering stay unchanged; this only gates the store.
+    """
+    stripped = content.strip()
+    # ponytail: floor of 16 chars + single-repeated-char check; real cold
+    # context is always multi-word. Raise the floor if it ever under-filters.
+    return len(stripped) < 16 or len(set(stripped)) <= 1
 
 
 def _cold_demote(content: str, store_id: str) -> bool:

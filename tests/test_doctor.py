@@ -156,6 +156,30 @@ def test_real_failure_mode_probes_present():
         assert statuses[key] in ("pass", "warn", "fail", "skip")
 
 
+def test_version_files_synced_skips_foreign_pyproject(tmp_path: Path):
+    # regression: doctor run from another python project's cwd compared that
+    # project's version against installed metadata and false-failed
+    from cluxion_agentplugin_preprocessing.doctor.framework import DoctorContext
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "some-other-package"\nversion = "0.2.31"\n',
+        encoding="utf-8",
+    )
+    ctx = DoctorContext(cwd=tmp_path, hermes_bin="hermes", run=lambda cmd: None)
+    status, detail = PROBES["version_files_synced"](ctx)
+    assert status == "skip"
+    assert detail == "repo files not present"
+
+
+def test_version_files_synced_passes_from_repo_root():
+    from cluxion_agentplugin_preprocessing.doctor.framework import DoctorContext
+
+    repo_root = Path(__file__).resolve().parents[1]
+    ctx = DoctorContext(cwd=repo_root, hermes_bin="hermes", run=lambda cmd: None)
+    status, detail = PROBES["version_files_synced"](ctx)
+    assert status == "pass", detail
+
+
 def test_probe_exception_becomes_fail():
     def bad_probe(ctx):
         raise RuntimeError("boom")

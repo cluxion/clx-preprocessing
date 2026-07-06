@@ -447,7 +447,12 @@ def version_files_synced(ctx: DoctorContext) -> tuple[str, str]:
         pyproject_path = ctx.cwd / "pyproject.toml"
         if not pyproject_path.exists():
             return "skip", "repo files not present"
-        version = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))["project"]["version"]
+        pyproject = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+        # A foreign project's pyproject.toml in cwd is not this repo; only the
+        # preprocessing repo itself can be checked for version drift.
+        if pyproject.get("project", {}).get("name") != "cluxion-agentplugin-preprocessing":
+            return "skip", "repo files not present"
+        version = pyproject["project"]["version"]
         paths = {
             "plugin.yaml": ctx.cwd / "plugin.yaml",
             "package plugin.yaml": ctx.cwd / "src" / "cluxion_agentplugin_preprocessing" / "plugin.yaml",
