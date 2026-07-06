@@ -75,7 +75,7 @@ Do not use a `[plugins.<name>] command = [...]` block; Codex plugins are marketp
 ### Claude Code plugin install
 
 Install the same repo as a Claude Code plugin from the root `.claude-plugin/plugin.json`, then use
-the `cluxion-preprocess` skill or commands. The commands call `cluxion-runtime` and do not own model execution.
+the `preprocess` skill or commands. The commands call `cluxion-runtime` and do not own model execution.
 
 ## CLI
 
