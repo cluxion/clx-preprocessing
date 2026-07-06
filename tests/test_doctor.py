@@ -1,5 +1,6 @@
 """Tests for embedded doctor (determinism + cross-cutting checks)."""
 
+import concurrent.futures
 import json
 import subprocess
 import sys
@@ -170,11 +171,33 @@ def test_probe_exception_becomes_fail():
     assert statuses["hermes_on_path"] == "fail"
 
 
+def _writable_probes_failures(_: int) -> list:
+    # runs in a child process: concurrent doctors race on the shared data dirs
+    from cluxion_agentplugin_preprocessing.doctor.probes import PROBES
+
+    failures = []
+    for _round in range(25):
+        for probe_id in ("queue_store_dir_writable", "dispatch_dir_writable"):
+            status, detail = PROBES[probe_id](None)
+            if status != "pass":
+                failures.append((probe_id, status, detail))
+    return failures
+
+
+def test_writable_probes_survive_concurrent_doctors(tmp_path: Path, monkeypatch):
+    # regression: fixed '.doctor-probe' filename made 8 parallel doctors race
+    # on write/read/unlink (ENOENT + roundtrip mismatch)
+    monkeypatch.setenv("CLUXION_QUEUE_STORE_DIR", str(tmp_path / "queue"))
+    monkeypatch.setenv("CLUXION_PREPROCESS_DISPATCH_DIR", str(tmp_path / "dispatch"))
+    with concurrent.futures.ProcessPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(_writable_probes_failures, range(8)))
+    assert all(not failures for failures in results), results
+
+
 def test_warn_only_is_ok():
     # construct a result with only warn (no fail)
     from cluxion_agentplugin_preprocessing.doctor.framework import CheckResult, DoctorResult
-    checks = (
-        CheckResult(check_id="x", category="c", severity="medium", status="warn", detail="w"),
-    )
+
+    checks = (CheckResult(check_id="x", category="c", severity="medium", status="warn", detail="w"),)
     r = DoctorResult(plugin="p", version="0.3.7", checks=checks)
     assert r.ok is True

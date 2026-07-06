@@ -63,7 +63,9 @@ def entry_point_registered(ctx: DoctorContext) -> tuple[str, str]:
     try:
         eps = importlib.metadata.entry_points(group="hermes_agent.plugins")
         for ep in eps:
-            if "cluxion-agentplugin-preprocessing" in (ep.name or "").lower() or "cluxion_agentplugin_preprocessing" in (ep.value or ""):
+            if "cluxion-agentplugin-preprocessing" in (
+                ep.name or ""
+            ).lower() or "cluxion_agentplugin_preprocessing" in (ep.value or ""):
                 mod = ep.load()
                 if hasattr(mod, "register") and callable(mod.register):
                     return "pass", ep.value or str(ep)
@@ -132,6 +134,7 @@ def native_module_importable(ctx: DoctorContext) -> tuple[str, str]:
 def queue_backend_resolvable(ctx: DoctorContext) -> tuple[str, str]:
     try:
         from cluxion_runtime.resources import queue_bridge
+
         backend = queue_bridge.resolve_backend()
         if backend in ("native", "subprocess", "python"):
             return "pass", backend
@@ -144,12 +147,15 @@ def queue_backend_resolvable(ctx: DoctorContext) -> tuple[str, str]:
 def queue_store_dir_writable(ctx: DoctorContext) -> tuple[str, str]:
     try:
         from cluxion_runtime.resources import queue_bridge
+
         store = queue_bridge.default_store_dir()
         store.mkdir(parents=True, exist_ok=True)
-        probe = store / ".doctor-probe"
+        # per-process probe name: concurrent doctors share this dir and would
+        # race on a fixed filename (write/read/unlink interleaving)
+        probe = store / f".doctor-probe-{os.getpid()}"
         probe.write_text("ok")
         readback = probe.read_text()
-        probe.unlink()
+        probe.unlink(missing_ok=True)
         if readback == "ok":
             return "pass", str(store)
         return "fail", "roundtrip mismatch"
@@ -163,12 +169,14 @@ def queue_store_dir_writable(ctx: DoctorContext) -> tuple[str, str]:
 def dispatch_dir_writable(ctx: DoctorContext) -> tuple[str, str]:
     try:
         from cluxion_runtime.core.dispatch_store import default_dispatch_dir
+
         d = default_dispatch_dir()
         d.mkdir(parents=True, exist_ok=True)
-        probe = d / ".doctor-probe"
+        # per-process probe name: same race as queue_store_dir_writable
+        probe = d / f".doctor-probe-{os.getpid()}"
         probe.write_text("ok")
         readback = probe.read_text()
-        probe.unlink()
+        probe.unlink(missing_ok=True)
         if readback == "ok":
             return "pass", str(d)
         return "fail", "roundtrip mismatch"
@@ -250,8 +258,10 @@ def guard_state_not_stale(ctx: DoctorContext) -> tuple[str, str]:
 def handler_exception_coverage(ctx: DoctorContext) -> tuple[str, str]:
     try:
         from cluxion_agentplugin_preprocessing.plugin import _json_result
+
         def bad_cb():
             raise TypeError("test TypeError for coverage")
+
         result = _json_result(bad_cb)
         if isinstance(result, str) and "ok" in result and "false" in result.lower():
             return "pass", "degraded to error JSON"
@@ -263,6 +273,7 @@ def handler_exception_coverage(ctx: DoctorContext) -> tuple[str, str]:
 def _safe_read_hermes_config():
     try:
         import yaml
+
         cfg_path = os.path.expanduser("~/.hermes/config.yaml")
         if not os.path.exists(cfg_path):
             return None, "absent"
@@ -277,6 +288,7 @@ def _safe_read_hermes_config():
 def psutil_importable(ctx: DoctorContext) -> tuple[str, str]:
     try:
         import psutil
+
         _ = psutil.virtual_memory()
         return "pass", "importable"
     except ImportError:
@@ -289,6 +301,7 @@ def psutil_importable(ctx: DoctorContext) -> tuple[str, str]:
 def pyyaml_importable(ctx: DoctorContext) -> tuple[str, str]:
     try:
         import yaml
+
         yaml.safe_load("test: 1")
         return "pass", "importable"
     except ImportError:
@@ -303,6 +316,7 @@ def fcntl_available_on_posix(ctx: DoctorContext) -> tuple[str, str]:
         return "skip", "non-POSIX (Windows)"
     try:
         import fcntl
+
         # real check: lock a temp file
         with tempfile.NamedTemporaryFile(delete=False) as tf:
             tf_path = tf.name
