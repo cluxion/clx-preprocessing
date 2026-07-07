@@ -43,20 +43,20 @@ def _epoch_ms() -> int:
 
 def _scan_process_fields() -> ProcessScanCache:
     zombie_pids: list[int] = []
-    count = 0
     rows = _process_status_rows()
     if rows is None:
-        # The psutil fallback iterates every process; on loaded hosts that can
-        # stall the daemon loop, so it runs under a hard time budget and
-        # reports a partial (fail-closed: partial scan never triggers kills).
+        # ps down: count = len(pids) (never 0 on a live host); budget ONLY the
+        # zombie walk. Old process_iter(["status"]) front-loaded status onto a
+        # slow first yield -> whole scan exceeded budget -> count collapsed to 0.
+        pids = psutil.pids()
+        count = len(pids)
         deadline = time.monotonic() + _FALLBACK_SCAN_BUDGET_S
-        for proc in psutil.process_iter(["status"]):
+        for pid in pids:
             if time.monotonic() > deadline:
                 break
-            count += 1
             try:
-                if proc.info["status"] == psutil.STATUS_ZOMBIE:
-                    zombie_pids.append(proc.pid)
+                if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+                    zombie_pids.append(pid)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
     else:
