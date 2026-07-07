@@ -6,9 +6,17 @@ from cluxion_runtime.adapters.contract import render_adapter_manifest, work_item
 from cluxion_runtime.core.types import AgentSurface, WorkPriority
 
 
-def test_empty_prompt_rejected() -> None:
-    with pytest.raises(ValueError, match="prompt"):
-        work_item_from_adapter_payload({"prompt": "   "}, default_surface=AgentSurface.HERMES)
+def test_prompt_must_be_a_non_empty_string() -> None:
+    for payload in ({"prompt": None}, {"prompt": 123}):
+        with pytest.raises(ValueError, match=r"prompt must be a string\."):
+            work_item_from_adapter_payload(payload, default_surface=AgentSurface.HERMES)
+
+    for payload in ({"prompt": "   "}, {}):
+        with pytest.raises(ValueError, match=r"prompt must not be empty\."):
+            work_item_from_adapter_payload(payload, default_surface=AgentSurface.HERMES)
+
+    item = work_item_from_adapter_payload({"prompt": "hi"}, default_surface=AgentSurface.HERMES)
+    assert item.prompt == "hi"
 
 
 def test_missing_work_id_gets_stable_hash_id() -> None:

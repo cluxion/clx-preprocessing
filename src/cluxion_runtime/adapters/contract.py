@@ -13,7 +13,10 @@ if TYPE_CHECKING:
 
 def work_item_from_adapter_payload(payload: Mapping[str, object], *, default_surface: AgentSurface) -> WorkItem:
     """Convert an external wrapper JSON payload into a WorkItem."""
-    prompt = str(payload.get("prompt", "")).strip()
+    raw = payload.get("prompt", "")
+    if not isinstance(raw, str):
+        raise ValueError("prompt must be a string.")
+    prompt = raw.strip()
     if not prompt:
         raise ValueError("prompt must not be empty.")
     work_id = str(payload.get("work_id", "")) or _stable_work_id(prompt)
