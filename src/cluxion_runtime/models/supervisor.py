@@ -85,7 +85,7 @@ class LocalModelSupervisor:
             return SupervisorStartResult(False, 0, "empty_command")
         try:
             self._process = self._process_factory(self._profile.command, self._cwd, self._env)
-        except (FileNotFoundError, PermissionError) as exc:
+        except OSError as exc:
             return SupervisorStartResult(False, 0, f"binary_not_found:{exc}")
         return SupervisorStartResult(True, self._process.pid, "started")
 

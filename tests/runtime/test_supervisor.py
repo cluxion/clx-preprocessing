@@ -144,6 +144,15 @@ def test_start_reports_binary_not_found_on_permission_error() -> None:
     assert result.reason.startswith("binary_not_found:")
 
 
+def test_start_reports_binary_not_found_on_exec_format_error() -> None:
+    def bad_format(*_: object) -> FakeProcess:
+        raise OSError(8, "Exec format error")
+
+    result = LocalModelSupervisor(_profile(), process_factory=bad_format).start()
+    assert result.started is False
+    assert result.reason.startswith("binary_not_found:")
+
+
 def test_default_factory_missing_binary_returns_clean_result(tmp_path: Path) -> None:
     missing = tmp_path / "vllm-mlx"
     result = LocalModelSupervisor(_profile(command=(str(missing), "serve", "demo"))).start()
