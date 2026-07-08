@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import subprocess
@@ -167,6 +168,21 @@ def _has_markers(path: Path, *markers: str) -> bool:
     return all(marker in text for marker in markers)
 
 
+def _atomic_write(path: Path, text: str) -> None:
+    # Write in the same directory, fsync, then atomically replace the target.
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 def _plugins_applied(root: Path) -> bool:
     return _has_markers(root / "hermes_cli" / "plugins.py", 'deliver: str = "output"', '"deliver": deliver_mode')
 
@@ -301,7 +317,7 @@ def _patch_plugins_py(root: Path) -> bool:
         1,
     )
     text = text.replace(old, new, 1)
-    path.write_text(text, encoding="utf-8")
+    _atomic_write(path, text)
     return True
 
 
@@ -344,7 +360,7 @@ def _patch_cli_py(root: Path) -> bool:
     if old not in text:
         return False
     _backup(path)
-    path.write_text(text.replace(old, new, 1), encoding="utf-8")
+    _atomic_write(path, text.replace(old, new, 1))
     return True
 
 
@@ -400,7 +416,7 @@ def _patch_tui_gateway(root: Path) -> bool:
             text = text.replace(old, new, 1)
             changed = True
     if changed:
-        path.write_text(text, encoding="utf-8")
+        _atomic_write(path, text)
     return changed
 
 
