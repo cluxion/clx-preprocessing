@@ -6,6 +6,11 @@ from typing import TYPE_CHECKING
 import yaml
 
 from cluxion_agentplugin_preprocessing import cli, hermes_config
+from cluxion_runtime.adapters.hermes import (
+    build_hermes_local_endpoint_patch,
+    hermes_config_patch_to_dict,
+    hermes_config_set_commands,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -66,3 +71,22 @@ def test_cli_enable_reports_json(tmp_path: Path, capsys) -> None:
     assert payload["ok"] is True
     assert payload["enabled"] is True
     assert payload["changed"] is True
+
+
+def test_hermes_config_set_commands_include_provider_model_context_length() -> None:
+    patch = build_hermes_local_endpoint_patch(
+        "local-128k",
+        "http://127.0.0.1:8787/v1",
+        context_length=200000,
+    )
+
+    assert (
+        "hermes config set providers.cluxion-local.models.local-128k.context_length 200000"
+        in hermes_config_set_commands(patch)
+    )
+    assert (
+        hermes_config_patch_to_dict(patch)["providers"]["cluxion-local"]["models"][
+            "local-128k"
+        ]["context_length"]
+        == 200000
+    )

@@ -1,6 +1,6 @@
 {
   "name": "cluxion-agentplugin-preprocessing",
-  "version": "0.3.45",
+  "version": "0.3.46",
   "description": "Cluxion preprocessing: honesty, clarification, durable work queue, loop_auto, doctor, and resource guard contracts.",
   "author": {
     "name": "cluxion"

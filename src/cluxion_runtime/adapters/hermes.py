@@ -120,6 +120,7 @@ def hermes_config_set_commands(patch: HermesLocalEndpointPatch) -> tuple[str, ..
         f"hermes config set {root}.default_model {_shell_quote(patch.model)}",
         f"hermes config set {root}.transport {patch.transport}",
         f"hermes config set {root}.discover_models true",
+        f"hermes config set {root}.models.{patch.model}.context_length {patch.context_length}",
         f"hermes config set model.provider {_shell_quote(patch.provider_id)}",
         f"hermes config set model.default {_shell_quote(patch.model)}",
         f"hermes config set model.base_url {_shell_quote(patch.base_url)}",
