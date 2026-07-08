@@ -418,6 +418,8 @@ def hermes_plugin_enabled(ctx: DoctorContext) -> tuple[str, str]:
                 return "pass", f"{n} in enabled"
         if any(n in enabled for n in names):
             return "warn", "present but also disabled; fix: remove it from plugins.disabled"
+        if any(n in disabled for n in names):
+            return "skip", "explicitly disabled via cluxion-preprocess disable (deliberate opt-out)"
         return "fail", "not in plugins.enabled; fix: run cluxion-preprocess enable"
     except Exception as e:
         return "skip", f"uncertainty: {type(e).__name__}"
