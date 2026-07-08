@@ -365,18 +365,27 @@ def _segments_for(
 
 
 def _split_segments(text: str, max_chars: int, max_tokens: int) -> list[QueueSegment]:
-    segments: list[QueueSegment] = []
+    return [
+        _segment(f"seg_{index:03d}", content, start, end)
+        for index, (content, start, end) in enumerate(_collect_segment_ranges(text, max_chars, max_tokens, 0))
+    ]
+
+
+def _collect_segment_ranges(text: str, max_chars: int, max_tokens: int, origin: int) -> list[tuple[str, int, int]]:
+    segments: list[tuple[str, int, int]] = []
     start = 0
     while start < len(text):
         end = min(len(text), start + max_chars)
         boundary = _find_boundary(text, start, end)
-        chunk = text[start:boundary].strip()
+        raw_chunk = text[start:boundary]
+        chunk = raw_chunk.strip()
         if chunk:
-            segment = _segment(f"seg_{len(segments):03d}", chunk, start, boundary)
-            if segment.token_estimate > max_tokens and max_chars > 1_024:
-                segments.extend(_split_segments(chunk, max(1_024, max_chars // 2), max_tokens))
+            orig_start = origin + start + (len(raw_chunk) - len(raw_chunk.lstrip()))
+            orig_end = orig_start + len(chunk)
+            if estimate_tokens(chunk) > max_tokens and max_chars > 1_024:
+                segments.extend(_collect_segment_ranges(chunk, max(1_024, max_chars // 2), max_tokens, orig_start))
             else:
-                segments.append(segment)
+                segments.append((chunk, orig_start, orig_end))
         start = max(boundary, start + 1)
     return segments
 

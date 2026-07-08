@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from cluxion_runtime.adapters.contract import render_adapter_manifest, work_item_from_adapter_payload
+from cluxion_runtime.core.preprocess import _split_segments
 from cluxion_runtime.core.types import AgentSurface, WorkPriority
 
 
@@ -90,3 +91,15 @@ def test_manifest_targets_plan_cli_for_surface() -> None:
     assert manifest["surface"] == "hermes"
     assert manifest["command"] == ["cluxion-runtime", "plan", "--json-stdin", "--surface", "hermes"]
     assert "prompt" in manifest["input_schema"]["required"]
+
+
+def test_recursive_split_segments_have_unique_ids_and_original_offsets() -> None:
+    text = "   " + ("가나다라마바사아자차카타파하" * 260)
+
+    segments = _split_segments(text, max_chars=2048, max_tokens=100)
+
+    assert [segment.segment_id for segment in segments] == [f"seg_{index:03d}" for index in range(len(segments))]
+    assert [segment.char_start for segment in segments] == sorted(segment.char_start for segment in segments)
+    assert segments[0].char_start == 3
+    assert segments[-1].char_end == len(text)
+    assert all(segment.content == text[segment.char_start : segment.char_end] for segment in segments)
