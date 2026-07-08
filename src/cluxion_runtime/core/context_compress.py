@@ -250,7 +250,8 @@ def _apply_head_tail_truncate(content: str) -> str | None:
     elided = len(content) - TRUNCATE_HEAD_CHARS - TRUNCATE_TAIL_CHARS
     head = content[:TRUNCATE_HEAD_CHARS]
     tail = content[len(content) - TRUNCATE_TAIL_CHARS :]
-    return f"{head}\n[...cluxion: {elided} chars elided...]\n{tail}"
+    result = f"{head}\n[...cluxion: {elided} chars elided...]\n{tail}"
+    return None if len(result) >= len(content) else result
 
 
 def _stage_truncate(messages: list[_Msg], pinned: list[int], total: int, target: int) -> tuple[int, bool]:
