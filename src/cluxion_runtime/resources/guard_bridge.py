@@ -46,6 +46,13 @@ DEFAULT_RAM_FLOOR_MB = 1024
 _CPU_WINDOW_SECONDS = 0.1
 
 
+def _int_or_default(value: object, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def sample(payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """One full system sample (RAM/swap/CPU/zombies)."""
     body = dict(payload or {})
@@ -226,7 +233,7 @@ def auto_enforce(
         return {"ok": False, "triggered": False, "error": "daemon_state_stale", "dry_run": dry_run}
     window = state.get("window")
     window = window if isinstance(window, dict) else {}
-    samples = int(window.get("samples", 0))
+    samples = _int_or_default(window.get("samples", 0), 0)
     summary: dict[str, Any] = {
         "samples": samples,
         "cpu_avg": window.get("cpu_avg"),
@@ -317,7 +324,7 @@ def read_daemon_state(*, store_dir: Path | str | None = None) -> dict[str, Any] 
         return None
     if not isinstance(state, dict):
         return None
-    updated = int(state.get("updated_at_ms", 0))
+    updated = _int_or_default(state.get("updated_at_ms", 0), 0)
     state["stale"] = (int(time.time() * 1000) - updated) > STALE_AFTER_MS
     return state
 
