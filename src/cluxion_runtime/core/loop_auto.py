@@ -164,6 +164,9 @@ def run_loop_auto(options: LoopAutoOptions) -> LoopAutoResult:
         previous_state: tuple[object, ...] | None = None
         iterations = 0
         while time.monotonic() < deadline:
+            step_payload = next_dispatch_step(options.work_id)
+            if not step_payload.get("ready"):
+                break
             if iterations >= options.max_iterations:
                 return _finalize(
                     options.work_id,
@@ -175,9 +178,6 @@ def run_loop_auto(options: LoopAutoOptions) -> LoopAutoResult:
                     start=start,
                     error=f"loop_auto exceeded max_iterations={options.max_iterations}",
                 )
-            step_payload = next_dispatch_step(options.work_id)
-            if not step_payload.get("ready"):
-                break
             step = step_payload.get("step")
             if not isinstance(step, dict):
                 return _fail(options.work_id, "invalid_step_payload", records, start, error="invalid step payload")
