@@ -215,7 +215,10 @@ def _is_engine_nav_link(href: str, engine: str) -> bool:
 
 
 def _is_valid_http_url(url: str) -> bool:
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
@@ -295,22 +298,27 @@ def _get_page() -> tuple[Any | None, str | None]:
         return None, None
 
     mode = str(session["browser_mode"])
-    browser = _session.get("browser")
-    if browser is not None:
-        contexts = browser.contexts
-        if contexts:
-            context = contexts[0]
+    try:
+        browser = _session.get("browser")
+        if browser is not None:
+            contexts = browser.contexts
+            if contexts:
+                context = contexts[0]
+                if context.pages:
+                    return context.pages[0], mode
+                return context.new_page(), mode
+            context = browser.new_context()
+            return context.new_page(), mode
+
+        context = _session.get("context")
+        if context is not None:
             if context.pages:
                 return context.pages[0], mode
             return context.new_page(), mode
-        context = browser.new_context()
-        return context.new_page(), mode
-
-    context = _session.get("context")
-    if context is not None:
-        if context.pages:
-            return context.pages[0], mode
-        return context.new_page(), mode
+    except Exception:
+        # Cached session whose browser/CDP link died: reset so the next call reconnects.
+        _close_session()
+        return None, None
 
     return None, mode
 
