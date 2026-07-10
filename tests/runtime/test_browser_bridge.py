@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import os
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -171,6 +172,52 @@ def test_shape_page_skips_engine_navigation_links() -> None:
         {"text": "Result", "href": "https://www.google.com/url?q=https://example.com"},
         {"text": "External", "href": "https://example.com/doc"},
     ]
+
+
+def test_cdp_operation_uses_and_closes_only_a_new_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    def page(url: str) -> MagicMock:
+        fake = MagicMock()
+        fake.url = url
+        fake.title.return_value = "Title"
+        fake.evaluate.side_effect = ["Body", []]
+        return fake
+
+    user_page = page("https://example.com/user-work")
+    bridge_pages = [page("https://example.com/bridge"), page("https://example.com/bridge-again")]
+    context = MagicMock()
+    context.pages = [user_page]
+    context.new_page.side_effect = bridge_pages
+    browser = MagicMock()
+    browser.contexts = [context]
+    monkeypatch.setattr(browser_bridge, "_import_playwright", lambda: object())
+    monkeypatch.setattr(browser_bridge.time, "sleep", lambda _: None)
+    monkeypatch.setitem(browser_bridge._session, "playwright", MagicMock())
+    monkeypatch.setitem(browser_bridge._session, "browser", browser)
+    monkeypatch.setitem(browser_bridge._session, "context", None)
+    monkeypatch.setitem(browser_bridge._session, "mode", "cdp")
+
+    result = browser_bridge.open_url("https://example.com/bridge")
+
+    assert result["ok"] is True
+    assert user_page.url == "https://example.com/user-work"
+    user_page.goto.assert_not_called()
+    user_page.close.assert_not_called()
+    bridge_pages[0].goto.assert_called_once_with(
+        "https://example.com/bridge", wait_until="domcontentloaded", timeout=browser_bridge._NAVIGATE_TIMEOUT_MS
+    )
+    bridge_pages[0].close.assert_called_once_with()
+    context.close.assert_not_called()
+    browser.close.assert_not_called()
+
+    second_result = browser_bridge.open_url("https://example.com/bridge-again")
+    assert second_result["ok"] is True
+    assert context.new_page.call_count == 2
+    bridge_pages[1].close.assert_called_once_with()
+
+    browser_bridge._close_session()
+    user_page.close.assert_not_called()
+    context.close.assert_not_called()
+    browser.close.assert_not_called()
 
 
 @pytest.mark.skipif(

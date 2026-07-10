@@ -303,12 +303,8 @@ def _get_page() -> tuple[Any | None, str | None]:
         if browser is not None:
             contexts = browser.contexts
             if contexts:
-                context = contexts[0]
-                if context.pages:
-                    return context.pages[0], mode
-                return context.new_page(), mode
-            context = browser.new_context()
-            return context.new_page(), mode
+                return contexts[0].new_page(), mode
+            return None, mode
 
         context = _session.get("context")
         if context is not None:
@@ -344,6 +340,9 @@ def _with_page(callback: Any) -> dict[str, Any]:
         return _browser_unreachable(mode)
     except Exception:
         return _browser_unreachable(mode)
+    finally:
+        with contextlib.suppress(Exception):
+            page.close()
 
 
 def _navigate_and_extract(
@@ -392,11 +391,12 @@ def _close_session() -> None:
     context = _session.get("context")
     browser = _session.get("browser")
     playwright = _session.get("playwright")
+    owns_browser = _session.get("mode") != "cdp"
 
-    if context is not None:
+    if owns_browser and context is not None:
         with contextlib.suppress(Exception):
             context.close()
-    if browser is not None:
+    if owns_browser and browser is not None:
         with contextlib.suppress(Exception):
             browser.close()
     if playwright is not None:
