@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -236,7 +237,7 @@ def _run_loop_auto(args: argparse.Namespace) -> int:
             cwd=Path(cwd_raw).expanduser() if cwd_raw else Path.cwd(),
             hermes_bin=str(payload.get("hermes_bin", args.hermes_bin)),
             model=str(payload.get("model", args.model)),
-            timeout_seconds=_non_negative_float(
+            timeout_seconds=_positive_float(
                 "timeout_seconds", payload.get("timeout_seconds", args.timeout_seconds)
             ),
             max_segment_retries=_non_negative_int(
@@ -535,6 +536,39 @@ def _print_payload_error(exc: PayloadError) -> int:
     return exc.exit_code
 
 
+# Maximum nesting depth for JSON dict/list containers accepted on stdin.
+# CPython 3.14+ can parse very deep documents without RecursionError; cap
+# container depth explicitly so adversarial payloads stay structured errors.
+MAX_JSON_CONTAINER_DEPTH = 128
+
+
+def _ensure_json_container_depth(
+    value: object,
+    *,
+    max_depth: int = MAX_JSON_CONTAINER_DEPTH,
+) -> None:
+    """Reject dict/list nesting deeper than max_depth (iterative stack walk).
+
+    Only dict and list nodes count toward depth; scalars are ignored. Uses an
+    explicit stack so this never depends on the interpreter recursion limit.
+    """
+    stack: list[tuple[object, int]] = [(value, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if not isinstance(node, (dict, list)):
+            continue
+        if depth > max_depth:
+            raise PayloadError(
+                "stdin JSON nesting too deep",
+                "reduce the nesting depth of the JSON payload",
+            )
+        child_depth = depth + 1
+        children = node.values() if isinstance(node, dict) else node
+        for child in children:
+            if isinstance(child, (dict, list)):
+                stack.append((child, child_depth))
+
+
 def _payload_from_stdin() -> dict[str, object]:
     raw = sys.stdin.read()
     try:
@@ -545,10 +579,12 @@ def _payload_from_stdin() -> dict[str, object]:
             'pipe a JSON object, e.g. echo \'{"prompt": "..."}\' | cluxion-runtime plan --json-stdin',
         ) from exc
     except RecursionError as exc:
+        # Older interpreters (e.g. 3.12) may fail inside json.loads first.
         raise PayloadError(
             "stdin JSON nesting too deep",
             "reduce the nesting depth of the JSON payload",
         ) from exc
+    _ensure_json_container_depth(payload)
     if not isinstance(payload, dict):
         raise PayloadError("stdin JSON must be an object.", "wrap the payload in {...}")
     return dict(payload)
@@ -593,10 +629,32 @@ def _non_negative_float(name: str, value: object) -> float:
             f"{name} must be a number, got {value!r}",
             f"pass a non-negative number for {name} (0 = unspecified)",
         ) from exc
+    if not math.isfinite(parsed):
+        raise PayloadError(
+            f"{name} must be a finite number, got {value!r}",
+            f"pass a non-negative finite number for {name} (0 = unspecified)",
+        )
     if parsed < 0:
         raise PayloadError(
             f"{name} must be >= 0, got {parsed:g}",
             f"pass a non-negative number for {name} (0 = unspecified)",
+        )
+    return parsed
+
+
+def _positive_float(name: str, value: object) -> float:
+    """Finite float strictly greater than zero (timeouts)."""
+    try:
+        parsed = float(str(value))
+    except (TypeError, ValueError) as exc:
+        raise PayloadError(
+            f"{name} must be a number, got {value!r}",
+            f"pass a positive finite number for {name} (> 0)",
+        ) from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise PayloadError(
+            f"{name} must be > 0 and finite, got {value!r}",
+            f"pass a positive finite number for {name} (> 0)",
         )
     return parsed
 
@@ -639,7 +697,7 @@ def _apply_plan_numeric_contract(payload: dict[str, object]) -> dict[str, object
         if key in updated:
             updated[key] = _non_negative_int(key, updated[key], parse_exit_code=1)
     if "loop_auto_timeout_s" in updated:
-        updated["loop_auto_timeout_s"] = _non_negative_float("loop_auto_timeout_s", updated["loop_auto_timeout_s"])
+        updated["loop_auto_timeout_s"] = _positive_float("loop_auto_timeout_s", updated["loop_auto_timeout_s"])
     return updated
 
 

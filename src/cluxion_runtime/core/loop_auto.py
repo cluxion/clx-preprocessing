@@ -8,12 +8,13 @@ Inspired by Codex /goal `continue_if_idle` + hermes-call `--until-done` completi
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import subprocess
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -154,12 +155,23 @@ def run_loop_auto(options: LoopAutoOptions) -> LoopAutoResult:
     records: list[LoopAutoStepRecord] = []
     processed = 0
     failed = 0
-    deadline = start + options.timeout_seconds
 
     try:
         preflight_error = _preflight_error(options)
         if preflight_error:
             return _fail(options.work_id, "preflight_failed", records, start, error=preflight_error)
+        # Deadline only after validation; normalize int/float to finite positive float.
+        timeout_seconds = _normalize_timeout_seconds(options.timeout_seconds)
+        if timeout_seconds is None:  # pragma: no cover - guarded by _preflight_error
+            return _fail(
+                options.work_id,
+                "preflight_failed",
+                records,
+                start,
+                error="timeout_seconds must be > 0 and finite",
+            )
+        options = replace(options, timeout_seconds=timeout_seconds)
+        deadline = start + timeout_seconds
         runner = options.segment_runner or _default_segment_runner(options)
         previous_state: tuple[object, ...] | None = None
         iterations = 0
@@ -327,7 +339,26 @@ def _release_crashed_step(work_id: str, step_id: str, exc: BaseException) -> Non
         pass
 
 
+def _normalize_timeout_seconds(value: object) -> float | None:
+    """Normalize int/float timeout to a representable finite positive float.
+
+    Rejects bool (int subclass), non-int/float types, non-representable ints
+    (e.g. 10**400 → inf), NaN/Inf, and <= 0. Never raises.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        parsed = float(value)
+    except (OverflowError, ValueError, TypeError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0:
+        return None
+    return parsed
+
+
 def _preflight_error(options: LoopAutoOptions) -> str:
+    if _normalize_timeout_seconds(options.timeout_seconds) is None:
+        return "timeout_seconds must be > 0 and finite"
     if options.segment_runner is None and not options.dry_run and not shutil.which(options.hermes_bin):
         return f"hermes binary not found: {options.hermes_bin}"
     try:

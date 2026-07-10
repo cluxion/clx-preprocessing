@@ -76,6 +76,54 @@ def test_run_loop_auto_drains_queue_dry_run(tmp_path: Path, queued_plan, monkeyp
     assert result.briefing_answer
 
 
+@pytest.mark.parametrize(
+    "timeout_seconds",
+    [
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        0.0,
+        -1.0,
+        # Cycle97 second-boundary: bool is int-subclass; 10**400 not float-representable
+        True,
+        False,
+        10**400,
+        # Cycle97: int-to-str above ~4300 digits raises; error path must not repr() it
+        pytest.param(10**5000, id="10**5000"),
+        # non-int/float must never throw into the caller
+        "600",
+        object(),
+        [],
+    ],
+)
+def test_run_loop_auto_preflight_rejects_non_positive_or_non_finite_timeout(
+    timeout_seconds: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Cycle 97 PP: programmatic core must reject bad timeouts before dispatch work
+    monkeypatch.setenv("CLUXION_PREPROCESS_DISPATCH_DIR", str(tmp_path))
+    result = run_loop_auto(
+        LoopAutoOptions(
+            work_id="w-bad-timeout",
+            dry_run=True,
+            timeout_seconds=timeout_seconds,  # type: ignore[arg-type]
+        )
+    )
+    assert result.ok is False
+    assert result.status == "preflight_failed"
+    assert "timeout" in result.error.lower()
+
+
+def test_run_loop_auto_accepts_positive_int_timeout_without_throw(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Valid int must normalize to float path (no preflight reject; missing bundle is post-preflight)
+    monkeypatch.setenv("CLUXION_PREPROCESS_DISPATCH_DIR", str(tmp_path))
+    result = run_loop_auto(
+        LoopAutoOptions(work_id="w-int-timeout", dry_run=True, timeout_seconds=30)
+    )
+    assert result.status != "preflight_failed"
+
+
 def test_plan_cli_auto_loops_queued_plan_dry_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

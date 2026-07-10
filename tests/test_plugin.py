@@ -119,3 +119,20 @@ def test_browser_check_fn_returns_false_when_playwright_missing(monkeypatch):
     monkeypatch.setattr(importlib.util, "find_spec", lambda name: None if name == "playwright" else object())
     from cluxion_agentplugin_preprocessing.plugin import _check_browser_tool_available
     assert _check_browser_tool_available() is False
+
+
+def test_plan_schema_loop_auto_timeout_has_exclusive_minimum_zero() -> None:
+    # Cycle97 second-boundary: public schema contract (numeric exclusiveMinimum)
+    from cluxion_agentplugin_preprocessing.schemas import PLAN_SCHEMA
+
+    prop = PLAN_SCHEMA["parameters"]["properties"]["loop_auto_timeout_s"]
+    assert prop["type"] == "number"
+    assert prop["exclusiveMinimum"] == 0
+
+
+def test_loop_auto_schema_timeout_seconds_has_exclusive_minimum_zero() -> None:
+    from cluxion_agentplugin_preprocessing.schemas import LOOP_AUTO_SCHEMA
+
+    prop = LOOP_AUTO_SCHEMA["parameters"]["properties"]["timeout_seconds"]
+    assert prop["type"] == "number"
+    assert prop["exclusiveMinimum"] == 0

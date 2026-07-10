@@ -70,6 +70,7 @@ PLAN_SCHEMA = {
             },
             "loop_auto_timeout_s": {
                 "type": "number",
+                "exclusiveMinimum": 0,
                 "default": 600,
                 "description": "Maximum seconds for the full autonomous drain loop.",
             },
@@ -180,7 +181,7 @@ LOOP_AUTO_SCHEMA = {
             "cwd": {"type": "string", "default": ""},
             "hermes_bin": {"type": "string", "default": "hermes"},
             "model": {"type": "string", "default": ""},
-            "timeout_seconds": {"type": "number", "default": 600},
+            "timeout_seconds": {"type": "number", "exclusiveMinimum": 0, "default": 600},
             "max_segment_retries": {"type": "integer", "minimum": 0, "default": 2},
             "dry_run": {
                 "type": "boolean",

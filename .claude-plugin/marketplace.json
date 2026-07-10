@@ -8,7 +8,7 @@
     {
       "name": "cluxion-agentplugin-preprocessing",
       "description": "Universal agent preprocessing: honesty gate, clarification, Rust work queue, resource admission.",
-      "version": "0.3.57",
+      "version": "0.3.58",
       "source": "./"
     }
   ]

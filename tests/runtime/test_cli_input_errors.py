@@ -145,6 +145,7 @@ def test_queue_next_bounds_long_fields() -> None:
 
 def test_plan_deeply_nested_json_returns_structured_error(capsys, monkeypatch) -> None:
     # adversarial: ~10k nesting must be a clean error, not a raw RecursionError traceback
+    # (3.12: json.loads RecursionError; 3.14+: iterative depth gate after loads)
     deep = "{\"x\":" + "[" * 10000 + "]" * 10000 + "}"
     code, payload, stderr = _run(["plan", "--surface", "codex", "--json-stdin"], deep, capsys, monkeypatch)
     assert code == 2
@@ -152,6 +153,54 @@ def test_plan_deeply_nested_json_returns_structured_error(capsys, monkeypatch) -
     assert payload["ok"] is False
     assert payload["error"] == "invalid_input"
     assert "nesting too deep" in payload["message"]
+    assert payload["hint"] == "reduce the nesting depth of the JSON payload"
+
+
+def _dict_nest(depth: int) -> dict[str, object]:
+    """Build exactly `depth` nested dict containers (iterative; leaf is a scalar)."""
+    node: object = "leaf"
+    for _ in range(depth):
+        node = {"k": node}
+    assert isinstance(node, dict)
+    return node
+
+
+def _mixed_nest(depth: int) -> object:
+    """Build exactly `depth` alternating list/dict containers (iterative)."""
+    node: object = "leaf"
+    for i in range(depth):
+        node = [node] if i % 2 == 0 else {"k": node}
+    return node
+
+
+def test_json_container_depth_128_accepted(monkeypatch) -> None:
+    body = _dict_nest(128)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(body)))
+    got = cli._payload_from_stdin()
+    assert isinstance(got, dict)
+    assert "k" in got
+
+
+def test_json_container_depth_129_rejected(monkeypatch) -> None:
+    body = _dict_nest(129)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(body)))
+    with pytest.raises(cli.PayloadError) as caught:
+        cli._payload_from_stdin()
+    assert str(caught.value) == "stdin JSON nesting too deep"
+    assert caught.value.hint == "reduce the nesting depth of the JSON payload"
+
+
+def test_json_container_depth_mixed_dict_list_boundary(monkeypatch) -> None:
+    # depth 128 mixed containers accepted; 129 rejected (walks only dict/list)
+    ok_body = {"root": _mixed_nest(127)}  # root dict + 127 = 128
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(ok_body)))
+    assert isinstance(cli._payload_from_stdin(), dict)
+
+    bad_body = {"root": _mixed_nest(128)}  # root dict + 128 = 129
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(bad_body)))
+    with pytest.raises(cli.PayloadError) as caught:
+        cli._payload_from_stdin()
+    assert str(caught.value) == "stdin JSON nesting too deep"
 
 
 @pytest.mark.parametrize(
@@ -172,3 +221,95 @@ def test_wrong_typed_numeric_payload_fields_return_structured_error(
     assert stderr == ""
     assert payload["ok"] is False
     assert payload["error"] == "invalid_input"
+
+
+@pytest.mark.parametrize(
+    ("argv", "body", "field"),
+    [
+        (["loop-auto", "--work-id", "w1", "--json-stdin"], {"timeout_seconds": "nan"}, "timeout_seconds"),
+        (["loop-auto", "--work-id", "w1", "--json-stdin"], {"timeout_seconds": "inf"}, "timeout_seconds"),
+        (["loop-auto", "--work-id", "w1", "--json-stdin"], {"timeout_seconds": "-inf"}, "timeout_seconds"),
+        (["loop-auto", "--work-id", "w1", "--json-stdin"], {"timeout_seconds": 0}, "timeout_seconds"),
+        (["loop-auto", "--work-id", "w1", "--json-stdin"], {"timeout_seconds": 0.0}, "timeout_seconds"),
+        (
+            ["plan", "--surface", "codex", "--json-stdin"],
+            {"prompt": "x", "loop_auto_timeout_s": "nan"},
+            "loop_auto_timeout_s",
+        ),
+        (
+            ["plan", "--surface", "codex", "--json-stdin"],
+            {"prompt": "x", "loop_auto_timeout_s": "inf"},
+            "loop_auto_timeout_s",
+        ),
+        (
+            ["plan", "--surface", "codex", "--json-stdin"],
+            {"prompt": "x", "loop_auto_timeout_s": "-inf"},
+            "loop_auto_timeout_s",
+        ),
+        (
+            ["plan", "--surface", "codex", "--json-stdin"],
+            {"prompt": "x", "loop_auto_timeout_s": 0},
+            "loop_auto_timeout_s",
+        ),
+    ],
+)
+def test_loop_auto_timeout_non_finite_or_zero_returns_invalid_input(
+    argv: list[str], body: dict[str, object], field: str, capsys, monkeypatch
+) -> None:
+    # Cycle 97 PP: NaN/Inf/0 must be structured invalid_input (exit 2), not dispatch_error
+    code, payload, stderr = _run(argv, json.dumps(body), capsys, monkeypatch)
+    assert code == 2
+    assert stderr == ""
+    assert payload["ok"] is False
+    assert payload["error"] == "invalid_input"
+    assert field in payload["message"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"action": "enforce", "owned_roots": [os.getpid()], "cpu_threshold": "nan"},
+        {"action": "enforce", "owned_roots": [os.getpid()], "cpu_threshold": "NaN"},
+        {"action": "enforce", "owned_roots": [os.getpid()], "cpu_threshold": "inf"},
+        {"action": "enforce", "owned_roots": [os.getpid()], "cpu_threshold": "-inf"},
+        {"action": "enforce", "owned_roots": [os.getpid()], "grace_seconds": "nan"},
+        {"action": "auto-enforce", "owned_roots": [os.getpid()], "sustained_cpu": "inf"},
+    ],
+)
+def test_guard_non_finite_float_fields_rejected(body: dict[str, object], capsys, monkeypatch) -> None:
+    monkeypatch.setattr(guard_bridge, "enforce", lambda *_a, **_k: pytest.fail("enforce should not run"))
+    monkeypatch.setattr(guard_bridge, "auto_enforce", lambda *_a, **_k: pytest.fail("auto_enforce should not run"))
+    code, payload, stderr = _run(["guard", "--json-stdin"], json.dumps(body), capsys, monkeypatch)
+    assert code == 2
+    assert stderr == ""
+    assert payload["ok"] is False
+    assert payload["error"] == "invalid_input"
+
+
+def test_guard_zero_cpu_threshold_and_grace_accepted(capsys, monkeypatch) -> None:
+    # 0 remains valid for CPU thresholds and grace (unspecified / disabled semantics)
+    calls: list[dict[str, object]] = []
+
+    def _enforce(*_args: object, **kwargs: object) -> dict[str, object]:
+        calls.append(kwargs)
+        return {"ok": True, "action": "enforce"}
+
+    monkeypatch.setattr(guard_bridge, "enforce", _enforce)
+    code, payload, stderr = _run(
+        ["guard", "--json-stdin"],
+        json.dumps(
+            {
+                "action": "enforce",
+                "owned_roots": [os.getpid()],
+                "cpu_threshold": 0,
+                "grace_seconds": 0,
+            }
+        ),
+        capsys,
+        monkeypatch,
+    )
+    assert code == 0
+    assert stderr == ""
+    assert payload["ok"] is True
+    assert calls and calls[0]["cpu_threshold"] == 0.0
+    assert calls[0]["grace_seconds"] == 0.0
