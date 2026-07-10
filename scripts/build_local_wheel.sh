@@ -12,8 +12,11 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 
-echo "[1/4] clean previous merged output"
-rm -rf dist-merged
+# preflight: fail fast with a clear message on a machine missing the build toolchain
+for _t in uv maturin cargo; do command -v "$_t" >/dev/null 2>&1 || { echo "build_local_wheel: needs uv, maturin, and cargo (rust) on PATH (missing: $_t)" >&2; exit 1; }; done
+
+echo "[1/4] clean previous build output (dist + dist-merged)"
+rm -rf dist dist-merged
 mkdir -p dist-merged
 
 echo "[2/4] build pure py3-none-any wheel (hatchling)"
