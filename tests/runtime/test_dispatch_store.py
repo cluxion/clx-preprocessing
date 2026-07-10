@@ -122,6 +122,46 @@ def test_dispatch_store_uses_shared_lock_instead_of_per_bundle_locks(tmp_path: P
         assert (lock_path.stat().st_mode & 0o777) == 0o600
 
 
+@pytest.mark.skipif(__import__("os").name != "posix", reason="POSIX mode migration only")
+def test_dispatch_store_migrates_dir_and_bundle_modes(tmp_path: Path, queued_plan: HarnessPlan) -> None:
+    tmp_path.chmod(0o755)
+    path = persist_dispatch_bundle(queued_plan, dispatch_dir=tmp_path)
+    assert path is not None
+    path.chmod(0o644)
+    load_dispatch_bundle("w-queued", dispatch_dir=tmp_path)
+    assert (tmp_path.stat().st_mode & 0o777) == 0o700
+    assert (path.stat().st_mode & 0o777) == 0o600
+
+
+@pytest.mark.skipif(__import__("os").name != "posix", reason="POSIX fail-closed symlink policy")
+def test_dispatch_store_rejects_bundle_and_lock_symlinks(tmp_path: Path, queued_plan: HarnessPlan) -> None:
+    victim = tmp_path / "outside.json"
+    victim.write_text('{"work_id":"victim","steps":[]}', encoding="utf-8")
+    victim.chmod(0o644)
+    victim_mode = victim.stat().st_mode
+    victim_text = victim.read_text(encoding="utf-8")
+
+    planted = tmp_path / "w-queued.json"
+    planted.symlink_to(victim)
+    with pytest.raises(DispatchStoreError, match=r"symlink|expected"):
+        load_dispatch_bundle("w-queued", dispatch_dir=tmp_path)
+    assert victim.read_text(encoding="utf-8") == victim_text
+    assert victim.stat().st_mode == victim_mode
+
+    if planted.is_symlink() or planted.exists():
+        planted.unlink()
+    lock_victim = tmp_path / "lock-outside"
+    lock_victim.write_text("LOCK", encoding="utf-8")
+    lock_victim.chmod(0o644)
+    lock_mode = lock_victim.stat().st_mode
+    lock_text = lock_victim.read_text(encoding="utf-8")
+    (tmp_path / ".dispatch.lock").symlink_to(lock_victim)
+    with pytest.raises(DispatchStoreError, match=r"symlink|expected"):
+        persist_dispatch_bundle(queued_plan, dispatch_dir=tmp_path)
+    assert lock_victim.read_text(encoding="utf-8") == lock_text
+    assert lock_victim.stat().st_mode == lock_mode
+
+
 def test_concurrent_next_dispatch_steps_do_not_claim_same_step(
     tmp_path: Path, queued_plan: HarnessPlan, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -314,16 +354,64 @@ def test_atomic_write_cleans_tempfile_on_replace_failure(tmp_path: Path, monkeyp
     assert not list(tmp_path.glob("tmp*"))
 
 
-def test_work_id_traversal_is_neutralized(tmp_path: Path) -> None:
-    # Path separators and dots are stripped, so traversal collapses to a
-    # plain missing-bundle error instead of escaping the dispatch dir.
-    with pytest.raises(DispatchStoreError, match="not found"):
+def test_work_id_traversal_is_rejected_as_invalid(tmp_path: Path) -> None:
+    # Sanitized path differs from the original — reject; never alias to etcpasswd.
+    with pytest.raises(DispatchStoreError, match="invalid"):
         load_dispatch_bundle("../../etc/passwd", dispatch_dir=tmp_path)
+    assert not (tmp_path / "etcpasswd.json").exists()
 
 
 def test_work_id_with_no_safe_chars_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(DispatchStoreError, match="empty"):
         load_dispatch_bundle("../..", dispatch_dir=tmp_path)
+
+
+def test_work_id_alias_vic_tim_does_not_touch_victim(tmp_path: Path) -> None:
+    victim = tmp_path / "victim.json"
+    victim.write_text(
+        json.dumps({"work_id": "victim", "steps": []}),
+        encoding="utf-8",
+    )
+    with pytest.raises(DispatchStoreError, match="invalid"):
+        load_dispatch_bundle("vic!tim", dispatch_dir=tmp_path)
+    with pytest.raises(DispatchStoreError, match="invalid"):
+        next_dispatch_step("vic!tim", dispatch_dir=tmp_path)
+    with pytest.raises(DispatchStoreError, match="invalid"):
+        record_dispatch_result("vic!tim", "s1", dispatch_dir=tmp_path)
+    with pytest.raises(DispatchStoreError, match="invalid"):
+        build_briefing_payload("vic!tim", dispatch_dir=tmp_path)
+    assert victim.read_text(encoding="utf-8")
+
+
+def test_work_id_unicode_alphanumeric_remains_valid(tmp_path: Path) -> None:
+    work_id = "작업-테스트1"
+    path = tmp_path / f"{work_id}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "work_id": work_id,
+                "steps": [
+                    {
+                        "step_id": "s1",
+                        "segment_id": "g1",
+                        "checksum": "c1",
+                        "token_estimate": 1,
+                        "content": "x",
+                        "status": "queued",
+                        "result": "",
+                        "error": "",
+                        "updated_at": time.time(),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    bundle = load_dispatch_bundle(work_id, dispatch_dir=tmp_path)
+    assert bundle["work_id"] == work_id
+    step = next_dispatch_step(work_id, dispatch_dir=tmp_path)
+    assert step["ready"] is True
+    assert path.exists()
 
 
 from cluxion_runtime.core.types import ResourceSnapshot

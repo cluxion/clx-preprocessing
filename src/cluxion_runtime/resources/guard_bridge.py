@@ -44,6 +44,7 @@ DEFAULT_GRACE_SECONDS = 3.0
 DEFAULT_SUSTAINED_CPU = 85.0
 DEFAULT_RAM_FLOOR_MB = 1024
 _CPU_WINDOW_SECONDS = 0.1
+_U64_MAX = (1 << 64) - 1
 
 
 def _int_or_default(value: object, default: int) -> int:
@@ -53,9 +54,23 @@ def _int_or_default(value: object, default: int) -> int:
         return default
 
 
+def _validate_cpu_sample_ms(value: object, default: int = 100) -> int:
+    """Non-bool integer, non-negative, and Rust u64-representable."""
+    if value is None:
+        value = default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"cpu_sample_ms must be a non-bool integer, got {value!r}")
+    if value < 0:
+        raise ValueError(f"cpu_sample_ms must be >= 0, got {value}")
+    if value > _U64_MAX:
+        raise ValueError(f"cpu_sample_ms exceeds u64 maximum ({_U64_MAX})")
+    return value
+
+
 def sample(payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """One full system sample (RAM/swap/CPU/zombies)."""
     body = dict(payload or {})
+    body["cpu_sample_ms"] = _validate_cpu_sample_ms(body.get("cpu_sample_ms", 100))
     backend = queue_bridge.resolve_backend()
     if backend == "native":
         return queue_bridge._invoke_native("guard-sample", body)
@@ -180,7 +195,8 @@ def enforce(
     for entry in candidates:
         pid = int(entry["pid"])
         proc = procs.get(pid) if procs else _process_or_none(pid)
-        if proc is None or not _still_owned_for_signal(proc, roots, procs, parents):
+        # One immediate identity check before SIGTERM (PID reuse defense).
+        if proc is None or not _still_owned_and_same(proc, roots):
             skipped.append({"pid": entry["pid"], "reason": "identity_or_ownership_changed"})
             continue
         try:
@@ -192,6 +208,9 @@ def enforce(
     result["terminated"] = sorted(proc.pid for proc in gone)
     killed: list[int] = []
     for proc in alive:
+        # One immediate revalidation before SIGKILL — never signal a recycled PID.
+        if not _still_owned_and_same(proc, roots):
+            continue
         try:
             proc.kill()
             killed.append(proc.pid)
@@ -281,20 +300,6 @@ def _still_owned_and_same(proc: psutil.Process, roots: list[int]) -> bool:
     except (psutil.NoSuchProcess, psutil.AccessDenied, PermissionError):
         return False
     return any(root in lineage for root in roots)
-
-
-def _still_owned_for_signal(
-    proc: psutil.Process,
-    roots: list[int],
-    procs: dict[int, psutil.Process],
-    parents: dict[int, int],
-) -> bool:
-    if procs:
-        return _still_owned_and_same(proc, roots)
-    try:
-        return proc.is_running() and _is_owned(proc.pid, roots, parents)
-    except (psutil.NoSuchProcess, psutil.AccessDenied, PermissionError):
-        return False
 
 
 def _protected_pids(protect: list[int] | tuple[int, ...], store_dir: Path | str | None) -> set[int]:
@@ -406,17 +411,26 @@ def stop_daemon(*, store_dir: Path | str | None = None) -> dict[str, Any]:
         pid = int(pid_path.read_text(encoding="utf-8").strip())
     except (FileNotFoundError, ValueError):
         return {"ok": True, "stopped": False, "reason": "no_pidfile"}
-    if not _is_our_daemon(pid):
+    verified = _is_our_daemon(pid)
+    if verified is None:
         pid_path.unlink(missing_ok=True)
         return {"ok": False, "stopped": False, "reason": "identity_mismatch", "pid": pid}
     try:
-        proc = psutil.Process(pid)
-        proc.terminate()
-        proc.wait(timeout=3)
+        # Revalidate the same process identity immediately before SIGTERM.
+        recheck = _is_our_daemon(pid)
+        if recheck is None or not _same_process(verified, recheck):
+            pid_path.unlink(missing_ok=True)
+            return {"ok": False, "stopped": False, "reason": "identity_mismatch", "pid": pid}
+        verified.terminate()
+        verified.wait(timeout=3)
     except psutil.NoSuchProcess:
         pass
     except psutil.TimeoutExpired:
-        proc.kill()
+        # Revalidate again before SIGKILL so a recycled PID is never killed.
+        recheck = _is_our_daemon(pid)
+        if recheck is not None and _same_process(verified, recheck):
+            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                verified.kill()
     pid_path.unlink(missing_ok=True)
     return {"ok": True, "stopped": True, "pid": pid}
 
@@ -427,7 +441,7 @@ def daemon_status(*, store_dir: Path | str | None = None) -> dict[str, Any]:
         pid = int((base / PID_FILE_NAME).read_text(encoding="utf-8").strip())
     except (FileNotFoundError, ValueError):
         return {"running": False, "pid": None}
-    return {"running": _is_our_daemon(pid), "pid": pid}
+    return {"running": _is_our_daemon(pid) is not None, "pid": pid}
 
 
 def _store_base(store_dir: Path | str | None) -> Path:
@@ -439,15 +453,25 @@ def _store_base(store_dir: Path | str | None) -> Path:
     return DEFAULT_GUARD_STORE
 
 
-def _is_our_daemon(pid: int) -> bool:
+def _same_process(left: psutil.Process, right: psutil.Process) -> bool:
+    try:
+        return left.pid == right.pid and left.create_time() == right.create_time()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, PermissionError):
+        return False
+
+
+def _is_our_daemon(pid: int) -> psutil.Process | None:
+    """Return the verified daemon Process, or None when identity fails."""
     try:
         proc = psutil.Process(pid)
         cmdline = proc.cmdline()
     except (psutil.NoSuchProcess, psutil.AccessDenied):
-        return False
+        return None
     if any("cluxion_runtime.guard_daemon_host" in part for part in cmdline):
-        return True
-    return any("guard-daemon" in part for part in cmdline) and any("cluxion-queue" in part for part in cmdline)
+        return proc
+    if any("guard-daemon" in part for part in cmdline) and any("cluxion-queue" in part for part in cmdline):
+        return proc
+    return None
 
 
 def _native_guard_available() -> bool:
@@ -461,10 +485,13 @@ def _which(binary: str) -> bool:
 
 
 def _python_sample(body: Mapping[str, Any]) -> dict[str, Any]:
-    cpu_sample_ms = int(body.get("cpu_sample_ms", 100))
-    interval = None if cpu_sample_ms <= 0 else cpu_sample_ms / 1000.0
-    memory = psutil.virtual_memory()
-    cpu = psutil.cpu_percent(interval=interval)
+    cpu_sample_ms = _validate_cpu_sample_ms(body.get("cpu_sample_ms", 100))
+    try:
+        interval = None if cpu_sample_ms <= 0 else cpu_sample_ms / 1000.0
+        memory = psutil.virtual_memory()
+        cpu = psutil.cpu_percent(interval=interval)
+    except OverflowError as exc:
+        raise ValueError(f"cpu_sample_ms too large for sampling: {cpu_sample_ms}") from exc
     process_rows = _process_rows()
     if process_rows is None:
         zombie_pids = []

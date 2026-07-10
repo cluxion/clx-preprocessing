@@ -8,9 +8,11 @@ module nor the CLI binary is available.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sqlite3
+import stat
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -30,6 +32,8 @@ _RUNNING_LEASE_SECONDS = 600.0
 _ENQUEUE_RETRY_ATTEMPTS = 5
 _OPEN_RETRY_ATTEMPTS = 20
 _UNIQUE_SEQUENCE_INDEX = "CREATE UNIQUE INDEX IF NOT EXISTS idx_work_queue_sequence ON work_queue(sequence)"
+_DIR_MODE = 0o700
+_FILE_MODE = 0o600
 
 
 def run(command: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -55,9 +59,100 @@ def _default_store() -> str:
     return str(Path(home) / ".local" / "share" / "cluxion-agentplugin-preprocessing" / "queue")
 
 
+def _is_posix() -> bool:
+    return os.name == "posix"
+
+
+def _open_flags(*, create: bool, write: bool = True) -> int:
+    flags = os.O_RDWR if write else os.O_RDONLY
+    if create:
+        flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return flags
+
+
+def _fchmod_regular(path: Path, mode: int, *, create: bool) -> None:
+    """Open with O_NOFOLLOW, verify regular file via fstat, fchmod the descriptor."""
+    flags = _open_flags(create=create, write=create)
+    try:
+        fd = os.open(path, flags, mode if create else 0o600)
+    except FileNotFoundError:
+        if create:
+            raise
+        return  # optional leaf vanished (e.g. WAL checkpoint race)
+    except OSError as exc:
+        # ENOENT for optional leaves is not a permission failure.
+        if not create and exc.errno == errno.ENOENT:
+            return
+        raise RuntimeError(f"failed to open {path}: {exc}") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise RuntimeError(f"expected regular file, found non-regular: {path}")
+        if create or (st.st_mode & 0o777) != mode:
+            os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+
+
+def _ensure_dir_mode(path: Path, mode: int = _DIR_MODE) -> None:
+    """Ensure path is a real directory (not a symlink) and mode-tight on POSIX."""
+    if path.is_symlink():
+        raise RuntimeError(f"expected directory, found symlink: {path}")
+    path.mkdir(parents=True, exist_ok=True)
+    if not _is_posix():
+        return
+    st = path.lstat()
+    if not stat.S_ISDIR(st.st_mode):
+        raise RuntimeError(f"expected directory, found non-directory: {path}")
+    if st.st_mode & 0o777 != mode:
+        os.chmod(path, mode, follow_symlinks=False)
+
+
+def _ensure_file_mode(path: Path, mode: int = _FILE_MODE, *, create: bool = False) -> None:
+    """Ensure a single leaf regular file; reject symlink/wrong type. Missing optional files OK."""
+    if path.is_symlink():
+        raise RuntimeError(f"expected regular file, found symlink: {path}")
+    if not path.exists():
+        if not create:
+            return
+        if not _is_posix():
+            path.touch()
+            return
+        _fchmod_regular(path, mode, create=True)
+        return
+    if not _is_posix():
+        return
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        if create:
+            raise
+        return
+    if not stat.S_ISREG(st.st_mode):
+        raise RuntimeError(f"expected regular file, found non-regular: {path}")
+    if st.st_mode & 0o777 == mode:
+        return
+    # Mode needs tightening: O_RDONLY|O_NOFOLLOW + fstat + fchmod.
+    _fchmod_regular(path, mode, create=False)
+
+
+def _db_sidecars(db_path: Path) -> tuple[Path, Path]:
+    return Path(f"{db_path}-wal"), Path(f"{db_path}-shm")
+
+
+def _migrate_db_modes(db_path: Path, *, create_db: bool) -> None:
+    _ensure_file_mode(db_path, _FILE_MODE, create=create_db)
+    for side in _db_sidecars(db_path):
+        _ensure_file_mode(side, _FILE_MODE, create=False)
+
+
 def _open_db(store_dir: Path) -> sqlite3.Connection:
-    store_dir.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(store_dir / "work_queue.sqlite", timeout=30.0)
+    _ensure_dir_mode(store_dir, _DIR_MODE)
+    db_path = store_dir / "work_queue.sqlite"
+    _migrate_db_modes(db_path, create_db=True)
+    conn = sqlite3.connect(db_path, timeout=30.0)
     # The rollback->WAL switch upgrades a read txn to EXCLUSIVE inside SQLite
     # (sqlite3BtreeSetVersion) and that path returns SQLITE_BUSY without
     # consulting the busy handler, so the connect timeout cannot protect a
@@ -66,6 +161,7 @@ def _open_db(store_dir: Path) -> sqlite3.Connection:
         if attempt:
             time.sleep(0.01 * attempt)
         try:
+            _migrate_db_modes(db_path, create_db=False)
             conn.executescript(
                 """
                 PRAGMA journal_mode=WAL;
@@ -90,6 +186,7 @@ def _open_db(store_dir: Path) -> sqlite3.Connection:
         except sqlite3.OperationalError as err:
             if attempt >= _OPEN_RETRY_ATTEMPTS or ("locked" not in str(err) and "busy" not in str(err)):
                 raise
+    _migrate_db_modes(db_path, create_db=False)
     _ensure_unique_sequence_index(conn)
     return conn
 
@@ -226,19 +323,33 @@ def _status(store_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _dispatch_dir(store_dir: Path) -> Path:
-    return store_dir / "dispatch"
+    # Application queue leaf first, then dispatch child — never chmod parents above store_dir.
+    _ensure_dir_mode(store_dir, _DIR_MODE)
+    path = store_dir / "dispatch"
+    _ensure_dir_mode(path, _DIR_MODE)
+    return path
 
 
-def _bundle_path(store_dir: Path, work_id: str) -> Path:
+def _validated_work_id(work_id: str) -> str:
     safe = "".join(ch for ch in work_id if ch.isalnum() or ch in "-_")
     if not safe:
         raise RuntimeError("work_id is empty")
+    if safe != work_id:
+        raise RuntimeError(f"invalid work_id: {work_id!r}")
+    return safe
+
+
+def _bundle_path(store_dir: Path, work_id: str) -> Path:
+    safe = _validated_work_id(work_id)
     return _dispatch_dir(store_dir) / f"{safe}.json"
 
 
 def _read_bundle(path: Path) -> dict[str, Any]:
+    if path.is_symlink():
+        raise RuntimeError(f"expected regular file, found symlink: {path}")
     if not path.exists():
         raise RuntimeError(f"dispatch bundle not found: {path}")
+    _ensure_file_mode(path, _FILE_MODE, create=False)
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise RuntimeError(f"dispatch bundle expected object, found {_type_name(payload)}: {path}")
@@ -246,7 +357,7 @@ def _read_bundle(path: Path) -> dict[str, Any]:
 
 
 def _write_atomic(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_dir_mode(path.parent, _DIR_MODE)
     temporary: Path | None = None
     try:
         with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
@@ -255,7 +366,10 @@ def _write_atomic(path: Path, payload: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
             temporary = Path(handle.name)
+        if temporary is not None:
+            _ensure_file_mode(temporary, _FILE_MODE, create=False)
         os.replace(temporary, path)
+        _ensure_file_mode(path, _FILE_MODE, create=False)
     except Exception:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -379,14 +493,28 @@ def _record_step(store_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
 
 @contextmanager
 def _exclusive_bundle_lock(path: Path) -> Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_dir_mode(path.parent, _DIR_MODE)
     if _fcntl is None:
         # Non-POSIX platforms keep atomic rename but skip advisory locking.
         yield
         return
     lock_path = path.parent / ".dispatch.lock"
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-    os.fchmod(fd, 0o600)
+    if lock_path.is_symlink():
+        raise RuntimeError(f"expected regular file, found symlink: {lock_path}")
+    if lock_path.exists() and not stat.S_ISREG(lock_path.lstat().st_mode):
+        raise RuntimeError(f"expected regular file, found non-regular: {lock_path}")
+    try:
+        fd = os.open(lock_path, _open_flags(create=True), _FILE_MODE)
+    except OSError as exc:
+        raise RuntimeError(f"failed to open lock file {lock_path}: {exc}") from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise RuntimeError(f"expected regular file, found non-regular: {lock_path}")
+        os.fchmod(fd, _FILE_MODE)
+    except Exception:
+        os.close(fd)
+        raise
     with os.fdopen(fd, "r+b") as lock_file:
         _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
         try:

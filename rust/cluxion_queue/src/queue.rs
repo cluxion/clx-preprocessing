@@ -1,7 +1,11 @@
 use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use rusqlite::{params, Connection, ErrorCode};
 use serde_json::{json, Value};
@@ -41,10 +45,126 @@ fn with_db<T>(
     op(conn)
 }
 
+/// Tighten the application queue store leaf to 0700 (not parents above it).
+pub(crate) fn ensure_store_dir(store_dir: &Path) -> Result<(), QueueError> {
+    ensure_dir_mode(store_dir, 0o700)
+}
+
+pub(crate) fn ensure_dir_mode(path: &Path, mode: u32) -> Result<(), QueueError> {
+    if path.is_symlink() {
+        return Err(QueueError::Store(format!(
+            "expected directory, found symlink: {}",
+            path.display()
+        )));
+    }
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return Err(QueueError::Store(format!(
+                "expected directory, found non-directory: {}",
+                path.display()
+            )));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path)?;
+        }
+        Err(err) => return Err(err.into()),
+    }
+    #[cfg(unix)]
+    {
+        let meta = fs::symlink_metadata(path)?;
+        if !meta.is_dir() {
+            return Err(QueueError::Store(format!(
+                "expected directory, found non-directory: {}",
+                path.display()
+            )));
+        }
+        if meta.file_type().is_symlink() {
+            return Err(QueueError::Store(format!(
+                "expected directory, found symlink: {}",
+                path.display()
+            )));
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_regular_file_mode(path: &Path, mode: u32) -> Result<(), QueueError> {
+    if path.is_symlink() {
+        return Err(QueueError::Store(format!(
+            "expected regular file, found symlink: {}",
+            path.display()
+        )));
+    }
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => {
+            #[cfg(unix)]
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+            #[cfg(not(unix))]
+            let _ = mode;
+            Ok(())
+        }
+        Ok(_) => Err(QueueError::Store(format!(
+            "expected regular file, found non-regular: {}",
+            path.display()
+        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn precreate_db_file(db_path: &Path) -> Result<(), QueueError> {
+    if db_path.is_symlink() {
+        return Err(QueueError::Store(format!(
+            "expected regular file, found symlink: {}",
+            db_path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        if !db_path.exists() {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true).mode(0o600);
+            match options.open(db_path) {
+                Ok(file) => {
+                    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                }
+                // Concurrent creator won the race; tighten the existing regular file.
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    ensure_regular_file_mode(db_path, 0o600)?;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        } else {
+            ensure_regular_file_mode(db_path, 0o600)?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = db_path;
+    }
+    Ok(())
+}
+
+fn migrate_db_sidecars(db_path: &Path) -> Result<(), QueueError> {
+    for suffix in ["-wal", "-shm"] {
+        let side = PathBuf::from(format!("{}{suffix}", db_path.display()));
+        ensure_regular_file_mode(&side, 0o600)?;
+    }
+    Ok(())
+}
+
 fn open_db(store_dir: &Path) -> Result<Connection, QueueError> {
-    std::fs::create_dir_all(store_dir)?;
+    ensure_store_dir(store_dir)?;
     let db_path = store_dir.join("work_queue.sqlite");
-    let conn = Connection::open(db_path)?;
+    precreate_db_file(&db_path)?;
+    migrate_db_sidecars(&db_path)?;
+    let conn = Connection::open(&db_path)?;
     // busy_timeout must be installed before any other statement: on a fresh
     // store the journal-mode switch and table creation are write operations,
     // and concurrent one-shot processes racing them with the default timeout
@@ -57,6 +177,7 @@ fn open_db(store_dir: &Path) -> Result<Connection, QueueError> {
     // reliably, so retry the (idempotent) schema batch explicitly.
     let mut attempt = 0;
     loop {
+        migrate_db_sidecars(&db_path)?;
         let schema = conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
@@ -83,6 +204,7 @@ fn open_db(store_dir: &Path) -> Result<Connection, QueueError> {
             Err(err) => return Err(QueueError::Sqlite(err)),
         }
     }
+    migrate_db_sidecars(&db_path)?;
     ensure_unique_sequence_index(&conn);
     Ok(conn)
 }

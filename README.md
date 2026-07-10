@@ -168,10 +168,21 @@ Apache-2.0
 
 ## Native backend (optional, faster)
 
-The Rust backend is not built automatically. After install, run once:
+A pure source `pip install` does **not** include the native module. The supported local
+artifact is the **merged platform wheel** produced by the repo script (same layout PyPI
+ships — pure hatchling wheel + native extension merged in). Do **not** install a
+standalone native package from `rust/cluxion_queue` or rebuild the extension outside
+`scripts/build_local_wheel.sh`.
 
 ```bash
-uv pip install ./rust/cluxion_queue --python .venv/bin/python
+bash scripts/build_local_wheel.sh
+# Resolve exactly one absolute wheel path (portable in zsh, bash, and POSIX shells):
+WHEEL="$(python3 -c 'from pathlib import Path; w=list(Path("dist-merged").glob("cluxion_agentplugin_preprocessing-*.whl")); assert len(w)==1, f"expected exactly one wheel, got {len(w)}"; print(w[0].resolve())')"
+HERMES_PY="$HOME/.hermes/hermes-agent/venv/bin/python"
+uv tool install --force "$WHEEL"
+uv pip install --python "$HERMES_PY" --no-deps --reinstall "$WHEEL"
+uv pip check --python "$HERMES_PY"
 ```
 
-Without it the plugin falls back to a slower pure-Python path (`doctor` reports `native_module_importable`).
+Without the merged wheel the plugin falls back to a slower pure-Python path
+(`doctor` reports `native_module_importable`).

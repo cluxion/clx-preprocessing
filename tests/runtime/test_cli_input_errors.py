@@ -116,6 +116,22 @@ def test_guard_unknown_action_error_uses_stdout(capsys, monkeypatch) -> None:
     assert "unknown guard action" in payload["error"]
 
 
+def test_guard_cpu_sample_ms_u64_overflow_structured_invalid_input(capsys, monkeypatch) -> None:
+    def raise_value(_payload=None):
+        raise ValueError("cpu_sample_ms exceeds u64")
+
+    monkeypatch.setattr(guard_bridge, "sample", raise_value)
+    monkeypatch.setattr(guard_bridge, "daemon_status", lambda **_: {"running": False, "pid": None})
+    monkeypatch.setattr(guard_bridge, "read_daemon_state", lambda **_: None)
+    body = json.dumps({"action": "status", "cpu_sample_ms": (1 << 64)})
+    code, payload, stderr = _run(["guard", "--json-stdin"], body, capsys, monkeypatch)
+    assert code == 1
+    assert stderr == ""
+    assert payload["ok"] is False
+    assert payload["error"] == "invalid_input"
+    assert "traceback" not in str(payload.get("message", "")).lower()
+
+
 def test_guard_start_readonly_store_returns_structured_error(tmp_path, capsys, monkeypatch) -> None:
     store = tmp_path / "guard"
     store.mkdir()

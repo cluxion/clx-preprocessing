@@ -51,3 +51,46 @@ def test_marketplace_manifest_is_version_synced() -> None:
     marketplace = json.loads(Path(".claude-plugin/marketplace.json").read_text(encoding="utf-8"))
     assert marketplace["plugins"][0]["version"] == version
     assert marketplace["plugins"][0]["source"] == "./"
+
+
+def test_native_backend_docs_point_at_merged_local_wheel() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+    catalog = json.loads(Path("src/cluxion_agentplugin_preprocessing/doctor/catalog.json").read_text(encoding="utf-8"))
+    catalog_text = json.dumps(catalog)
+    native_entries = [item for item in catalog if item.get("category") == "native_backend"]
+    assert native_entries, "expected native_backend catalog entries"
+
+    stale_phrases = (
+        "cluxion-queue-native",
+        "maturin develop",
+        "uv pip install ./rust/cluxion_queue",
+        "pip install ./rust/cluxion_queue",
+        "separate Rust package",
+    )
+    for phrase in stale_phrases:
+        assert phrase not in readme, f"stale packaging phrase in README: {phrase}"
+        assert phrase not in catalog_text, f"stale packaging phrase in catalog: {phrase}"
+
+    assert "bash scripts/build_local_wheel.sh" in readme
+    assert 'uv tool install --force "$WHEEL"' in readme
+    assert 'HERMES_PY="$HOME/.hermes/hermes-agent/venv/bin/python"' in readme
+    assert 'uv pip install --python "$HERMES_PY" --no-deps --reinstall "$WHEEL"' in readme
+    assert 'uv pip check --python "$HERMES_PY"' in readme
+    assert "shopt" not in readme
+    # installation commands must use $WHEEL, not a dist-merged glob
+    assert "dist-merged/cluxion_agentplugin_preprocessing-*-*.whl" not in readme
+    assert 'uv tool install --force "$WHEEL"' in readme
+    assert "WHEEL=" in readme
+    assert "exactly one" in readme.lower() or "len(wheels) == 1" in readme or "${#wheels[@]}" in readme
+
+    for entry in native_entries:
+        steps = "\n".join(entry.get("fix_steps", []))
+        for phrase in stale_phrases:
+            assert phrase not in steps, f"{entry['check_id']} still has {phrase!r}"
+        if entry["check_id"] in {"native_module_importable", "abi3_wheel_compatible"}:
+            assert "scripts/build_local_wheel.sh" in steps
+            assert "cluxion_queue_native" in steps or "import cluxion_queue_native" in steps
+            assert 'WHEEL="$(python3 -c' in steps
+            assert "assert len(w)==1" in steps
+
+    assert Path("scripts/build_local_wheel.sh").is_file()

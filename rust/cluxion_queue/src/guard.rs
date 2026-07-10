@@ -61,16 +61,43 @@ fn uint_field(payload: &Value, key: &str, default: u64) -> u64 {
     payload.get(key).and_then(Value::as_u64).unwrap_or(default)
 }
 
+/// Parse `cpu_sample_ms`: missing/null → default 100; explicit negative,
+/// non-integer, or u64-overflow → Usage error (never coerce via unwrap_or).
+fn parse_cpu_sample_ms(payload: &Value) -> Result<u64, QueueError> {
+    match payload.get("cpu_sample_ms") {
+        None | Some(Value::Null) => Ok(DEFAULT_CPU_SAMPLE_MS),
+        Some(value) => {
+            if let Some(n) = value.as_u64() {
+                return Ok(n);
+            }
+            Err(QueueError::Usage(format!(
+                "cpu_sample_ms must be a non-negative integer fitting in u64, got {value}"
+            )))
+        }
+    }
+}
+
+/// Pure delay conversion: `0 -> None` (no sleep), positive N -> exact Duration.
+fn cpu_sample_delay(ms: u64) -> Option<std::time::Duration> {
+    if ms == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_millis(ms))
+    }
+}
+
 /// One full system sample. CPU usage needs two refreshes separated by a
-/// short sleep; `cpu_sample_ms` controls that pause (clamped to >= 100ms,
-/// sysinfo's minimum meaningful interval).
+/// short sleep; `cpu_sample_ms` controls that pause. `0` is non-blocking
+/// (single refresh, no sleep); positive values are used exactly as given.
 pub fn sample(payload: &Value) -> Result<Value, QueueError> {
-    let cpu_sample_ms = uint_field(payload, "cpu_sample_ms", DEFAULT_CPU_SAMPLE_MS).max(100);
+    let cpu_sample_ms = parse_cpu_sample_ms(payload)?;
     let mut sys = System::new();
     sys.refresh_memory();
     sys.refresh_cpu_usage();
-    std::thread::sleep(std::time::Duration::from_millis(cpu_sample_ms));
-    sys.refresh_cpu_usage();
+    if let Some(delay) = cpu_sample_delay(cpu_sample_ms) {
+        std::thread::sleep(delay);
+        sys.refresh_cpu_usage();
+    }
     sys.refresh_processes(ProcessesToUpdate::All, true);
     Ok(sample_from(&sys))
 }
@@ -242,7 +269,9 @@ pub fn scan(payload: &Value) -> Result<Value, QueueError> {
             if zombies.len() < MAX_REPORTED_PIDS {
                 zombies.push(entry());
             }
-        } else if f64::from(proc_.cpu_usage()) >= cpu_hot || proc_.memory() / 1_048_576 >= rss_hot_mb {
+        } else if f64::from(proc_.cpu_usage()) >= cpu_hot
+            || proc_.memory() / 1_048_576 >= rss_hot_mb
+        {
             if hot.len() < MAX_REPORTED_PIDS {
                 hot.push(entry());
             }
@@ -347,6 +376,56 @@ mod tests {
     }
 
     #[test]
+    fn sample_accepts_zero_cpu_sample_ms_without_coercion() {
+        let result = sample(&json!({"cpu_sample_ms": 0})).expect("sample zero");
+        assert_eq!(result["ok"], true);
+        assert!(result["total_ram_mb"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn cpu_sample_delay_zero_has_no_100ms_clamp() {
+        assert_eq!(cpu_sample_delay(0), None);
+        assert_eq!(
+            cpu_sample_delay(1),
+            Some(std::time::Duration::from_millis(1))
+        );
+        assert_eq!(
+            cpu_sample_delay(250),
+            Some(std::time::Duration::from_millis(250))
+        );
+        assert_eq!(
+            cpu_sample_delay(100),
+            Some(std::time::Duration::from_millis(100))
+        );
+    }
+
+    #[test]
+    fn sample_rejects_negative_non_integer_and_overflow_cpu_sample_ms() {
+        for bad in [
+            json!({"cpu_sample_ms": -1}),
+            json!({"cpu_sample_ms": 1.5}),
+            json!({"cpu_sample_ms": true}),
+            json!({"cpu_sample_ms": "100"}),
+            // larger than u64::MAX as a JSON number (serde stores as f64 / rejects as_u64)
+            json!({"cpu_sample_ms": 1e40}),
+        ] {
+            let err = sample(&bad).expect_err("must reject invalid cpu_sample_ms");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("cpu_sample_ms") || msg.contains("Usage") || msg.contains("integer"),
+                "unexpected error for {bad}: {msg}"
+            );
+        }
+        // missing key keeps default 100 (smoke: succeeds)
+        let ok = sample(&json!({})).expect("missing defaults");
+        assert_eq!(ok["ok"], true);
+        assert_eq!(
+            parse_cpu_sample_ms(&json!({})).unwrap(),
+            DEFAULT_CPU_SAMPLE_MS
+        );
+    }
+
+    #[test]
     fn scan_marks_own_lineage_and_external() {
         let me = std::process::id() as u64;
         let result = scan(&json!({
@@ -437,10 +516,7 @@ mod tests {
             cheap_tick_state["current"]["zombie_count"].as_u64(),
             Some(2)
         );
-        assert_eq!(
-            cheap_tick_state["current"]["zombie_pids"],
-            json!([99, 100])
-        );
+        assert_eq!(cheap_tick_state["current"]["zombie_pids"], json!([99, 100]));
 
         // Cadence is wall-clock based: age the cache past the scan window
         // to force a rescan regardless of tick number.
@@ -471,7 +547,6 @@ mod tests {
         assert!(!is_idle(now - ttl, now, ttl));
         assert!(!is_idle(now - 1, now, ttl));
     }
-
 
     #[test]
     fn daemon_without_heartbeat_idles_out_from_start() {

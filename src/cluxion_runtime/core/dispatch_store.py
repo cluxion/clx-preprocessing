@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+import stat
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -16,6 +18,9 @@ try:
     import fcntl as _fcntl
 except ImportError:  # pragma: no cover - exercised only on non-POSIX platforms.
     _fcntl = None
+
+_DIR_MODE = 0o700
+_FILE_MODE = 0o600
 
 if TYPE_CHECKING:
     from cluxion_runtime.core.types import HarnessPlan, QueueSegment
@@ -77,7 +82,7 @@ def persist_dispatch_bundle(plan: HarnessPlan, *, dispatch_dir: Path | None = No
                 return Path(str(result.get("path", "")))
         except RuntimeError:
             pass
-    target_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_dir_mode(target_dir, _DIR_MODE)
     path = _bundle_path(plan.item.work_id, target_dir)
     with _exclusive_bundle_lock(path):
         _atomic_write_json(path, bundle)
@@ -299,16 +304,101 @@ def _custom_dispatch_dir_configured() -> bool:
     return bool(os.environ.get(DISPATCH_DIR_ENV, "").strip() or os.environ.get(_LEGACY_DISPATCH_DIR_ENV, "").strip())
 
 
-def _bundle_path(work_id: str, dispatch_dir: Path) -> Path:
+def _is_posix() -> bool:
+    return os.name == "posix"
+
+
+def _open_flags(*, create: bool, write: bool = True) -> int:
+    flags = os.O_RDWR if write else os.O_RDONLY
+    if create:
+        flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return flags
+
+
+def _fchmod_regular(path: Path, mode: int, *, create: bool) -> None:
+    flags = _open_flags(create=create, write=create)
+    try:
+        fd = os.open(path, flags, mode if create else 0o600)
+    except FileNotFoundError:
+        if create:
+            raise
+        return
+    except OSError as exc:
+        if not create and exc.errno == errno.ENOENT:
+            return
+        raise DispatchStoreError(f"failed to open {path}: {exc}") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise DispatchStoreError(f"expected regular file, found non-regular: {path}")
+        if create or (st.st_mode & 0o777) != mode:
+            os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+
+
+def _ensure_dir_mode(path: Path, mode: int = _DIR_MODE) -> None:
+    if path.is_symlink():
+        raise DispatchStoreError(f"expected directory, found symlink: {path}")
+    path.mkdir(parents=True, exist_ok=True)
+    if not _is_posix():
+        return
+    st = path.lstat()
+    if not stat.S_ISDIR(st.st_mode):
+        raise DispatchStoreError(f"expected directory, found non-directory: {path}")
+    if st.st_mode & 0o777 != mode:
+        os.chmod(path, mode, follow_symlinks=False)
+
+
+def _ensure_file_mode(path: Path, mode: int = _FILE_MODE, *, create: bool = False) -> None:
+    if path.is_symlink():
+        raise DispatchStoreError(f"expected regular file, found symlink: {path}")
+    if not path.exists():
+        if not create:
+            return
+        if not _is_posix():
+            path.touch()
+            return
+        _fchmod_regular(path, mode, create=True)
+        return
+    if not _is_posix():
+        return
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        if create:
+            raise
+        return
+    if not stat.S_ISREG(st.st_mode):
+        raise DispatchStoreError(f"expected regular file, found non-regular: {path}")
+    if st.st_mode & 0o777 == mode:
+        return
+    _fchmod_regular(path, mode, create=False)
+
+
+def _validated_work_id(work_id: str) -> str:
     safe = "".join(ch for ch in work_id if ch.isalnum() or ch in {"-", "_"})
     if not safe:
         raise DispatchStoreError("work_id is empty")
+    if safe != work_id:
+        raise DispatchStoreError(f"invalid work_id: {work_id!r}")
+    return safe
+
+
+def _bundle_path(work_id: str, dispatch_dir: Path) -> Path:
+    safe = _validated_work_id(work_id)
+    _ensure_dir_mode(dispatch_dir, _DIR_MODE)
     return dispatch_dir / f"{safe}.json"
 
 
 def _load_dispatch_bundle_from_path(path: Path, work_id: str) -> dict[str, object]:
+    if path.is_symlink():
+        raise DispatchStoreError(f"expected regular file, found symlink: {path}")
     if not path.exists():
         raise DispatchStoreError(f"dispatch bundle not found: {work_id}")
+    _ensure_file_mode(path, _FILE_MODE, create=False)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
@@ -328,14 +418,28 @@ def _type_name(value: object) -> str:
 
 @contextmanager
 def _exclusive_bundle_lock(path: Path) -> Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_dir_mode(path.parent, _DIR_MODE)
     if _fcntl is None:
         # Non-POSIX platforms keep atomic rename but skip advisory locking.
         yield
         return
     lock_path = path.parent / ".dispatch.lock"
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-    os.fchmod(fd, 0o600)
+    if lock_path.is_symlink():
+        raise DispatchStoreError(f"expected regular file, found symlink: {lock_path}")
+    if lock_path.exists() and not stat.S_ISREG(lock_path.lstat().st_mode):
+        raise DispatchStoreError(f"expected regular file, found non-regular: {lock_path}")
+    try:
+        fd = os.open(lock_path, _open_flags(create=True), _FILE_MODE)
+    except OSError as exc:
+        raise DispatchStoreError(f"failed to open lock file {lock_path}: {exc}") from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise DispatchStoreError(f"expected regular file, found non-regular: {lock_path}")
+        os.fchmod(fd, _FILE_MODE)
+    except Exception:
+        os.close(fd)
+        raise
     with os.fdopen(fd, "r+b") as lock_file:
         _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
         try:
@@ -345,7 +449,7 @@ def _exclusive_bundle_lock(path: Path) -> Iterator[None]:
 
 
 def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_dir_mode(path.parent, _DIR_MODE)
     temporary: Path | None = None
     try:
         with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
@@ -354,7 +458,10 @@ def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
             temporary = Path(handle.name)
+        if temporary is not None:
+            _ensure_file_mode(temporary, _FILE_MODE, create=False)
         os.replace(temporary, path)
+        _ensure_file_mode(path, _FILE_MODE, create=False)
     except Exception:
         if temporary is not None:
             temporary.unlink(missing_ok=True)

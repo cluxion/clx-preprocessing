@@ -48,15 +48,23 @@ struct Msg {
 pub fn compress(payload: &Value) -> Result<Value, QueueError> {
     let raw_messages = match payload.get("messages") {
         None => return Err(QueueError::Usage("missing required field: messages".into())),
-        Some(value) => value.as_array().ok_or_else(|| {
-            QueueError::Usage("messages must be a list".into())
-        })?,
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| QueueError::Usage("messages must be a list".into()))?,
     };
     let mut messages: Vec<Msg> = Vec::with_capacity(raw_messages.len());
     for raw in raw_messages {
         messages.push(Msg {
-            role: raw.get("role").and_then(Value::as_str).unwrap_or("user").to_string(),
-            content: raw.get("content").and_then(Value::as_str).unwrap_or("").to_string(),
+            role: raw
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("user")
+                .to_string(),
+            content: raw
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
             pinned: raw.get("pinned").and_then(Value::as_bool).unwrap_or(false),
         });
     }
@@ -101,7 +109,12 @@ pub fn compress(payload: &Value) -> Result<Value, QueueError> {
     }
 
     let summary_request = if total > target_tokens {
-        Some(build_summary_request(&messages, &pinned, total, target_tokens))
+        Some(build_summary_request(
+            &messages,
+            &pinned,
+            total,
+            target_tokens,
+        ))
     } else {
         None
     };
@@ -247,7 +260,10 @@ fn stage_digest(messages: &mut [Msg], pinned: &[usize], total: &mut u64, target:
             .chars()
             .take(DIGEST_LINE_CHARS)
             .collect();
-        let replacement = format!("[cluxion digest] {}: {first_line} [{tokens} tokens elided]", messages[idx].role);
+        let replacement = format!(
+            "[cluxion digest] {}: {first_line} [{tokens} tokens elided]",
+            messages[idx].role
+        );
         let new_tokens = estimate_tokens(&replacement);
         if new_tokens >= tokens {
             continue;

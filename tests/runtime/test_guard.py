@@ -196,14 +196,16 @@ def test_is_our_daemon_accepts_python_host_cmdline(monkeypatch) -> None:
         "5",
     ]
     monkeypatch.setattr(psutil, "Process", lambda _pid: _FakeProcess(python_host))
-    assert guard_bridge._is_our_daemon(42) is True
+    verified = guard_bridge._is_our_daemon(42)
+    assert verified is not None
+    assert verified.cmdline() == python_host
 
 
 def test_is_our_daemon_rejects_foreign_cmdline(monkeypatch) -> None:
     monkeypatch.setattr(
         psutil, "Process", lambda _pid: _FakeProcess([sys.executable, "-c", "import time; time.sleep(60)"])
     )
-    assert guard_bridge._is_our_daemon(42) is False
+    assert guard_bridge._is_our_daemon(42) is None
 
 
 @pytest.mark.skipif(importlib.util.find_spec("cluxion_queue_native") is None, reason="native module not built")
@@ -452,3 +454,180 @@ def test_process_rows_nonzero_exit_returns_none(monkeypatch) -> None:
         lambda *args, **kwargs: subprocess.CompletedProcess(args, 1, stdout="", stderr=""),
     )
     assert guard_bridge._process_rows() is None
+
+
+class _SignalProbe:
+    def __init__(self, pid: int, *, create_time: float = 1.0, owned: bool = True) -> None:
+        self.pid = pid
+        self._create_time = create_time
+        self._owned = owned
+        self.terminate_calls = 0
+        self.kill_calls = 0
+
+    def create_time(self) -> float:
+        return self._create_time
+
+    def is_running(self) -> bool:
+        return True
+
+    def parents(self):
+        if not self._owned:
+            return []
+        return [type("P", (), {"pid": os.getpid()})()]
+
+    def cmdline(self) -> list[str]:
+        return [sys.executable, "-m", "cluxion_runtime.guard_daemon_host", "/tmp", "100", "5"]
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+
+    def wait(self, timeout: float | None = None) -> None:
+        del timeout
+        raise psutil.TimeoutExpired(self.pid)
+
+
+def test_stop_daemon_revalidates_before_terminate_and_kill(tmp_path: Path, monkeypatch) -> None:
+    pid = 4242
+    (tmp_path / guard_bridge.PID_FILE_NAME).write_text(str(pid), encoding="utf-8")
+    foreign = _SignalProbe(pid, create_time=99.0)
+    ours = _SignalProbe(pid, create_time=1.0)
+    calls = {"n": 0}
+
+    def fake_is_our(_pid: int):
+        calls["n"] += 1
+        # 1: initial verify, 2: before terminate (foreign reused), so never signal
+        if calls["n"] == 1:
+            return ours
+        return None
+
+    monkeypatch.setattr(guard_bridge, "_is_our_daemon", fake_is_our)
+    result = guard_bridge.stop_daemon(store_dir=tmp_path)
+    assert result["stopped"] is False
+    assert result["reason"] == "identity_mismatch"
+    assert ours.terminate_calls == 0 and ours.kill_calls == 0
+    assert foreign.terminate_calls == 0 and foreign.kill_calls == 0
+
+    calls["n"] = 0
+
+    def fake_is_our_timeout(_pid: int):
+        calls["n"] += 1
+        # pass initial + pre-terminate; fail pre-kill revalidation
+        if calls["n"] <= 2:
+            return ours
+        return None
+
+    monkeypatch.setattr(guard_bridge, "_is_our_daemon", fake_is_our_timeout)
+    (tmp_path / guard_bridge.PID_FILE_NAME).write_text(str(pid), encoding="utf-8")
+    result = guard_bridge.stop_daemon(store_dir=tmp_path)
+    assert result["ok"] is True and result["stopped"] is True
+    assert ours.terminate_calls == 1
+    assert ours.kill_calls == 0  # revalidation blocked kill after PID reuse
+
+
+def test_enforce_revalidates_before_terminate_and_kill(tmp_path: Path, monkeypatch) -> None:
+    probe = _SignalProbe(7777, create_time=1.0)
+    checks = {"n": 0}
+
+    def fake_rows():
+        return [
+            {
+                "pid": probe.pid,
+                "ppid": os.getpid(),
+                "name": "runaway",
+                "cpu_percent": 99.0,
+                "rss_mb": 9999,
+                "status": "R",
+                "zombie": False,
+            }
+        ]
+
+    def still_owned(proc, roots):
+        checks["n"] += 1
+        # one check immediately before terminate, one before kill — pre-kill fails
+        return checks["n"] < 2
+
+    monkeypatch.setattr(guard_bridge, "_process_rows", fake_rows)
+    monkeypatch.setattr(guard_bridge, "_process_or_none", lambda _pid: probe)
+    monkeypatch.setattr(guard_bridge, "_still_owned_and_same", still_owned)
+    monkeypatch.setattr(guard_bridge.psutil, "wait_procs", lambda procs, timeout=0: ([], list(procs)))
+
+    result = guard_bridge.enforce(
+        [os.getpid()],
+        cpu_threshold=0.0,
+        rss_threshold_mb=0,
+        dry_run=False,
+        grace_seconds=0.1,
+        store_dir=tmp_path,
+        protect=[],
+    )
+    assert result["ok"] is True
+    assert probe.terminate_calls == 1
+    assert probe.kill_calls == 0
+    assert probe.pid not in result["killed"]
+    # behavior: terminate once, kill blocked by revalidation — not a call-count assertion on duplicates
+    assert checks["n"] == 2
+
+
+def test_cpu_sample_ms_rejects_invalid_before_backend(monkeypatch) -> None:
+    monkeypatch.setattr(
+        queue_bridge,
+        "resolve_backend",
+        lambda: (_ for _ in ()).throw(AssertionError("backend must not run")),
+    )
+    for bad in (True, False, -1, 1.5, "100", (1 << 64), 10**400):
+        with pytest.raises(ValueError):
+            guard_bridge.sample({"cpu_sample_ms": bad})
+
+
+def test_cpu_sample_ms_zero_and_positive_pass_validation(monkeypatch) -> None:
+    seen: list[object] = []
+
+    def fake_python(body):
+        seen.append(body.get("cpu_sample_ms"))
+        return {"ok": True, "cpu_sample_ms": body.get("cpu_sample_ms")}
+
+    monkeypatch.setattr(queue_bridge, "resolve_backend", lambda: "python")
+    monkeypatch.setattr(guard_bridge, "_python_sample", fake_python)
+    assert guard_bridge.sample({"cpu_sample_ms": 0})["ok"] is True
+    assert guard_bridge.sample({"cpu_sample_ms": 250})["ok"] is True
+    assert seen == [0, 250]
+
+
+def test_cpu_sample_ms_overflow_maps_to_valueerror(monkeypatch) -> None:
+    monkeypatch.setattr(queue_bridge, "resolve_backend", lambda: "python")
+
+    def boom(interval=None):
+        del interval
+        raise OverflowError("interval too large")
+
+    monkeypatch.setattr(guard_bridge.psutil, "cpu_percent", boom)
+    monkeypatch.setattr(guard_bridge.psutil, "virtual_memory", lambda: type("M", (), {"total": 1, "available": 1})())
+    monkeypatch.setattr(guard_bridge, "_process_rows", lambda: [])
+    monkeypatch.setattr(guard_bridge, "_swap_used_mb", lambda: 0)
+    with pytest.raises(ValueError):
+        guard_bridge.sample({"cpu_sample_ms": 100})
+
+
+def test_guard_schema_cpu_sample_ms_minimum_is_zero() -> None:
+    from cluxion_agentplugin_preprocessing.schemas import GUARD_SCHEMA
+
+    prop = GUARD_SCHEMA["parameters"]["properties"]["cpu_sample_ms"]
+    assert prop["minimum"] == 0
+    assert prop["type"] == "integer"
+
+
+def test_cpu_sample_ms_python_rust_parity_zero(monkeypatch) -> None:
+    if importlib.util.find_spec("cluxion_queue_native") is None:
+        pytest.skip("native module not built")
+    monkeypatch.setenv(queue_bridge.QUEUE_BACKEND_ENV, "native")
+    native = guard_bridge.sample({"cpu_sample_ms": 0})
+    monkeypatch.setenv(queue_bridge.QUEUE_BACKEND_ENV, "python")
+    # force python path
+    monkeypatch.setattr(queue_bridge, "resolve_backend", lambda: "python")
+    py = guard_bridge.sample({"cpu_sample_ms": 0})
+    assert native["ok"] is True and py["ok"] is True
+    assert set(native) >= _SAMPLE_KEYS
+    assert set(py) >= _SAMPLE_KEYS

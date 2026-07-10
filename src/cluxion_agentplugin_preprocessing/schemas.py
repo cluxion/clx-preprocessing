@@ -363,7 +363,7 @@ GUARD_SCHEMA = {
                 "items": {"type": "integer"},
                 "description": "Root PIDs this agent owns; used for the ownership scan and required for enforce.",
             },
-            "cpu_sample_ms": {"type": "integer", "minimum": 100, "default": 100},
+            "cpu_sample_ms": {"type": "integer", "minimum": 0, "default": 100},
             "interval_ms": {"type": "integer", "minimum": 100, "default": 200},
             "window": {"type": "integer", "minimum": 1, "default": 25},
             "cpu_threshold": {

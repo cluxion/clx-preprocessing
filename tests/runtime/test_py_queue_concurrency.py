@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -133,6 +134,143 @@ def test_python_queue_uses_shared_lock_instead_of_per_bundle_locks(tmp_path: Pat
         lock_path = dispatch_dir / ".dispatch.lock"
         assert lock_path.exists()
         assert (lock_path.stat().st_mode & 0o777) == 0o600
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode migration only")
+def test_python_queue_migrates_store_and_dispatch_modes(tmp_path: Path) -> None:
+    parent_mode = tmp_path.stat().st_mode
+    store_dir = tmp_path / "queue"
+    store_dir.mkdir(parents=True)
+    store_dir.chmod(0o755)
+    db = store_dir / "work_queue.sqlite"
+    db.write_bytes(b"")
+    db.chmod(0o644)
+    dispatch = store_dir / "dispatch"
+    dispatch.mkdir()
+    dispatch.chmod(0o755)
+    bundle = dispatch / "loose.json"
+    bundle.write_text('{"work_id":"loose","steps":[]}', encoding="utf-8")
+    bundle.chmod(0o644)
+
+    py_queue.run("enqueue", _store_payload(store_dir, work_id="m1", prompt="p"))
+    py_queue.run("next", _store_payload(store_dir, work_id="loose"))
+
+    assert (store_dir.stat().st_mode & 0o777) == 0o700
+    assert (db.stat().st_mode & 0o777) == 0o600
+    assert (dispatch.stat().st_mode & 0o777) == 0o700
+    assert (bundle.stat().st_mode & 0o777) == 0o600
+    for side in (store_dir / "work_queue.sqlite-wal", store_dir / "work_queue.sqlite-shm"):
+        if side.exists():
+            assert (side.stat().st_mode & 0o777) == 0o600
+    # no recursive parent tightening
+    assert tmp_path.stat().st_mode == parent_mode
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode migration only")
+def test_dispatch_only_first_access_sets_store_and_dispatch_0700(tmp_path: Path) -> None:
+    """Dispatch-only path (no enqueue) must tighten application queue leaf + dispatch child."""
+    parent_mode = tmp_path.stat().st_mode
+    store_dir = tmp_path / "fresh_queue"
+    # store_dir does not exist yet — first access is pure dispatch persist
+    bundle = {
+        "work_id": "d1",
+        "steps": [
+            {
+                "step_id": "s1",
+                "segment_id": "g1",
+                "checksum": "c1",
+                "token_estimate": 1,
+                "content": "x",
+                "status": "queued",
+                "result": "",
+                "error": "",
+            }
+        ],
+    }
+    py_queue.run("persist", {**_store_payload(store_dir, work_id="d1"), "bundle": bundle})
+    assert store_dir.is_dir()
+    assert (store_dir.stat().st_mode & 0o777) == 0o700
+    dispatch = store_dir / "dispatch"
+    assert dispatch.is_dir()
+    assert (dispatch.stat().st_mode & 0o777) == 0o700
+    assert tmp_path.stat().st_mode == parent_mode
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode migration only")
+def test_python_queue_ignores_missing_sidecars_and_rejects_symlinks(tmp_path: Path) -> None:
+    store_dir = tmp_path / "queue"
+    store_dir.mkdir()
+    # missing WAL/SHM must not raise on first open
+    py_queue.run("enqueue", _store_payload(store_dir, work_id="s1", prompt="p"))
+
+    victim = tmp_path / "outside-target"
+    victim.write_text("SECRET", encoding="utf-8")
+    victim.chmod(0o644)
+    victim_mode = victim.stat().st_mode
+    victim_text = victim.read_text(encoding="utf-8")
+
+    # planted bundle symlink: actual next must error and leave victim untouched
+    dispatch = store_dir / "dispatch"
+    dispatch.mkdir(exist_ok=True)
+    link = dispatch / "alias.json"
+    link.symlink_to(victim)
+    with pytest.raises(RuntimeError, match=r"symlink|expected"):
+        py_queue.run("next", _store_payload(store_dir, work_id="alias"))
+    assert link.is_symlink()
+    assert victim.read_text(encoding="utf-8") == victim_text
+    assert victim.stat().st_mode == victim_mode
+
+    # planted lock symlink: persist must error and leave lock-target untouched
+    lock_victim = tmp_path / "lock-victim"
+    lock_victim.write_text("LOCK", encoding="utf-8")
+    lock_victim.chmod(0o644)
+    lock_mode = lock_victim.stat().st_mode
+    lock_text = lock_victim.read_text(encoding="utf-8")
+    lock_link = dispatch / ".dispatch.lock"
+    if lock_link.exists() or lock_link.is_symlink():
+        lock_link.unlink()
+    lock_link.symlink_to(lock_victim)
+    with pytest.raises(RuntimeError, match=r"symlink|expected"):
+        py_queue.run(
+            "persist",
+            {
+                **_store_payload(store_dir, work_id="safe"),
+                "bundle": {
+                    "work_id": "safe",
+                    "steps": [
+                        {
+                            "step_id": "s1",
+                            "segment_id": "g1",
+                            "checksum": "c1",
+                            "token_estimate": 1,
+                            "content": "x",
+                            "status": "queued",
+                            "result": "",
+                            "error": "",
+                        }
+                    ],
+                },
+            },
+        )
+    assert lock_link.is_symlink()
+    assert lock_victim.read_text(encoding="utf-8") == lock_text
+    assert lock_victim.stat().st_mode == lock_mode
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode migration only")
+def test_python_queue_rejects_db_symlink_without_touching_victim(tmp_path: Path) -> None:
+    store_dir = tmp_path / "queue"
+    store_dir.mkdir()
+    victim = tmp_path / "real.sqlite"
+    victim.write_bytes(b"VICTIM-DB")
+    victim.chmod(0o644)
+    mode = victim.stat().st_mode
+    data = victim.read_bytes()
+    (store_dir / "work_queue.sqlite").symlink_to(victim)
+    with pytest.raises(RuntimeError, match=r"symlink|expected"):
+        py_queue.run("enqueue", _store_payload(store_dir, work_id="x", prompt="p"))
+    assert victim.read_bytes() == data
+    assert victim.stat().st_mode == mode
 
 
 def test_python_queue_concurrent_dequeue_serializes_select_update(

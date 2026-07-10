@@ -115,9 +115,13 @@
       "native package not installed"
     ],
     "fix_steps": [
-      "Build+install the native backend: cd <plugin-root> && uv pip install ./rust/cluxion_queue --python .venv/bin/python (or pip install ./rust/cluxion_queue)",
+      "Build the supported merged platform wheel: bash scripts/build_local_wheel.sh",
+      "Resolve exactly one absolute wheel: WHEEL=\"$(python3 -c 'from pathlib import Path; w=list(Path(\"dist-merged\").glob(\"cluxion_agentplugin_preprocessing-*.whl\")); assert len(w)==1, f\"expected exactly one wheel, got {len(w)}\"; print(w[0].resolve())')\"",
+      "Install: uv tool install --force \"$WHEEL\"",
+      "Install into Hermes: uv pip install --python \"$HOME/.hermes/hermes-agent/venv/bin/python\" --no-deps --reinstall \"$WHEEL\"",
+      "Run: uv pip check --python \"$HOME/.hermes/hermes-agent/venv/bin/python\"",
       "Run: python -c 'import cluxion_queue_native'",
-      "If ImportError, reinstall the bundled wheel; fallback keeps working meanwhile"
+      "If ImportError, rebuild via scripts/build_local_wheel.sh and reinstall the same $WHEEL; fallback keeps working meanwhile"
     ],
     "change_robust": "Attempts the import + hasattr at runtime; WARN (not fail) because fallback works",
     "detection_method": "import cluxion_queue_native succeeds"
@@ -417,11 +421,12 @@
     ],
     "fix_steps": [
       "Check Python version and SOABI: python -c 'import sysconfig; print(f\"{sysconfig.get_python_version()} {sysconfig.get_config_var(\\\"SOABI\\\")}\")' ",
-      "Verify abi3 in Cargo.toml: grep 'abi3' /path/to/cluxion_queue/Cargo.toml",
-      "Check built wheel tags: pip show cluxion-queue-native | grep -A5 Location, then unzip -l <whl> | grep .so",
-      "Rebuild: cd rust/cluxion_queue && maturin develop --release",
-      "Force download correct wheel: pip install --force-reinstall --no-cache-dir cluxion-agentplugin-preprocessing",
-      "Check architecture: python -c 'import platform; print(platform.machine())'  (must match wheel filename)"
+      "Verify abi3 in Cargo.toml: grep 'abi3' rust/cluxion_queue/Cargo.toml",
+      "Rebuild the supported merged platform wheel: bash scripts/build_local_wheel.sh",
+      "Resolve exactly one absolute wheel: WHEEL=\"$(python3 -c 'from pathlib import Path; w=list(Path(\"dist-merged\").glob(\"cluxion_agentplugin_preprocessing-*.whl\")); assert len(w)==1, f\"expected exactly one wheel, got {len(w)}\"; print(w[0].resolve())')\"",
+      "Reinstall: HERMES_PY=\"$HOME/.hermes/hermes-agent/venv/bin/python\"; uv tool install --force \"$WHEEL\" && uv pip install --python \"$HERMES_PY\" --no-deps --reinstall \"$WHEEL\" && uv pip check --python \"$HERMES_PY\"",
+      "Check architecture: python -c 'import platform; print(platform.machine())'  (must match wheel filename)",
+      "Confirm import: python -c 'import cluxion_queue_native; from cluxion_queue_native import __backend__; assert __backend__ == \"rust_native\"'"
     ],
     "change_robust": "Verify abi3 feature in Cargo.toml remains pinned; test wheel upload includes both arm64 and x86_64 variants for macOS",
     "detection_method": "python -c 'import sysconfig; print(sysconfig.get_config_var(\"SOABI\")); from cluxion_queue_native import __backend__; assert __backend__ == \"rust_native\"'"

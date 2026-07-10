@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -325,7 +326,7 @@ def _release_crashed_step(work_id: str, step_id: str, exc: BaseException) -> Non
     """Park a step whose worker crashed mid-flight in 'retry_wait' for the next run."""
     if not step_id:
         return
-    try:
+    with suppress(Exception):
         record_dispatch_result(
             work_id,
             step_id,
@@ -333,10 +334,8 @@ def _release_crashed_step(work_id: str, step_id: str, exc: BaseException) -> Non
             succeeded=False,
             retryable=True,
         )
-    except Exception:
-        # Best-effort: if the store itself is broken, the stale-running lease
-        # in next_dispatch_step reclaims the step instead.
-        pass
+    # Best-effort: if the store itself is broken, the stale-running lease in
+    # next_dispatch_step reclaims the step instead.
 
 
 def _normalize_timeout_seconds(value: object) -> float | None:

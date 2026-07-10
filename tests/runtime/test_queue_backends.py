@@ -207,3 +207,56 @@ def test_forced_subprocess_timeout_reports_command(monkeypatch, tmp_path: Path) 
 
 def test_resolve_backend_honors_env(backend) -> None:
     assert queue_bridge.resolve_backend() == backend
+
+
+def test_work_id_alias_rejected_cross_backend(backend, tmp_path: Path) -> None:
+    """vic!tim must never read/mutate a victim bundle on any backend."""
+    if backend == "native" and not _native_has_strict_work_id():
+        pytest.skip("installed native module predates strict work_id; covered by Rust unit tests")
+    store = tmp_path / "queue"
+    victim_bundle = _two_step_bundle("victim")
+    queue_bridge.persist_dispatch_bundle("victim", victim_bundle, store_dir=store)
+    with pytest.raises(RuntimeError, match=r"invalid|empty|work_id"):
+        queue_bridge.next_dispatch_step("vic!tim", store_dir=store)
+    with pytest.raises(RuntimeError, match=r"invalid|empty|work_id"):
+        queue_bridge.record_dispatch_step("vic!tim", "s1", result="x", store_dir=store)
+    with pytest.raises(RuntimeError, match=r"invalid|empty|work_id"):
+        queue_bridge.build_briefing("vic!tim", store_dir=store)
+    # victim remains untouched / still claimable
+    claimed = queue_bridge.next_dispatch_step("victim", store_dir=store)
+    assert claimed["ready"] is True
+    assert claimed["step"]["step_id"] == "s1"
+
+
+def test_work_id_unicode_valid_cross_backend(backend, tmp_path: Path) -> None:
+    if backend == "native" and not _native_has_strict_work_id():
+        pytest.skip("installed native module predates strict work_id; covered by Rust unit tests")
+    store = tmp_path / "queue"
+    work_id = "작업-테스트1"
+    queue_bridge.persist_dispatch_bundle(work_id, _two_step_bundle(work_id), store_dir=store)
+    claimed = queue_bridge.next_dispatch_step(work_id, store_dir=store)
+    assert claimed["ready"] is True
+    assert claimed["work_id"] == work_id
+    rec = queue_bridge.record_dispatch_step(work_id, "s1", result="ok", store_dir=store)
+    assert rec["recorded"] is True
+
+
+def _native_has_strict_work_id() -> bool:
+    """Detect whether the installed native extension rejects sanitized≠original ids."""
+    import json
+    import tempfile
+
+    try:
+        import cluxion_queue_native as native
+    except ImportError:
+        return False
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Path(tmp)
+        try:
+            native.run(
+                "next",
+                json.dumps({"store_dir": str(store), "work_id": "vic!tim"}, ensure_ascii=False),
+            )
+        except RuntimeError as exc:
+            return "invalid" in str(exc).lower()
+        return False

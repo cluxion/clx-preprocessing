@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from io import StringIO
@@ -16,6 +17,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
     CommandRunner = Callable[[Sequence[str], str | None], subprocess.CompletedProcess[str]]
+
+# Serializes global sys.stdin/stdout/stderr redirects for the in-process path.
+_INPROCESS_STDIO_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -300,33 +304,34 @@ def _run_command(command: Sequence[str], stdin: str | None) -> subprocess.Comple
 def _run_inprocess(command: Sequence[str], stdin: str | None) -> subprocess.CompletedProcess[str]:
     from cluxion_runtime.cli import main as runtime_main
 
-    old_stdin = sys.stdin
-    stdout = StringIO()
-    stderr = StringIO()
-    try:
-        sys.stdin = StringIO(stdin or "")
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            returncode = runtime_main(list(command[1:]))
-    except SystemExit as exc:
-        # argparse / runtime may raise SystemExit; map to CompletedProcess so
-        # _execute_json can return a structured RuntimeResult instead of aborting.
-        code = exc.code
-        if isinstance(code, int):
-            exit_code = code
-        elif code is None:
-            exit_code = 0
-        else:
-            exit_code = 1
+    with _INPROCESS_STDIO_LOCK:
+        old_stdin = sys.stdin
+        stdout = StringIO()
+        stderr = StringIO()
+        try:
+            sys.stdin = StringIO(stdin or "")
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                returncode = runtime_main(list(command[1:]))
+        except SystemExit as exc:
+            # argparse / runtime may raise SystemExit; map to CompletedProcess so
+            # _execute_json can return a structured RuntimeResult instead of aborting.
+            code = exc.code
+            if isinstance(code, int):
+                exit_code = code
+            elif code is None:
+                exit_code = 0
+            else:
+                exit_code = 1
+            return subprocess.CompletedProcess(
+                list(command), exit_code, stdout=stdout.getvalue(), stderr=stderr.getvalue()
+            )
+        except Exception as exc:
+            return subprocess.CompletedProcess(list(command), 1, stdout=stdout.getvalue(), stderr=str(exc))
+        finally:
+            sys.stdin = old_stdin
         return subprocess.CompletedProcess(
-            list(command), exit_code, stdout=stdout.getvalue(), stderr=stderr.getvalue()
+            list(command), int(returncode), stdout=stdout.getvalue(), stderr=stderr.getvalue()
         )
-    except Exception as exc:
-        return subprocess.CompletedProcess(list(command), 1, stdout=stdout.getvalue(), stderr=str(exc))
-    finally:
-        sys.stdin = old_stdin
-    return subprocess.CompletedProcess(
-        list(command), int(returncode), stdout=stdout.getvalue(), stderr=stderr.getvalue()
-    )
 
 
 def _runtime_binary(binary: str | None) -> str:

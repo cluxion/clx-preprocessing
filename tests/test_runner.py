@@ -231,3 +231,52 @@ def test_context_compress_accepts_valid_messages_structure() -> None:
     except ValueError as exc:
         assert "must be an object with string content" not in str(exc)
     # ok if other error like runtime missing
+
+
+def test_run_inprocess_stdio_lock_serializes_threads(monkeypatch) -> None:
+    """Two concurrent in-process runs must not interleave global stdio redirects."""
+    import sys
+    import threading
+    import time
+
+    hold = threading.Event()
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    order: list[str] = []
+    results: dict[str, subprocess.CompletedProcess[str]] = {}
+    original = (sys.stdin, sys.stdout, sys.stderr)
+
+    def fake_main(argv: list[str]) -> int:
+        label = argv[0]
+        order.append(f"enter:{label}")
+        if label == "first":
+            first_entered.set()
+            assert hold.wait(timeout=2.0)
+        else:
+            second_entered.set()
+        print(f"out-{label}", end="")
+        print(f"err-{label}", end="", file=sys.stderr)
+        order.append(f"exit:{label}")
+        return 0
+
+    monkeypatch.setattr("cluxion_runtime.cli.main", fake_main)
+
+    def run(label: str) -> None:
+        results[label] = runner._run_inprocess(["cluxion-runtime", label], f"in-{label}")
+
+    t1 = threading.Thread(target=run, args=("first",))
+    t2 = threading.Thread(target=run, args=("second",))
+    t1.start()
+    assert first_entered.wait(timeout=2.0)
+    t2.start()
+    time.sleep(0.15)
+    assert not second_entered.is_set(), "second thread entered while first still held the lock"
+    hold.set()
+    t1.join(timeout=2.0)
+    t2.join(timeout=2.0)
+    assert order == ["enter:first", "exit:first", "enter:second", "exit:second"]
+    assert results["first"].stdout == "out-first"
+    assert results["first"].stderr == "err-first"
+    assert results["second"].stdout == "out-second"
+    assert results["second"].stderr == "err-second"
+    assert (sys.stdin, sys.stdout, sys.stderr) == original
