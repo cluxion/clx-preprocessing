@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from typing import TYPE_CHECKING
 
 import pytest
 
+from cluxion_agentplugin_preprocessing import cli
 from cluxion_runtime.bootstrap import RUNTIME_VENV_ENV, ensure_local_runtime
 
 if TYPE_CHECKING:
@@ -110,6 +112,19 @@ def test_bootstrap_falls_back_to_uv_when_pip_module_is_missing(monkeypatch: pyte
 def test_bootstrap_rejects_unsafe_package_name() -> None:
     with pytest.raises(ValueError, match="unsafe package"):
         ensure_local_runtime(packages=("vllm-mlx;rm -rf /",), dry_run=True)
+
+
+def test_cli_bootstrap_empty_package_returns_invalid_input(capsys) -> None:
+    """Empty --package must be structured invalid_input (code 2), not invalid_config/traceback."""
+    code = cli.main(["bootstrap", "--dry-run", "--package", ""])
+    captured = capsys.readouterr()
+    combined = f"{captured.out}\n{captured.err}"
+
+    assert code == 2
+    assert "Traceback" not in combined
+    payload = json.loads(captured.out)
+    assert payload["ok"] is False
+    assert payload["error"] == "invalid_input"
 
 
 def test_bootstrap_reports_install_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:

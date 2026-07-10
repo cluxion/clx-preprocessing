@@ -73,6 +73,40 @@ def test_cli_enable_reports_json(tmp_path: Path, capsys) -> None:
     assert payload["changed"] is True
 
 
+def test_cli_status_malformed_config_returns_structured_json_error(tmp_path: Path, capsys) -> None:
+    """Malformed config.yaml must yield nonzero structured JSON, not a traceback."""
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  enabled: [unterminated\n",
+        encoding="utf-8",
+    )
+
+    code = cli.main(["status", "--home", str(tmp_path)])
+    captured = capsys.readouterr()
+    combined = f"{captured.out}\n{captured.err}"
+
+    assert code != 0
+    assert "Traceback" not in combined
+    payload = json.loads(captured.out)
+    assert "error" in payload
+    assert "message" in payload
+    assert payload["error"] == "invalid_config"
+    assert payload["message"]
+
+
+def test_cli_status_invalid_utf8_config_returns_invalid_config(tmp_path: Path, capsys) -> None:
+    """Invalid UTF-8 in config.yaml must be invalid_config (exit 2), not traceback."""
+    (tmp_path / "config.yaml").write_bytes(b"\xff\xfe")
+
+    code = cli.main(["status", "--home", str(tmp_path)])
+    captured = capsys.readouterr()
+    combined = f"{captured.out}\n{captured.err}"
+
+    assert code == 2
+    assert "Traceback" not in combined
+    payload = json.loads(captured.out)
+    assert payload["error"] == "invalid_config"
+
+
 def test_hermes_config_set_commands_include_provider_model_context_length() -> None:
     patch = build_hermes_local_endpoint_patch(
         "local-128k",

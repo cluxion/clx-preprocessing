@@ -16,6 +16,10 @@ PLUGIN_NAME = "cluxion-agentplugin-preprocessing"
 LEGACY_PLUGIN_NAME = "hermes-cluxion"
 
 
+class InvalidConfigError(ValueError):
+    """Hermes config is malformed or has an invalid shape."""
+
+
 @dataclass(frozen=True)
 class ConfigChange:
     """Result of a Hermes config update."""
@@ -79,14 +83,17 @@ def config_path(home: str | os.PathLike[str] | None = None) -> Path:
 def _read_config(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
-    raw = path.read_text(encoding="utf-8")
-    if not raw.strip():
-        return {}
-    loaded = yaml.safe_load(raw)
+    try:
+        raw = path.read_text(encoding="utf-8")
+        if not raw.strip():
+            return {}
+        loaded = yaml.safe_load(raw)
+    except (UnicodeError, yaml.YAMLError) as exc:
+        raise InvalidConfigError(f"invalid YAML in {path}: {exc}") from exc
     if loaded is None:
         return {}
     if not isinstance(loaded, dict):
-        raise ValueError(f"{path} must contain a YAML mapping")
+        raise InvalidConfigError(f"{path} must contain a YAML mapping")
     return dict(loaded)
 
 
@@ -106,7 +113,7 @@ def _is_enabled(config: dict[str, Any]) -> bool:
 def _set_enabled(config: dict[str, Any], *, enabled: bool) -> bool:
     plugins = config.setdefault("plugins", {})
     if not isinstance(plugins, dict):
-        raise ValueError("plugins must be a YAML mapping")
+        raise InvalidConfigError("plugins must be a YAML mapping")
     enabled_list = _as_list(plugins.get("enabled"))
     disabled_list = _as_list(plugins.get("disabled"))
 
@@ -133,11 +140,11 @@ def _as_list(value: object) -> list[str]:
     if value is None:
         return []
     if not isinstance(value, list):
-        raise ValueError("plugins.enabled/plugins.disabled must be YAML lists")
+        raise InvalidConfigError("plugins.enabled/plugins.disabled must be YAML lists")
     items: list[str] = []
     for item in value:
         if not isinstance(item, str):
-            raise ValueError("plugins.enabled/plugins.disabled entries must be strings")
+            raise InvalidConfigError("plugins.enabled/plugins.disabled entries must be strings")
         items.append(item)
     return items
 
@@ -166,4 +173,11 @@ def _backup_config(path: Path) -> Path | None:
     return backup
 
 
-__all__ = ["ConfigChange", "config_path", "disable_plugin", "enable_plugin", "plugin_status"]
+__all__ = [
+    "ConfigChange",
+    "InvalidConfigError",
+    "config_path",
+    "disable_plugin",
+    "enable_plugin",
+    "plugin_status",
+]

@@ -25,24 +25,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run cluxion-preprocess CLI."""
     parser = _parser()
     args = parser.parse_args(argv)
-    if args.command == "check":
-        return _check()
-    if args.command == "bootstrap":
-        return _bootstrap(args)
-    if args.command == "status":
-        return _status(args)
-    if args.command == "enable":
-        return _enable(args)
-    if args.command == "disable":
-        return _disable(args)
-    if args.command == "hermes-config":
-        return _hermes_config(args)
-    if args.command == "doctor":
-        return _doctor(args)
-    if args.command == "hermes-patch":
-        return _hermes_patch(args)
-    parser.print_help(sys.stderr)
-    return 2
+    try:
+        if args.command == "check":
+            return _check()
+        if args.command == "bootstrap":
+            return _bootstrap(args)
+        if args.command == "status":
+            return _status(args)
+        if args.command == "enable":
+            return _enable(args)
+        if args.command == "disable":
+            return _disable(args)
+        if args.command == "hermes-config":
+            return _hermes_config(args)
+        if args.command == "doctor":
+            return _doctor(args)
+        if args.command == "hermes-patch":
+            return _hermes_patch(args)
+        parser.print_help(sys.stderr)
+        return 2
+    except ValueError as exc:
+        error = (
+            "invalid_config"
+            if isinstance(exc, hermes_config.InvalidConfigError)
+            else "invalid_input"
+        )
+        print(
+            json.dumps(
+                {"ok": False, "error": error, "message": str(exc)},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 2
 
 
 def _parser() -> argparse.ArgumentParser:

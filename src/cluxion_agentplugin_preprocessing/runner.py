@@ -307,6 +307,19 @@ def _run_inprocess(command: Sequence[str], stdin: str | None) -> subprocess.Comp
         sys.stdin = StringIO(stdin or "")
         with redirect_stdout(stdout), redirect_stderr(stderr):
             returncode = runtime_main(list(command[1:]))
+    except SystemExit as exc:
+        # argparse / runtime may raise SystemExit; map to CompletedProcess so
+        # _execute_json can return a structured RuntimeResult instead of aborting.
+        code = exc.code
+        if isinstance(code, int):
+            exit_code = code
+        elif code is None:
+            exit_code = 0
+        else:
+            exit_code = 1
+        return subprocess.CompletedProcess(
+            list(command), exit_code, stdout=stdout.getvalue(), stderr=stderr.getvalue()
+        )
     except Exception as exc:
         return subprocess.CompletedProcess(list(command), 1, stdout=stdout.getvalue(), stderr=str(exc))
     finally:

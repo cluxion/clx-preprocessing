@@ -126,6 +126,18 @@ def test_missing_runtime_binary_falls_back_to_inprocess_runtime() -> None:
     assert payload["result"]["item"]["surface"] == "hermes"
 
 
+def test_queue_next_dash_work_id_returns_runtime_result_not_systemexit(monkeypatch) -> None:
+    """In-process path: argparse-style -x work_id must not raise SystemExit."""
+    monkeypatch.delenv("CLUXION_RUNTIME_BIN", raising=False)
+    with _isolated_path(""):
+        result = runner.queue_next({"work_id": "-x"})
+
+    payload = json.loads(result.to_json())
+
+    assert result.ok is False
+    assert payload["returncode"] == 2
+
+
 def test_missing_configured_runtime_returns_error() -> None:
     with _isolated_path(""), _isolated_env("CLUXION_RUNTIME_BIN", "/missing/cluxion-runtime"):
         result = runner.plan({"prompt": "hello"}, command_runner=_unused_runner)
