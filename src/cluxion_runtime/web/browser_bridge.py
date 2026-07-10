@@ -45,6 +45,7 @@ _session: dict[str, Any] = {
     "browser": None,
     "context": None,
     "mode": None,
+    "page": None,
 }
 
 
@@ -299,18 +300,24 @@ def _get_page() -> tuple[Any | None, str | None]:
 
     mode = str(session["browser_mode"])
     try:
+        page = _session.get("page")
+        if page is not None and not page.is_closed():
+            return page, mode
+
         browser = _session.get("browser")
         if browser is not None:
             contexts = browser.contexts
             if contexts:
-                return contexts[0].new_page(), mode
+                page = contexts[0].new_page()
+                _session["page"] = page
+                return page, mode
             return None, mode
 
         context = _session.get("context")
         if context is not None:
-            if context.pages:
-                return context.pages[0], mode
-            return context.new_page(), mode
+            page = context.new_page()
+            _session["page"] = page
+            return page, mode
     except Exception:
         # Cached session whose browser/CDP link died: reset so the next call reconnects.
         _close_session()
@@ -340,9 +347,6 @@ def _with_page(callback: Any) -> dict[str, Any]:
         return _browser_unreachable(mode)
     except Exception:
         return _browser_unreachable(mode)
-    finally:
-        with contextlib.suppress(Exception):
-            page.close()
 
 
 def _navigate_and_extract(
@@ -392,6 +396,12 @@ def _close_session() -> None:
     browser = _session.get("browser")
     playwright = _session.get("playwright")
     owns_browser = _session.get("mode") != "cdp"
+
+    page = _session.get("page")
+    if page is not None:
+        with contextlib.suppress(Exception):
+            page.close()
+    _session["page"] = None
 
     if owns_browser and context is not None:
         with contextlib.suppress(Exception):

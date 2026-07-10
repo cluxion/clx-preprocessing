@@ -7,6 +7,6 @@ from importlib.metadata import PackageNotFoundError, version
 try:
     __version__ = version("cluxion-agentplugin-preprocessing")
 except PackageNotFoundError:  # pragma: no cover
-    __version__ = "0.3.55"
+    __version__ = "0.3.56"
 
 __all__ = ["__version__"]
