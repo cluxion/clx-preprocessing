@@ -207,6 +207,7 @@ def _run_plan(args: argparse.Namespace) -> int:
             item_output["original_prompt_stored"] = True
         output["dispatch_store"] = {"stored": True, "path": str(persisted)}
     loop_auto_flag = payload.get("loop_auto") if isinstance(payload, dict) else None
+    loop_ok = True
     if should_auto_loop_plan(output, loop_auto=bool(loop_auto_flag) if loop_auto_flag is not None else None):
         cwd = str(payload.get("cwd", "")) if isinstance(payload, dict) else ""
         loop_result = run_loop_auto(
@@ -220,8 +221,9 @@ def _run_plan(args: argparse.Namespace) -> int:
             )
         )
         output["loop_auto"] = loop_result.to_dict()
+        loop_ok = loop_result.ok
     print(json.dumps(output, ensure_ascii=False, sort_keys=True))
-    return 0
+    return 0 if loop_ok else 1
 
 
 def _run_loop_auto(args: argparse.Namespace) -> int:
