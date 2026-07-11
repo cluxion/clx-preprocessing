@@ -141,24 +141,38 @@ pub fn record_step(store_dir: &Path, payload: &Value) -> Result<Value, QueueErro
         .get("retryable")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let status = if failed {
+        if retryable {
+            "retry_wait"
+        } else {
+            "failed"
+        }
+    } else {
+        "succeeded"
+    };
     let dispatch_dir = dispatch_dir(store_dir)?;
     let path = bundle_path(&dispatch_dir, work_id)?;
     with_dispatch_lock(&dispatch_dir, || {
         let mut bundle = read_bundle(&path)?;
+        let mut terminal_replay = None;
         let mut recorded_status = None;
         {
             let steps = steps_mut(&mut bundle)?;
             for step in steps.iter_mut() {
                 if step.get("step_id") == Some(&json!(step_id)) {
-                    step["status"] = json!(if failed {
-                        if retryable {
-                            "retry_wait"
-                        } else {
-                            "failed"
-                        }
-                    } else {
-                        "succeeded"
-                    });
+                    let stored_status = step.get("status").and_then(Value::as_str).unwrap_or("");
+                    if matches!(stored_status, "succeeded" | "failed") {
+                        let stored_result =
+                            step.get("result").and_then(Value::as_str).unwrap_or("");
+                        let stored_error = step.get("error").and_then(Value::as_str).unwrap_or("");
+                        terminal_replay = Some((
+                            stored_status.to_string(),
+                            stored_result.to_string(),
+                            stored_error.to_string(),
+                        ));
+                        break;
+                    }
+                    step["status"] = json!(status);
                     step["result"] = json!(result);
                     step["error"] = json!(error);
                     step["updated_at"] = json!(now_secs());
@@ -166,6 +180,30 @@ pub fn record_step(store_dir: &Path, payload: &Value) -> Result<Value, QueueErro
                     break;
                 }
             }
+        }
+        if let Some((stored_status, stored_result, stored_error)) = terminal_replay {
+            if stored_status == status && stored_result == result && stored_error == error {
+                let steps = steps_ref(&bundle)?;
+                return Ok(ok_payload(json!({
+                    "work_id": work_id,
+                    "step_id": step_id,
+                    "recorded": true,
+                    "idempotent": true,
+                    "status": stored_status,
+                    "remaining": remaining_count(steps),
+                    "synthesis_ready": steps.iter().all(|item| item.get("status") == Some(&json!("succeeded"))),
+                })));
+            }
+            return Ok(json!({
+                "ok": false,
+                "error": "step_already_recorded",
+                "work_id": work_id,
+                "step_id": step_id,
+                "recorded": false,
+                "stored_status": stored_status,
+                "stored_result": stored_result,
+                "stored_error": stored_error,
+            }));
         }
         if let Some(status) = recorded_status {
             write_atomic_json(&path, &bundle)?;
@@ -638,6 +676,48 @@ mod tests {
         let after: Value = serde_json::from_slice(&before).unwrap();
         assert_eq!(after["steps"][0]["status"], "succeeded");
         assert_eq!(after["steps"][0]["result"], "kept");
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn terminal_record_replay_is_idempotent_and_conflict_safe() {
+        let store = temp_store();
+        let path = store.join("dispatch").join("d1.json");
+        persist_bundle(
+            &store,
+            &json!({"work_id": "d1", "bundle": two_step_bundle("c1")}),
+        )
+        .expect("persist");
+
+        record_step(
+            &store,
+            &json!({"work_id": "d1", "step_id": "s1", "result": "FIRST"}),
+        )
+        .expect("first record");
+        let first_bytes = fs::read(&path).expect("read first");
+
+        let replay = record_step(
+            &store,
+            &json!({"work_id": "d1", "step_id": "s1", "result": "FIRST"}),
+        )
+        .expect("replay");
+        assert_eq!(replay["ok"], true);
+        assert_eq!(replay["recorded"], true);
+        assert_eq!(replay["idempotent"], true);
+        assert_eq!(fs::read(&path).expect("read replay"), first_bytes);
+
+        let conflict = record_step(
+            &store,
+            &json!({"work_id": "d1", "step_id": "s1", "result": "SECOND"}),
+        )
+        .expect("conflict contract");
+        assert_eq!(conflict["ok"], false);
+        assert_eq!(conflict["error"], "step_already_recorded");
+        assert_eq!(conflict["recorded"], false);
+        assert_eq!(conflict["stored_status"], "succeeded");
+        assert_eq!(conflict["stored_result"], "FIRST");
+        assert_eq!(conflict["stored_error"], "");
+        assert_eq!(fs::read(&path).expect("read conflict"), first_bytes);
         let _ = fs::remove_dir_all(&store);
     }
 

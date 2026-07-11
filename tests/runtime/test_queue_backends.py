@@ -198,6 +198,52 @@ def test_dispatch_retryable_failure_requeues_step(backend) -> None:
     assert retaken["step"]["step_id"] == "s1"
 
 
+def test_dispatch_terminal_record_replay_is_idempotent_and_conflict_safe(backend, tmp_path: Path) -> None:
+    work_id = "d-terminal"
+    queue_bridge.persist_dispatch_bundle(work_id, _two_step_bundle(work_id))
+    first = queue_bridge.record_dispatch_step(work_id, "s1", result="FIRST")
+    assert first["recorded"] is True
+
+    bundle_path = tmp_path / "queue" / "dispatch" / f"{work_id}.json"
+    first_bytes = bundle_path.read_bytes()
+
+    replay = queue_bridge.record_dispatch_step(work_id, "s1", result="FIRST")
+    assert replay["ok"] is True
+    assert replay["recorded"] is True
+    assert replay["idempotent"] is True
+    assert bundle_path.read_bytes() == first_bytes
+
+    conflict = queue_bridge.record_dispatch_step(work_id, "s1", result="SECOND")
+    assert conflict == {
+        "ok": False,
+        "error": "step_already_recorded",
+        "work_id": work_id,
+        "step_id": "s1",
+        "recorded": False,
+        "stored_status": "succeeded",
+        "stored_result": "FIRST",
+        "stored_error": "",
+    }
+    assert bundle_path.read_bytes() == first_bytes
+
+
+def test_dispatch_retry_wait_can_transition_to_terminal(backend) -> None:
+    work_id = "d-retry-terminal"
+    queue_bridge.persist_dispatch_bundle(work_id, _two_step_bundle(work_id))
+    retry = queue_bridge.record_dispatch_step(
+        work_id,
+        "s1",
+        error="temporary",
+        failed=True,
+        retryable=True,
+    )
+    assert retry["status"] == "retry_wait"
+
+    completed = queue_bridge.record_dispatch_step(work_id, "s1", result="recovered")
+    assert completed["ok"] is True
+    assert completed["status"] == "succeeded"
+
+
 def test_identical_repersist_preserves_progress_bytes(backend, tmp_path: Path) -> None:
     work_id = "d-idem"
     assert queue_bridge.persist_dispatch_bundle(work_id, _two_step_bundle(work_id))["stored"] is True

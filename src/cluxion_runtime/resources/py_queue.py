@@ -499,15 +499,44 @@ def _record_step(store_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
     step_id = _require_str(payload, "step_id")
     failed = bool(payload.get("failed", False))
     retryable = bool(payload.get("retryable", False))
+    status = ("retry_wait" if retryable else "failed") if failed else "succeeded"
+    result = payload.get("result", "")
+    error = payload.get("error", "")
     path = _bundle_path(store_dir, work_id)
     with _exclusive_bundle_lock(path):
         bundle = _read_bundle(path)
         steps = _steps(bundle)
         for step in steps:
             if step.get("step_id") == step_id:
-                step["status"] = ("retry_wait" if retryable else "failed") if failed else "succeeded"
-                step["result"] = payload.get("result", "")
-                step["error"] = payload.get("error", "")
+                if step.get("status") in {"succeeded", "failed"}:
+                    stored_status = str(step.get("status", ""))
+                    stored_result = str(step.get("result", ""))
+                    stored_error = str(step.get("error", ""))
+                    if stored_status == status and stored_result == result and stored_error == error:
+                        return _ok(
+                            {
+                                "work_id": work_id,
+                                "step_id": step_id,
+                                "recorded": True,
+                                "idempotent": True,
+                                "status": stored_status,
+                                "remaining": _remaining(steps),
+                                "synthesis_ready": all(s.get("status") == "succeeded" for s in steps),
+                            }
+                        )
+                    return {
+                        "ok": False,
+                        "error": "step_already_recorded",
+                        "work_id": work_id,
+                        "step_id": step_id,
+                        "recorded": False,
+                        "stored_status": stored_status,
+                        "stored_result": stored_result,
+                        "stored_error": stored_error,
+                    }
+                step["status"] = status
+                step["result"] = result
+                step["error"] = error
                 step["updated_at"] = time.time()
                 _write_atomic(path, bundle)
                 return _ok(

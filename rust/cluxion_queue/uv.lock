@@ -4,5 +4,5 @@ requires-python = ">=3.11"
 
 [[package]]
 name = "cluxion-queue-native"
-version = "0.3.61"
+version = "0.3.62"
 source = { editable = "." }
