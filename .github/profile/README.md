@@ -7,7 +7,7 @@ It keeps Hermes in control of OAuth, provider auth, active model selection, tool
 ## Install
 
 ```bash
-python -m pip install "hermes-cluxion==0.1.9"
+python -m pip install cluxion-agentplugin-preprocessing
 hermes-cluxion enable
 hermes-cluxion check
 ```

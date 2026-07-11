@@ -47,6 +47,33 @@ def test_enqueue_dequeue_roundtrip(backend) -> None:
     assert empty["ready"] is False
 
 
+def test_duplicate_work_id_preserves_admission_sequence(backend) -> None:
+    """Re-enqueue of an existing work_id must return its stored sequence (not MAX+1).
+
+    ON CONFLICT already keeps sequence/created_at; the response must match that
+    admission identity so callers do not invent a tail position. Order stays a, b.
+    """
+    first = queue_bridge.enqueue_work({"work_id": "a", "prompt": "first-a"})
+    assert first["ok"] is True
+    assert first["sequence"] == 1
+
+    second = queue_bridge.enqueue_work({"work_id": "b", "prompt": "first-b"})
+    assert second["ok"] is True
+    assert second["sequence"] == 2
+
+    re_a = queue_bridge.enqueue_work({"work_id": "a", "prompt": "re-a"})
+    assert re_a["ok"] is True
+    assert re_a["accepted"] is True
+    assert re_a["sequence"] == 1, "duplicate work_id must return original admission sequence"
+
+    peek = queue_bridge.peek_order()
+    assert [row["work_id"] for row in peek["order"]] == ["a", "b"]
+    assert [row["sequence"] for row in peek["order"]] == [1, 2]
+
+    assert queue_bridge.dequeue_work()["item"]["work_id"] == "a"
+    assert queue_bridge.dequeue_work()["item"]["work_id"] == "b"
+
+
 def test_priority_ordering(backend) -> None:
     for wid, prio in (("low", 9), ("high", 1), ("mid", 5)):
         queue_bridge.enqueue_work({"work_id": wid, "prompt": wid, "priority": prio})

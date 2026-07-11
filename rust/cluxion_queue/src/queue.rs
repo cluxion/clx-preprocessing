@@ -319,7 +319,13 @@ fn enqueue_txn(
                      updated_at=excluded.updated_at",
                 params![work_id, prompt, surface, priority, metadata_json, sequence, now],
             )?;
-            Ok(sequence)
+            // ON CONFLICT preserves sequence/created_at; return the stored
+            // admission identity rather than the provisional MAX+1 candidate.
+            conn.query_row(
+                "SELECT sequence FROM work_queue WHERE work_id = ?1",
+                params![work_id],
+                |row| row.get::<_, i64>(0),
+            )
         })
         .and_then(|sequence| {
             conn.execute_batch("COMMIT;")?;
@@ -514,6 +520,42 @@ mod tests {
         })
         .expect("sequence lookup");
         assert_eq!(seq, 1);
+
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn reenqueue_same_work_id_returns_original_sequence() {
+        let store = std::env::temp_dir().join(format!(
+            "cluxion-queue-reenqueue-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&store);
+
+        let a1 = enqueue(&store, &json!({"work_id": "a", "prompt": "first-a"})).expect("enqueue a");
+        assert_eq!(a1["sequence"], 1);
+        let b1 = enqueue(&store, &json!({"work_id": "b", "prompt": "first-b"})).expect("enqueue b");
+        assert_eq!(b1["sequence"], 2);
+
+        let a2 = enqueue(&store, &json!({"work_id": "a", "prompt": "re-a"})).expect("re-enqueue a");
+        assert_eq!(
+            a2["sequence"], 1,
+            "duplicate work_id must return original admission sequence, not MAX+1"
+        );
+
+        let peek = peek(&store, &json!({"limit": 16})).expect("peek");
+        let order = peek["order"].as_array().expect("order array");
+        assert_eq!(order.len(), 2);
+        assert_eq!(order[0]["work_id"], "a");
+        assert_eq!(order[0]["sequence"], 1);
+        assert_eq!(order[1]["work_id"], "b");
+        assert_eq!(order[1]["sequence"], 2);
+
+        let d1 = dequeue(&store, &json!({})).expect("dequeue 1");
+        assert_eq!(d1["item"]["work_id"], "a");
+        let d2 = dequeue(&store, &json!({})).expect("dequeue 2");
+        assert_eq!(d2["item"]["work_id"], "b");
 
         let _ = std::fs::remove_dir_all(&store);
     }

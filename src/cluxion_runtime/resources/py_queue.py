@@ -261,6 +261,12 @@ def _enqueue(store_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
                            status='pending', updated_at=excluded.updated_at""",
                     (work_id, prompt, surface, priority, metadata_json, sequence, now, now),
                 )
+                # ON CONFLICT preserves sequence/created_at; return that stored
+                # admission identity rather than the provisional MAX+1 candidate.
+                sequence = conn.execute(
+                    "SELECT sequence FROM work_queue WHERE work_id = ?",
+                    (work_id,),
+                ).fetchone()[0]
             return _ok({"accepted": True, "work_id": work_id, "sequence": sequence, "reason": "queued"})
         except sqlite3.IntegrityError as err:
             last_error = err
