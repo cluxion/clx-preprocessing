@@ -244,9 +244,17 @@ def test_dispatch_retry_wait_can_transition_to_terminal(backend) -> None:
     assert completed["status"] == "succeeded"
 
 
+def _owned_two_step(work_id: str, *, cwd: str, scope: str, session_id: str = "") -> dict:
+    body = _two_step_bundle(work_id)
+    body["schema_version"] = 2
+    body["owner"] = {"cwd": cwd, "session_id": session_id, "scope": scope}
+    return body
+
+
 def test_identical_repersist_preserves_progress_bytes(backend, tmp_path: Path) -> None:
     work_id = "d-idem"
-    assert queue_bridge.persist_dispatch_bundle(work_id, _two_step_bundle(work_id))["stored"] is True
+    bundle = _owned_two_step(work_id, cwd="/tmp/idem", scope="project:/tmp/idem")
+    assert queue_bridge.persist_dispatch_bundle(work_id, bundle)["stored"] is True
     assert queue_bridge.next_dispatch_step(work_id)["step"]["step_id"] == "s1"
     rec = queue_bridge.record_dispatch_step(work_id, "s1", result="kept")
     assert rec["recorded"] is True
@@ -255,7 +263,7 @@ def test_identical_repersist_preserves_progress_bytes(backend, tmp_path: Path) -
     before_bytes = bundle_path.read_bytes()
     before = json.loads(before_bytes.decode("utf-8"))
 
-    again = queue_bridge.persist_dispatch_bundle(work_id, _two_step_bundle(work_id))
+    again = queue_bridge.persist_dispatch_bundle(work_id, bundle)
     assert again["ok"] is True
     assert again.get("stored") is False or again.get("idempotent") is True
     assert bundle_path.read_bytes() == before_bytes
@@ -267,7 +275,8 @@ def test_identical_repersist_preserves_progress_bytes(backend, tmp_path: Path) -
 
 def test_conflicting_sequence_repersist_does_not_mutate(backend, tmp_path: Path) -> None:
     work_id = "d-conflict"
-    assert queue_bridge.persist_dispatch_bundle(work_id, _two_step_bundle(work_id))["stored"] is True
+    first = _owned_two_step(work_id, cwd="/tmp/c", scope="project:/tmp/c")
+    assert queue_bridge.persist_dispatch_bundle(work_id, first)["stored"] is True
     assert queue_bridge.next_dispatch_step(work_id)["step"]["step_id"] == "s1"
     queue_bridge.record_dispatch_step(work_id, "s1", result="kept")
 
@@ -275,37 +284,104 @@ def test_conflicting_sequence_repersist_does_not_mutate(backend, tmp_path: Path)
     before_bytes = bundle_path.read_bytes()
     before = json.loads(before_bytes.decode("utf-8"))
 
-    conflict = {
-        "work_id": work_id,
-        "steps": [
-            {
-                "step_id": "s1",
-                "segment_id": "g1",
-                "checksum": "CHANGED",
-                "token_estimate": 10,
-                "content": "one",
-                "status": "queued",
-                "result": "",
-                "error": "",
-            },
-            {
-                "step_id": "s2",
-                "segment_id": "g2",
-                "checksum": "c2",
-                "token_estimate": 12,
-                "content": "two",
-                "status": "queued",
-                "result": "",
-                "error": "",
-            },
-        ],
-    }
+    conflict = _owned_two_step(work_id, cwd="/tmp/c", scope="project:/tmp/c")
+    conflict["steps"][0]["checksum"] = "CHANGED"
     result = queue_bridge.persist_dispatch_bundle(work_id, conflict)
     assert result.get("stored") is False
     assert result.get("error") == "dispatch_bundle_conflict" or result.get("ok") is False
     assert "dispatch_bundle_conflict" in str(result.get("error", result))
     assert bundle_path.read_bytes() == before_bytes
     assert json.loads(bundle_path.read_text(encoding="utf-8")) == before
+
+
+def test_owner_equal_repersist_is_idempotent(backend, tmp_path: Path) -> None:
+    work_id = "d-owner-idem"
+    bundle = _owned_two_step(work_id, cwd="/tmp/a", scope="project:/tmp/a")
+    assert queue_bridge.persist_dispatch_bundle(work_id, bundle)["stored"] is True
+    assert queue_bridge.next_dispatch_step(work_id)["step"]["step_id"] == "s1"
+    queue_bridge.record_dispatch_step(work_id, "s1", result="kept")
+    bundle_path = tmp_path / "queue" / "dispatch" / f"{work_id}.json"
+    before = bundle_path.read_bytes()
+
+    again = queue_bridge.persist_dispatch_bundle(work_id, bundle)
+    assert again["ok"] is True
+    assert again.get("stored") is False or again.get("idempotent") is True
+    assert bundle_path.read_bytes() == before
+
+
+def test_owner_mismatch_repersist_is_typed_conflict(backend, tmp_path: Path) -> None:
+    work_id = "d-owner-conflict"
+    first = _owned_two_step(work_id, cwd="/tmp/a", scope="project:/tmp/a")
+    assert queue_bridge.persist_dispatch_bundle(work_id, first)["stored"] is True
+    assert queue_bridge.next_dispatch_step(work_id)["step"]["step_id"] == "s1"
+    queue_bridge.record_dispatch_step(work_id, "s1", result="kept")
+    bundle_path = tmp_path / "queue" / "dispatch" / f"{work_id}.json"
+    before = bundle_path.read_bytes()
+
+    foreign = _owned_two_step(work_id, cwd="/tmp/b", scope="project:/tmp/b")
+    result = queue_bridge.persist_dispatch_bundle(work_id, foreign)
+    assert result.get("ok") is False
+    assert result.get("error") == "dispatch_owner_conflict"
+    assert result.get("stored") is False
+    assert bundle_path.read_bytes() == before
+
+
+def test_malformed_schema_v2_owner_is_rejected_before_first_write(backend, tmp_path: Path) -> None:
+    work_id = "d-invalid-owner"
+    bundle = _two_step_bundle(work_id)
+    bundle["schema_version"] = 2
+    bundle["owner"] = {"cwd": [], "session_id": "", "scope": "project:/tmp/a"}
+
+    result = queue_bridge.persist_dispatch_bundle(work_id, bundle)
+
+    assert result.get("ok") is False
+    assert result.get("stored") is False
+    assert result.get("error") == "invalid_dispatch_owner"
+    assert not (tmp_path / "queue" / "dispatch" / f"{work_id}.json").exists()
+
+
+@pytest.mark.parametrize("schema_version", ["1", None, True, 1.0, 3])
+def test_malformed_schema_version_is_never_downgraded_to_legacy_v1(
+    backend, tmp_path: Path, schema_version: object
+) -> None:
+    work_id = "d-invalid-schema"
+    bundle = _two_step_bundle(work_id)
+    bundle["schema_version"] = schema_version
+
+    result = queue_bridge.persist_dispatch_bundle(work_id, bundle)
+
+    assert result.get("ok") is False
+    assert result.get("stored") is False
+    assert result.get("error") == "invalid_dispatch_owner"
+    assert not (tmp_path / "queue" / "dispatch" / f"{work_id}.json").exists()
+
+
+def test_ownerless_v1_repersist_fails_closed(backend, tmp_path: Path) -> None:
+    work_id = "d-v1-ownerless"
+    v1 = _two_step_bundle(work_id)
+    v1["schema_version"] = 1
+    assert queue_bridge.persist_dispatch_bundle(work_id, v1)["stored"] is True
+    bundle_path = tmp_path / "queue" / "dispatch" / f"{work_id}.json"
+    before = bundle_path.read_bytes()
+
+    owned = _owned_two_step(work_id, cwd="/tmp/a", scope="project:/tmp/a")
+    result = queue_bridge.persist_dispatch_bundle(work_id, owned)
+    assert result.get("ok") is False
+    assert result.get("error") == "dispatch_owner_conflict"
+    assert bundle_path.read_bytes() == before
+
+
+def test_schema_v1_ownerless_still_drains(backend) -> None:
+    work_id = "d-v1-drain"
+    v1 = _two_step_bundle(work_id)
+    v1["schema_version"] = 1
+    assert queue_bridge.persist_dispatch_bundle(work_id, v1)["stored"] is True
+    assert queue_bridge.next_dispatch_step(work_id)["step"]["step_id"] == "s1"
+    queue_bridge.record_dispatch_step(work_id, "s1", result="one")
+    assert queue_bridge.next_dispatch_step(work_id)["step"]["step_id"] == "s2"
+    queue_bridge.record_dispatch_step(work_id, "s2", result="two")
+    brief = queue_bridge.build_briefing(work_id)
+    assert brief["ready"] is True
 
 
 @pytest.mark.parametrize(

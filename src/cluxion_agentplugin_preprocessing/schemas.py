@@ -40,6 +40,14 @@ PLAN_SCHEMA = {
         "type": "object",
         "properties": {
             "prompt": {"type": "string", "description": "Task prompt to plan."},
+            "work_id": {
+                "type": "string",
+                "description": "Optional explicit work id; when omitted an owner-scoped auto id is generated.",
+            },
+            "session_id": {
+                "type": "string",
+                "description": "Canonical full UUID for session-scoped owner isolation of auto work IDs.",
+            },
             "priority": {
                 "type": "string",
                 "enum": ["critical", "high", "normal", "low"],

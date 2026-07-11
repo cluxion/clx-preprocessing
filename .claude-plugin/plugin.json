@@ -1,6 +1,6 @@
 {
   "name": "clx-preprocessing",
-  "version": "0.3.65",
+  "version": "0.3.66",
   "description": "Cluxion preprocessing: honesty, clarification, durable work queue, loop_auto, doctor, and resource guard contracts.",
   "author": {
     "name": "cluxion"

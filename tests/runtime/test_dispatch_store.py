@@ -443,6 +443,212 @@ def test_identical_repersist_preserves_bytes_and_progress(tmp_path: Path, queued
     assert progressed["result"] == f"progress:{step_id}"
 
 
+def _owner_meta(
+    *,
+    scope: str,
+    cwd: str,
+    session_id: str = "",
+    answers: str = "implement every REQ line in order",
+) -> dict[str, str]:
+    return {
+        "clarification_answers": answers,
+        "cwd": cwd,
+        "owner_scope": scope,
+        "owner_cwd": cwd,
+        "owner_session_id": session_id,
+    }
+
+
+def _queued_plan_with_owner(work_id: str, owner: dict[str, str], prompt: str | None = None) -> HarnessPlan:
+    if prompt is None:
+        prompt = "\n".join(f"REQ-{idx}: implement work item and record evidence token {idx}." for idx in range(1500))
+    item = WorkItem(work_id, prompt, surface=AgentSurface.HERMES, metadata=owner)
+    plan = build_harness_plan(item, snapshot=_SNAPSHOT)
+    assert plan.execution.queue_required is True
+    return plan
+
+
+def test_new_dispatch_bundle_is_schema_v2_with_owner(tmp_path: Path) -> None:
+    cwd = "/tmp/owner-project"
+    plan = _queued_plan_with_owner(
+        "w-owner-v2",
+        _owner_meta(scope=f"project:{cwd}", cwd=cwd),
+    )
+    path = persist_dispatch_bundle(plan, dispatch_dir=tmp_path)
+    assert path is not None
+    bundle = load_dispatch_bundle("w-owner-v2", dispatch_dir=tmp_path)
+    assert bundle["schema_version"] == 2
+    assert bundle["owner"] == {
+        "cwd": cwd,
+        "session_id": "",
+        "scope": f"project:{cwd}",
+    }
+
+
+def test_direct_work_item_without_owner_uses_canonical_project_owner(
+    tmp_path: Path, queued_plan: HarnessPlan
+) -> None:
+    path = persist_dispatch_bundle(queued_plan, dispatch_dir=tmp_path)
+    assert path is not None
+    owner = load_dispatch_bundle("w-queued", dispatch_dir=tmp_path)["owner"]
+    cwd = str(Path.cwd().resolve(strict=False))
+    assert owner == {"cwd": cwd, "session_id": "", "scope": f"project:{cwd}"}
+
+
+def test_explicit_same_id_same_owner_repersist_is_idempotent(tmp_path: Path) -> None:
+    cwd = "/tmp/same-owner"
+    owner = _owner_meta(scope=f"project:{cwd}", cwd=cwd)
+    plan = _queued_plan_with_owner("w-explicit-same", owner)
+    path = persist_dispatch_bundle(plan, dispatch_dir=tmp_path)
+    assert path is not None
+    step_id = str(next_dispatch_step("w-explicit-same", dispatch_dir=tmp_path)["step"]["step_id"])
+    record_dispatch_result("w-explicit-same", step_id, result="kept", dispatch_dir=tmp_path)
+    before = path.read_bytes()
+
+    again = persist_dispatch_bundle(plan, dispatch_dir=tmp_path)
+
+    assert again == path
+    assert path.read_bytes() == before
+    stored = load_dispatch_bundle("w-explicit-same", dispatch_dir=tmp_path)
+    step = next(s for s in stored["steps"] if s["step_id"] == step_id)
+    assert step["status"] == "succeeded"
+    assert step["result"] == "kept"
+
+
+def test_explicit_same_id_foreign_cwd_is_owner_conflict(tmp_path: Path) -> None:
+    plan_a = _queued_plan_with_owner(
+        "w-foreign-cwd",
+        _owner_meta(scope="project:/tmp/a", cwd="/tmp/a"),
+    )
+    plan_b = _queued_plan_with_owner(
+        "w-foreign-cwd",
+        _owner_meta(scope="project:/tmp/b", cwd="/tmp/b"),
+    )
+    path = persist_dispatch_bundle(plan_a, dispatch_dir=tmp_path)
+    assert path is not None
+    step_id = str(next_dispatch_step("w-foreign-cwd", dispatch_dir=tmp_path)["step"]["step_id"])
+    record_dispatch_result("w-foreign-cwd", step_id, result="progress-a", dispatch_dir=tmp_path)
+    before = path.read_bytes()
+
+    with pytest.raises(DispatchStoreError, match="dispatch_owner_conflict"):
+        persist_dispatch_bundle(plan_b, dispatch_dir=tmp_path)
+
+    assert path.read_bytes() == before
+    stored = load_dispatch_bundle("w-foreign-cwd", dispatch_dir=tmp_path)
+    step = next(s for s in stored["steps"] if s["step_id"] == step_id)
+    assert step["status"] == "succeeded"
+    assert step["result"] == "progress-a"
+    assert stored["owner"]["cwd"] == "/tmp/a"
+
+
+def test_explicit_same_id_foreign_session_is_owner_conflict(tmp_path: Path) -> None:
+    sid_a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    sid_b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    cwd = "/tmp/session-project"
+    plan_a = _queued_plan_with_owner(
+        "w-foreign-sid",
+        _owner_meta(scope=f"session:{sid_a}", cwd=cwd, session_id=sid_a),
+    )
+    plan_b = _queued_plan_with_owner(
+        "w-foreign-sid",
+        _owner_meta(scope=f"session:{sid_b}", cwd=cwd, session_id=sid_b),
+    )
+    path = persist_dispatch_bundle(plan_a, dispatch_dir=tmp_path)
+    assert path is not None
+    step_id = str(next_dispatch_step("w-foreign-sid", dispatch_dir=tmp_path)["step"]["step_id"])
+    record_dispatch_result("w-foreign-sid", step_id, result="sid-a", dispatch_dir=tmp_path)
+    before = path.read_bytes()
+
+    with pytest.raises(DispatchStoreError, match="dispatch_owner_conflict"):
+        persist_dispatch_bundle(plan_b, dispatch_dir=tmp_path)
+
+    assert path.read_bytes() == before
+    stored = load_dispatch_bundle("w-foreign-sid", dispatch_dir=tmp_path)
+    assert stored["owner"]["session_id"] == sid_a
+    step = next(s for s in stored["steps"] if s["step_id"] == step_id)
+    assert step["result"] == "sid-a"
+
+
+def test_schema_v1_ownerless_bundle_still_drains(tmp_path: Path) -> None:
+    work_id = "w-v1-legacy"
+    path = tmp_path / f"{work_id}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "work_id": work_id,
+                "steps": [
+                    {
+                        "step_id": "s1",
+                        "segment_id": "g1",
+                        "checksum": "c1",
+                        "token_estimate": 1,
+                        "content": "legacy segment",
+                        "status": "queued",
+                        "result": "",
+                        "error": "",
+                        "updated_at": time.time(),
+                    },
+                    {
+                        "step_id": "s2",
+                        "segment_id": "g2",
+                        "checksum": "c2",
+                        "token_estimate": 1,
+                        "content": "legacy segment two",
+                        "status": "queued",
+                        "result": "",
+                        "error": "",
+                        "updated_at": time.time(),
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    bundle = load_dispatch_bundle(work_id, dispatch_dir=tmp_path)
+    assert bundle.get("schema_version") == 1
+    assert "owner" not in bundle
+    drained = _drain_ids(work_id, tmp_path)
+    assert drained == ["s1", "s2"]
+    brief = build_briefing_payload(work_id, dispatch_dir=tmp_path)
+    assert brief["ready"] is True
+
+
+def test_repersist_over_ownerless_v1_fails_closed(tmp_path: Path) -> None:
+    work_id = "w-v1-repersist"
+    path = tmp_path / f"{work_id}.json"
+    v1 = {
+        "schema_version": 1,
+        "work_id": work_id,
+        "steps": [
+            {
+                "step_id": "s1",
+                "segment_id": "g1",
+                "checksum": "c1",
+                "token_estimate": 1,
+                "content": "x",
+                "status": "queued",
+                "result": "",
+                "error": "",
+                "updated_at": time.time(),
+            }
+        ],
+    }
+    path.write_text(json.dumps(v1), encoding="utf-8")
+    before = path.read_bytes()
+    plan = _queued_plan_with_owner(
+        work_id,
+        _owner_meta(scope="project:/tmp/x", cwd="/tmp/x"),
+        prompt="\n".join(f"REQ-{idx}: implement work item and record evidence token {idx}." for idx in range(1500)),
+    )
+
+    with pytest.raises(DispatchStoreError, match="dispatch_owner_conflict"):
+        persist_dispatch_bundle(plan, dispatch_dir=tmp_path)
+
+    assert path.read_bytes() == before
+    assert "owner" not in json.loads(path.read_text(encoding="utf-8"))
+
+
 def test_backend_outage_falls_back_safely_for_existing_identical_bundle(
     tmp_path: Path, queued_plan: HarnessPlan, monkeypatch: pytest.MonkeyPatch
 ) -> None:

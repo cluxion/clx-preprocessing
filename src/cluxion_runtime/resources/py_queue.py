@@ -413,6 +413,39 @@ def _step_identity_sequence(bundle: dict[str, Any]) -> list[tuple[str, str]]:
     return [(str(step.get("step_id", "")), str(step.get("checksum", ""))) for step in steps]
 
 
+def _owner_from_bundle(bundle: dict[str, Any]) -> dict[str, str] | None:
+    """Return normalized owner, or None when the bundle is schema-v1 ownerless."""
+    schema_version = _validated_schema_version(bundle)
+    owner = bundle.get("owner")
+    if owner is None:
+        if schema_version == 1:
+            return None
+        raise ValueError("invalid_dispatch_owner")
+    if schema_version != 2 or not isinstance(owner, dict):
+        raise ValueError("invalid_dispatch_owner")
+    if set(owner) != {"cwd", "session_id", "scope"}:
+        raise ValueError("invalid_dispatch_owner")
+    cwd, session_id, scope = owner["cwd"], owner["session_id"], owner["scope"]
+    if not isinstance(cwd, str) or not cwd or not isinstance(session_id, str) or not isinstance(scope, str) or not scope:
+        raise ValueError("invalid_dispatch_owner")
+    return {"cwd": cwd, "session_id": session_id, "scope": scope}
+
+
+def _validated_schema_version(bundle: dict[str, Any]) -> int:
+    if "schema_version" not in bundle:
+        return 1
+    value = bundle["schema_version"]
+    if type(value) is not int or value not in (1, 2):
+        raise ValueError("invalid_dispatch_owner")
+    return value
+
+
+def _owners_equal(left: dict[str, str], right: dict[str, str]) -> bool:
+    return left.get("cwd") == right.get("cwd") and left.get("session_id") == right.get("session_id") and left.get(
+        "scope"
+    ) == right.get("scope")
+
+
 def _persist(store_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
     work_id = _require_str(payload, "work_id")
     if "bundle" not in payload:
@@ -421,6 +454,10 @@ def _persist(store_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(bundle, dict):
         raise RuntimeError("bundle must be an object")
     path = _bundle_path(store_dir, work_id)
+    try:
+        new_owner = _owner_from_bundle(bundle)
+    except ValueError:
+        return {"ok": False, "stored": False, "error": "invalid_dispatch_owner", "path": str(path)}
     with _exclusive_bundle_lock(path):
         # is_symlink uses lstat: reject dangling links too; never replace/follow.
         if path.is_symlink():
@@ -428,7 +465,30 @@ def _persist(store_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
         if path.exists():
             # Read/JSON/shape failures fail closed — never catch-and-overwrite.
             existing = _read_bundle(path)
-            if _step_identity_sequence(existing) == _step_identity_sequence(bundle):
+            # Validate step shape first so corrupt existing bytes raise, never
+            # fall through to an owner/idempotent decision that mutates.
+            existing_id = _step_identity_sequence(existing)
+            new_id = _step_identity_sequence(bundle)
+            try:
+                existing_owner = _owner_from_bundle(existing)
+            except ValueError:
+                return {"ok": False, "stored": False, "error": "invalid_dispatch_owner", "path": str(path)}
+            # Ownerless existing (or new without owner over existing): fail closed.
+            if existing_owner is None or new_owner is None:
+                return {
+                    "ok": False,
+                    "stored": False,
+                    "error": "dispatch_owner_conflict",
+                    "path": str(path),
+                }
+            if not _owners_equal(existing_owner, new_owner):
+                return {
+                    "ok": False,
+                    "stored": False,
+                    "error": "dispatch_owner_conflict",
+                    "path": str(path),
+                }
+            if existing_id == new_id:
                 return _ok({"stored": False, "idempotent": True, "path": str(path)})
             return {
                 "ok": False,

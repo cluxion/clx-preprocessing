@@ -17,6 +17,8 @@ if TYPE_CHECKING:
 
 def test_adapter_payload_builds_work_item_with_metadata() -> None:
     """Wrapper JSON payloads convert into WorkItem reliably."""
+    from pathlib import Path
+
     item = work_item_from_adapter_payload(
         {
             "prompt": "로컬 모델 서버를 점검해줘",
@@ -29,7 +31,9 @@ def test_adapter_payload_builds_work_item_with_metadata() -> None:
 
     assert item.surface == AgentSurface.HERMES
     assert item.priority == WorkPriority.HIGH
-    assert item.metadata["cwd"] == "/tmp/project"
+    assert item.metadata["cwd"] == str(Path("/tmp/project").expanduser().resolve(strict=False))
+    assert item.metadata["owner_cwd"] == item.metadata["cwd"]
+    assert item.metadata["owner_scope"].startswith("invocation:")
     assert item.work_id.startswith("work-")
 
 

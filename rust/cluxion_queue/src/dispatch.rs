@@ -23,6 +23,17 @@ pub fn persist_bundle(store_dir: &Path, payload: &Value) -> Result<Value, QueueE
     let dispatch_dir = dispatch_dir(store_dir)?;
     let path = bundle_path(&dispatch_dir, work_id)?;
     with_dispatch_lock(&dispatch_dir, || {
+        let new_owner = match owner_from_bundle(&bundle) {
+            Ok(owner) => owner,
+            Err(_) => {
+                return Ok(json!({
+                    "ok": false,
+                    "stored": false,
+                    "error": "invalid_dispatch_owner",
+                    "path": path.to_string_lossy(),
+                }));
+            }
+        };
         // symlink_metadata/is_symlink detects dangling links path.exists() misses.
         // Never replace, unlink, or follow an existing final-bundle symlink.
         if path.is_symlink()
@@ -38,8 +49,41 @@ pub fn persist_bundle(store_dir: &Path, payload: &Value) -> Result<Value, QueueE
         if path.exists() {
             // Read/JSON/shape failures fail closed — never fall through to write.
             let existing = read_bundle(&path)?;
+            // Validate step shape first so corrupt existing bytes error out, never
+            // fall through to an owner/idempotent decision that mutates.
             let existing_id = step_identity_sequence(&existing)?;
             let new_id = step_identity_sequence(&bundle)?;
+            let existing_owner = match owner_from_bundle(&existing) {
+                Ok(owner) => owner,
+                Err(_) => {
+                    return Ok(json!({
+                        "ok": false,
+                        "stored": false,
+                        "error": "invalid_dispatch_owner",
+                        "path": path.to_string_lossy(),
+                    }));
+                }
+            };
+            // Ownerless existing (or new without owner over existing): fail closed.
+            match (&existing_owner, &new_owner) {
+                (None, _) | (_, None) => {
+                    return Ok(json!({
+                        "ok": false,
+                        "stored": false,
+                        "error": "dispatch_owner_conflict",
+                        "path": path.to_string_lossy(),
+                    }));
+                }
+                (Some(left), Some(right)) if left != right => {
+                    return Ok(json!({
+                        "ok": false,
+                        "stored": false,
+                        "error": "dispatch_owner_conflict",
+                        "path": path.to_string_lossy(),
+                    }));
+                }
+                (Some(_), Some(_)) => {}
+            }
             if existing_id == new_id {
                 return Ok(ok_payload(json!({
                     "stored": false,
@@ -60,6 +104,52 @@ pub fn persist_bundle(store_dir: &Path, payload: &Value) -> Result<Value, QueueE
             "path": path.to_string_lossy(),
         })))
     })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BundleOwner {
+    cwd: String,
+    session_id: String,
+    scope: String,
+}
+
+fn owner_from_bundle(bundle: &Value) -> Result<Option<BundleOwner>, QueueError> {
+    let schema_version = match bundle.get("schema_version") {
+        None => 1,
+        Some(Value::Number(number)) => match number.as_u64() {
+            Some(version @ (1 | 2)) => version,
+            _ => return Err(QueueError::Store("invalid_dispatch_owner".into())),
+        },
+        _ => return Err(QueueError::Store("invalid_dispatch_owner".into())),
+    };
+    match bundle.get("owner") {
+        None if schema_version == 1 => Ok(None),
+        Some(Value::Object(owner)) if schema_version == 2 => {
+            if owner.len() != 3
+                || !owner.contains_key("cwd")
+                || !owner.contains_key("session_id")
+                || !owner.contains_key("scope")
+            {
+                return Err(QueueError::Store("invalid_dispatch_owner".into()));
+            }
+            let cwd = owner.get("cwd").and_then(Value::as_str);
+            let session_id = owner.get("session_id").and_then(Value::as_str);
+            let scope = owner.get("scope").and_then(Value::as_str);
+            match (cwd, session_id, scope) {
+                (Some(cwd), Some(session_id), Some(scope))
+                    if !cwd.is_empty() && !scope.is_empty() =>
+                {
+                    Ok(Some(BundleOwner {
+                        cwd: cwd.to_string(),
+                        session_id: session_id.to_string(),
+                        scope: scope.to_string(),
+                    }))
+                }
+                _ => Err(QueueError::Store("invalid_dispatch_owner".into())),
+            }
+        }
+        _ => Err(QueueError::Store("invalid_dispatch_owner".into())),
+    }
 }
 
 fn step_identity_sequence(bundle: &Value) -> Result<Vec<(String, String)>, QueueError> {
@@ -647,15 +737,23 @@ mod tests {
         })
     }
 
+    fn owned_two_step(checksum_s1: &str, cwd: &str, scope: &str, session_id: &str) -> Value {
+        let mut bundle = two_step_bundle(checksum_s1);
+        bundle["schema_version"] = json!(2);
+        bundle["owner"] = json!({
+            "cwd": cwd,
+            "session_id": session_id,
+            "scope": scope,
+        });
+        bundle
+    }
+
     #[test]
     fn identical_repersist_is_idempotent_and_preserves_progress() {
         let store = temp_store();
         let path = store.join("dispatch").join("d1.json");
-        persist_bundle(
-            &store,
-            &json!({"work_id": "d1", "bundle": two_step_bundle("c1")}),
-        )
-        .expect("first persist");
+        let bundle = owned_two_step("c1", "/tmp/idem", "project:/tmp/idem", "");
+        persist_bundle(&store, &json!({"work_id": "d1", "bundle": bundle})).expect("first persist");
         let claimed = next_step(&store, &json!({"work_id": "d1"})).expect("claim");
         assert_eq!(claimed["step"]["step_id"], "s1");
         record_step(
@@ -666,7 +764,7 @@ mod tests {
         let before = fs::read(&path).expect("read before");
         let again = persist_bundle(
             &store,
-            &json!({"work_id": "d1", "bundle": two_step_bundle("c1")}),
+            &json!({"work_id": "d1", "bundle": owned_two_step("c1", "/tmp/idem", "project:/tmp/idem", "")}),
         )
         .expect("repersist");
         assert_eq!(again["ok"], true);
@@ -727,7 +825,7 @@ mod tests {
         let path = store.join("dispatch").join("d1.json");
         persist_bundle(
             &store,
-            &json!({"work_id": "d1", "bundle": two_step_bundle("c1")}),
+            &json!({"work_id": "d1", "bundle": owned_two_step("c1", "/tmp/c", "project:/tmp/c", "")}),
         )
         .expect("first persist");
         next_step(&store, &json!({"work_id": "d1"})).expect("claim");
@@ -739,13 +837,157 @@ mod tests {
         let before = fs::read(&path).expect("read before");
         let conflict = persist_bundle(
             &store,
-            &json!({"work_id": "d1", "bundle": two_step_bundle("CHANGED")}),
+            &json!({"work_id": "d1", "bundle": owned_two_step("CHANGED", "/tmp/c", "project:/tmp/c", "")}),
         )
         .expect("conflict persist returns contract");
         assert_eq!(conflict["ok"], false);
         assert_eq!(conflict["stored"], false);
         assert_eq!(conflict["error"], "dispatch_bundle_conflict");
         assert_eq!(fs::read(&path).expect("read after"), before);
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn owner_equal_repersist_is_idempotent() {
+        let store = temp_store();
+        let path = store.join("dispatch").join("d-owner.json");
+        let bundle = owned_two_step("c1", "/tmp/a", "project:/tmp/a", "");
+        persist_bundle(&store, &json!({"work_id": "d-owner", "bundle": bundle}))
+            .expect("first persist");
+        next_step(&store, &json!({"work_id": "d-owner"})).expect("claim");
+        record_step(
+            &store,
+            &json!({"work_id": "d-owner", "step_id": "s1", "result": "kept"}),
+        )
+        .expect("record");
+        let before = fs::read(&path).expect("read before");
+        let again = persist_bundle(
+            &store,
+            &json!({"work_id": "d-owner", "bundle": owned_two_step("c1", "/tmp/a", "project:/tmp/a", "")}),
+        )
+        .expect("repersist");
+        assert_eq!(again["ok"], true);
+        assert_eq!(again["idempotent"], true);
+        assert_eq!(fs::read(&path).expect("read after"), before);
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn owner_mismatch_returns_dispatch_owner_conflict() {
+        let store = temp_store();
+        let path = store.join("dispatch").join("d-own-conflict.json");
+        persist_bundle(
+            &store,
+            &json!({"work_id": "d-own-conflict", "bundle": owned_two_step("c1", "/tmp/a", "project:/tmp/a", "")}),
+        )
+        .expect("first");
+        next_step(&store, &json!({"work_id": "d-own-conflict"})).expect("claim");
+        record_step(
+            &store,
+            &json!({"work_id": "d-own-conflict", "step_id": "s1", "result": "kept"}),
+        )
+        .expect("record");
+        let before = fs::read(&path).expect("read before");
+        let conflict = persist_bundle(
+            &store,
+            &json!({"work_id": "d-own-conflict", "bundle": owned_two_step("c1", "/tmp/b", "project:/tmp/b", "")}),
+        )
+        .expect("owner conflict contract");
+        assert_eq!(conflict["ok"], false);
+        assert_eq!(conflict["stored"], false);
+        assert_eq!(conflict["error"], "dispatch_owner_conflict");
+        assert_eq!(fs::read(&path).expect("read after"), before);
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn malformed_schema_v2_owner_is_rejected_before_first_write() {
+        let store = temp_store();
+        let path = store.join("dispatch").join("d-invalid-owner.json");
+        let mut bundle = two_step_bundle("c1");
+        bundle["schema_version"] = json!(2);
+        bundle["owner"] = json!({
+            "cwd": [],
+            "session_id": "",
+            "scope": "project:/tmp/a",
+        });
+
+        let result = persist_bundle(
+            &store,
+            &json!({"work_id": "d-invalid-owner", "bundle": bundle}),
+        )
+        .expect("invalid owner returns typed contract");
+
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["stored"], false);
+        assert_eq!(result["error"], "invalid_dispatch_owner");
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn malformed_schema_version_is_never_downgraded_to_legacy_v1() {
+        for (index, schema_version) in [json!("1"), Value::Null, json!(true), json!(1.0), json!(3)]
+            .into_iter()
+            .enumerate()
+        {
+            let store = temp_store();
+            let work_id = format!("d-invalid-schema-{index}");
+            let path = store.join("dispatch").join(format!("{work_id}.json"));
+            let mut bundle = two_step_bundle("c1");
+            bundle["schema_version"] = schema_version;
+
+            let result = persist_bundle(&store, &json!({"work_id": work_id, "bundle": bundle}))
+                .expect("invalid schema returns typed contract");
+
+            assert_eq!(result["ok"], false);
+            assert_eq!(result["error"], "invalid_dispatch_owner");
+            assert!(!path.exists());
+            let _ = fs::remove_dir_all(&store);
+        }
+    }
+
+    #[test]
+    fn ownerless_v1_repersist_fails_closed() {
+        let store = temp_store();
+        let path = store.join("dispatch").join("d-v1.json");
+        let mut v1 = two_step_bundle("c1");
+        v1["schema_version"] = json!(1);
+        persist_bundle(&store, &json!({"work_id": "d-v1", "bundle": v1})).expect("v1");
+        let before = fs::read(&path).expect("read before");
+        let conflict = persist_bundle(
+            &store,
+            &json!({"work_id": "d-v1", "bundle": owned_two_step("c1", "/tmp/a", "project:/tmp/a", "")}),
+        )
+        .expect("ownerless conflict");
+        assert_eq!(conflict["ok"], false);
+        assert_eq!(conflict["error"], "dispatch_owner_conflict");
+        assert_eq!(fs::read(&path).expect("read after"), before);
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn schema_v1_ownerless_still_drains() {
+        let store = temp_store();
+        let mut v1 = two_step_bundle("c1");
+        v1["schema_version"] = json!(1);
+        persist_bundle(&store, &json!({"work_id": "d-v1-drain", "bundle": v1})).expect("v1");
+        let first = next_step(&store, &json!({"work_id": "d-v1-drain"})).expect("s1");
+        assert_eq!(first["step"]["step_id"], "s1");
+        record_step(
+            &store,
+            &json!({"work_id": "d-v1-drain", "step_id": "s1", "result": "one"}),
+        )
+        .expect("record s1");
+        let second = next_step(&store, &json!({"work_id": "d-v1-drain"})).expect("s2");
+        assert_eq!(second["step"]["step_id"], "s2");
+        record_step(
+            &store,
+            &json!({"work_id": "d-v1-drain", "step_id": "s2", "result": "two"}),
+        )
+        .expect("record s2");
+        let brief = build_brief(&store, &json!({"work_id": "d-v1-drain"})).expect("brief");
+        assert_eq!(brief["ready"], true);
         let _ = fs::remove_dir_all(&store);
     }
 

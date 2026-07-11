@@ -107,6 +107,8 @@ def persist_dispatch_bundle(plan: HarnessPlan, *, dispatch_dir: Path | None = No
             # Contract results (idempotent / conflict / corrupt) must not fall
             # through to a destructive Python overwrite — only true backend
             # outages without an existing file fallback.
+            if result.get("error") in {"dispatch_owner_conflict", "invalid_dispatch_owner"}:
+                raise DispatchStoreError(str(result["error"]))
             if result.get("error") == "dispatch_bundle_conflict":
                 raise DispatchStoreError("dispatch_bundle_conflict")
             if result.get("ok"):
@@ -119,6 +121,8 @@ def persist_dispatch_bundle(plan: HarnessPlan, *, dispatch_dir: Path | None = No
     path = _bundle_path(plan.item.work_id, target_dir)
     with _exclusive_bundle_lock(path):
         decision = _persist_under_lock(path, bundle)
+        if decision == "owner_conflict":
+            raise DispatchStoreError("dispatch_owner_conflict")
         if decision == "conflict":
             raise DispatchStoreError("dispatch_bundle_conflict")
     return path
@@ -247,9 +251,10 @@ def build_briefing_payload(work_id: str, *, dispatch_dir: Path | None = None) ->
 
 def _bundle_from_plan(plan: HarnessPlan) -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_at": time.time(),
         "work_id": plan.item.work_id,
+        "owner": _owner_from_item(plan.item),
         "surface": plan.item.surface.value,
         "original_prompt_preview": plan.preprocessing.normalized_prompt,
         "answer_policy": {
@@ -259,6 +264,62 @@ def _bundle_from_plan(plan: HarnessPlan) -> dict[str, object]:
         },
         "steps": [_step_from_segment(segment) for segment in plan.preprocessing.segments],
     }
+
+
+def _owner_from_item(item: object) -> dict[str, str]:
+    metadata = getattr(item, "metadata", {}) or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    has_owner = any(key in metadata for key in ("owner_cwd", "owner_session_id", "owner_scope"))
+    if has_owner:
+        owner = {
+            "cwd": metadata.get("owner_cwd"),
+            "session_id": metadata.get("owner_session_id"),
+            "scope": metadata.get("owner_scope"),
+        }
+        return _validated_owner(owner)
+    raw_cwd = metadata.get("cwd") or str(Path.cwd())
+    if not isinstance(raw_cwd, str) or "\x00" in raw_cwd:
+        raise DispatchStoreError("invalid_dispatch_owner")
+    cwd = str(Path(raw_cwd).expanduser().resolve(strict=False))
+    return {"cwd": cwd, "session_id": "", "scope": f"project:{cwd}"}
+
+
+def _owner_from_bundle(bundle: dict[str, object]) -> dict[str, str] | None:
+    """Return normalized owner, or None when the bundle is schema-v1 ownerless."""
+    schema_version = _validated_schema_version(bundle)
+    owner = bundle.get("owner")
+    if owner is None:
+        if schema_version == 1:
+            return None
+        raise DispatchStoreError("invalid_dispatch_owner")
+    if schema_version != 2:
+        raise DispatchStoreError("invalid_dispatch_owner")
+    return _validated_owner(owner)
+
+
+def _validated_schema_version(bundle: dict[str, object]) -> int:
+    if "schema_version" not in bundle:
+        return 1
+    value = bundle["schema_version"]
+    if type(value) is not int or value not in (1, 2):
+        raise DispatchStoreError("invalid_dispatch_owner")
+    return value
+
+
+def _validated_owner(owner: object) -> dict[str, str]:
+    if not isinstance(owner, dict) or set(owner) != {"cwd", "session_id", "scope"}:
+        raise DispatchStoreError("invalid_dispatch_owner")
+    cwd, session_id, scope = owner["cwd"], owner["session_id"], owner["scope"]
+    if not isinstance(cwd, str) or not cwd or not isinstance(session_id, str) or not isinstance(scope, str) or not scope:
+        raise DispatchStoreError("invalid_dispatch_owner")
+    return {"cwd": cwd, "session_id": session_id, "scope": scope}
+
+
+def _owners_equal(left: dict[str, str], right: dict[str, str]) -> bool:
+    return left.get("cwd") == right.get("cwd") and left.get("session_id") == right.get("session_id") and left.get(
+        "scope"
+    ) == right.get("scope")
 
 
 def _step_identity_sequence(bundle: dict[str, object]) -> list[tuple[str, str]]:
@@ -274,18 +335,31 @@ def _step_identity_sequence(bundle: dict[str, object]) -> list[tuple[str, str]]:
 def _persist_under_lock(path: Path, bundle: dict[str, object]) -> str:
     """Write a new bundle, or decide idempotent/conflict against an existing one.
 
-    Returns ``"written"``, ``"idempotent"``, or ``"conflict"``. Compare only the
-    ordered ``(step_id, checksum)`` sequence; never copy/compare progress fields.
-    When the path already exists, read/JSON/shape failures propagate (fail-closed)
-    and never fall through to write. Symlinks (including dangling) are rejected
-    via ``is_symlink``/lstat — never replace, unlink, or follow them.
+    Returns ``"written"``, ``"idempotent"``, ``"owner_conflict"``, or ``"conflict"``.
+    Idempotent re-persist requires owner equality AND ordered ``(step_id, checksum)``
+    identity; never copy/compare progress fields. Ownerless (schema-v1) existing
+    bytes fail closed — never guess an owner. When the path already exists,
+    read/JSON/shape failures propagate (fail-closed) and never fall through to write.
+    Symlinks (including dangling) are rejected via ``is_symlink``/lstat — never
+    replace, unlink, or follow them.
     """
+    new_owner = _owner_from_bundle(bundle)
     # is_symlink uses lstat: detects dangling links that path.exists() would miss.
     if path.is_symlink():
         raise DispatchStoreError(f"expected regular file, found symlink: {path}")
     if path.exists():
         existing = _load_dispatch_bundle_from_path(path, str(bundle.get("work_id", "")))
-        if _step_identity_sequence(existing) == _step_identity_sequence(bundle):
+        # Validate step shape first so corrupt existing bytes fail closed via raise,
+        # never fall through to an owner/idempotent decision that mutates.
+        existing_id = _step_identity_sequence(existing)
+        new_id = _step_identity_sequence(bundle)
+        existing_owner = _owner_from_bundle(existing)
+        # Ownerless existing (or new without owner over existing): fail closed.
+        if existing_owner is None or new_owner is None:
+            return "owner_conflict"
+        if not _owners_equal(existing_owner, new_owner):
+            return "owner_conflict"
+        if existing_id == new_id:
             return "idempotent"
         return "conflict"
     _atomic_write_json(path, bundle)
