@@ -143,6 +143,51 @@ def test_cluxion_runtime_plan_cli_marks_verification_answers(capsys: pytest.Capt
     assert "cite_external_source_or_document" in answer_policy["required_checks"]
 
 
+def test_queue_next_cli_dispatch_path_regular_file_returns_structured_json(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """When CLUXION_PREPROCESS_DISPATCH_DIR is a regular file: nonzero structured JSON, no traceback, bytes intact."""
+    dispatch = tmp_path / "dispatch"
+    sentinel = b"SENTINEL-DISPATCH-AS-FILE\n"
+    dispatch.write_bytes(sentinel)
+    monkeypatch.setenv("CLUXION_PREPROCESS_DISPATCH_DIR", str(dispatch))
+
+    code = main(["queue-next", "--work-id", "w-file-dispatch"])
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert "Traceback" not in captured.out
+    payload = json.loads(captured.out.strip())
+    assert code != 0
+    assert payload.get("ok") is False
+    assert "non-directory" in str(payload.get("error", ""))
+    assert dispatch.read_bytes() == sentinel
+
+
+def test_queue_next_cli_dispatch_parent_regular_file_returns_structured_json(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """When a parent of CLUXION_PREPROCESS_DISPATCH_DIR is a regular file: nonzero structured JSON, no traceback, parent bytes intact."""
+    parent = tmp_path / "parent_as_file"
+    sentinel = b"SENTINEL-PARENT-AS-FILE\n"
+    parent.write_bytes(sentinel)
+    dispatch = parent / "dispatch"
+    monkeypatch.setenv("CLUXION_PREPROCESS_DISPATCH_DIR", str(dispatch))
+
+    code = main(["queue-next", "--work-id", "w-parent-file-dispatch"])
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert "Traceback" not in captured.out
+    payload = json.loads(captured.out.strip())
+    assert code != 0
+    assert payload.get("ok") is False
+    assert "non-directory" in str(payload.get("error", ""))
+    assert parent.read_bytes() == sentinel
+
+
 def test_queued_plan_uses_dispatch_store_without_full_prompt_in_plan(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,

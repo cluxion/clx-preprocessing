@@ -408,7 +408,30 @@ def _fchmod_regular(path: Path, mode: int, *, create: bool) -> None:
 def _ensure_dir_mode(path: Path, mode: int = _DIR_MODE) -> None:
     if path.is_symlink():
         raise DispatchStoreError(f"expected directory, found symlink: {path}")
-    path.mkdir(parents=True, exist_ok=True)
+    # Existing non-directory must fail closed before mkdir (FileExistsError is not DispatchStoreError).
+    try:
+        pre = path.lstat()
+    except FileNotFoundError:
+        pre = None
+    except NotADirectoryError:
+        # Parent component is a non-directory; lstat cannot traverse it.
+        raise DispatchStoreError(f"expected directory, found non-directory: {path}") from None
+    if pre is not None and not stat.S_ISDIR(pre.st_mode):
+        raise DispatchStoreError(f"expected directory, found non-directory: {path}")
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except NotADirectoryError:
+        # Parent component is a non-directory; mkdir cannot create under it.
+        raise DispatchStoreError(f"expected directory, found non-directory: {path}") from None
+    except FileExistsError:
+        # Race: path appeared as a non-directory between pre-check and mkdir.
+        try:
+            raced = path.lstat()
+        except FileNotFoundError:
+            raise
+        if not stat.S_ISDIR(raced.st_mode):
+            raise DispatchStoreError(f"expected directory, found non-directory: {path}") from None
+        raise
     if not _is_posix():
         return
     st = path.lstat()
