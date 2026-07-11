@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from http.client import BadStatusLine
 from pathlib import Path
 
 from cluxion_runtime.core.types import ModelRuntimeProfile, RuntimeKind
+from cluxion_runtime.models import supervisor as supervisor_module
 from cluxion_runtime.models.supervisor import LocalModelSupervisor
 
 
@@ -48,7 +50,12 @@ def _profile(command: tuple[str, ...] = ("vllm-mlx", "serve", "demo")) -> ModelR
     )
 
 
+def _down_health(_url: str, _timeout: float) -> tuple[int, str]:
+    raise OSError("connection refused")
+
+
 def _supervisor(process: FakeProcess, **kwargs: object) -> LocalModelSupervisor:
+    kwargs.setdefault("health_getter", _down_health)
     return LocalModelSupervisor(_profile(), process_factory=lambda *_: process, **kwargs)
 
 
@@ -61,8 +68,169 @@ def test_start_spawns_once_then_reports_already_running() -> None:
     assert second.reason == "already_running"
 
 
+def test_start_reuses_matching_live_endpoint_without_spawn() -> None:
+    spawned: list[object] = []
+
+    def factory(*args: object) -> FakeProcess:
+        spawned.append(args)
+        return FakeProcess()
+
+    body = json.dumps({"data": [{"id": "demo"}]})
+    supervisor = LocalModelSupervisor(
+        _profile(),
+        process_factory=factory,
+        health_getter=lambda url, timeout: (200, body),
+    )
+    result = supervisor.start()
+    assert result.started is False
+    assert result.reason == "already_running"
+    assert spawned == []
+
+
+def test_start_rejects_occupied_endpoint_without_spawn() -> None:
+    spawned: list[object] = []
+
+    def factory(*args: object) -> FakeProcess:
+        spawned.append(args)
+        return FakeProcess()
+
+    body = json.dumps({"data": [{"id": "other-model"}]})
+    supervisor = LocalModelSupervisor(
+        _profile(),
+        process_factory=factory,
+        health_getter=lambda url, timeout: (200, body),
+    )
+    result = supervisor.start()
+    assert result.started is False
+    assert result.reason == "endpoint_in_use"
+    assert spawned == []
+
+
+def test_start_rejects_malformed_models_json_as_endpoint_in_use_without_spawn() -> None:
+    """Responding /v1/models with malformed JSON is occupied/incompatible — never spawn."""
+    spawned: list[object] = []
+
+    def factory(*args: object) -> FakeProcess:
+        spawned.append(args)
+        return FakeProcess()
+
+    supervisor = LocalModelSupervisor(
+        _profile(),
+        process_factory=factory,
+        health_getter=lambda url, timeout: (200, "not-json{{{"),
+    )
+    result = supervisor.start()
+    assert result.started is False
+    assert result.reason == "endpoint_in_use"
+    assert spawned == []
+
+
+def test_start_rejects_invalid_utf8_http_body_without_spawn() -> None:
+    """A responding endpoint with undecodable body is occupied, not transport-down."""
+    spawned: list[object] = []
+
+    def factory(*args: object) -> FakeProcess:
+        spawned.append(args)
+        return FakeProcess()
+
+    def invalid_utf8(_url: str, _timeout: float) -> tuple[int, str]:
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    supervisor = LocalModelSupervisor(
+        _profile(),
+        process_factory=factory,
+        health_getter=invalid_utf8,
+    )
+    result = supervisor.start()
+    assert result.started is False
+    assert result.reason == "endpoint_in_use"
+    assert spawned == []
+
+
+def test_start_rejects_http_server_error_as_endpoint_in_use_without_spawn() -> None:
+    """HTTP/server error from /v1/models is occupied/incompatible — never spawn."""
+    spawned: list[object] = []
+
+    def factory(*args: object) -> FakeProcess:
+        spawned.append(args)
+        return FakeProcess()
+
+    supervisor = LocalModelSupervisor(
+        _profile(),
+        process_factory=factory,
+        health_getter=lambda url, timeout: (503, '{"error":"unavailable"}'),
+    )
+    result = supervisor.start()
+    assert result.started is False
+    assert result.reason == "endpoint_in_use"
+    assert spawned == []
+
+
+def test_start_rejects_bad_http_status_line_without_spawn() -> None:
+    """A non-HTTP response still proves the configured endpoint is occupied."""
+    spawned: list[object] = []
+
+    def bad_status(_url: str, _timeout: float) -> tuple[int, str]:
+        raise BadStatusLine("not http")
+
+    supervisor = LocalModelSupervisor(
+        _profile(),
+        process_factory=lambda *args: spawned.append(args) or FakeProcess(),
+        health_getter=bad_status,
+    )
+
+    result = supervisor.start()
+
+    assert result.started is False
+    assert result.reason == "endpoint_in_use"
+    assert spawned == []
+
+
+def test_start_rejects_status_then_body_reset_without_spawn(monkeypatch) -> None:
+    """Once an HTTP status arrives, a body reset must not trigger a duplicate server."""
+    spawned: list[object] = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            raise ConnectionResetError("peer reset after status")
+
+    monkeypatch.setattr(supervisor_module, "urlopen", lambda *_args, **_kwargs: Response())
+    supervisor = LocalModelSupervisor(
+        _profile(),
+        process_factory=lambda *args: spawned.append(args) or FakeProcess(),
+    )
+
+    result = supervisor.start()
+
+    assert result.started is False
+    assert result.reason == "endpoint_in_use"
+    assert spawned == []
+
+
+def test_start_reports_immediate_child_exit() -> None:
+    process = FakeProcess()
+    process.returncode = 7
+    supervisor = _supervisor(process)
+    result = supervisor.start()
+    assert result.started is False
+    assert result.reason == "process_exited:7"
+    assert supervisor.is_running() is False
+
+
 def test_start_refuses_empty_command() -> None:
-    supervisor = LocalModelSupervisor(_profile(command=()), process_factory=lambda *_: FakeProcess())
+    supervisor = LocalModelSupervisor(
+        _profile(command=()),
+        process_factory=lambda *_: FakeProcess(),
+        health_getter=_down_health,
+    )
     result = supervisor.start()
     assert result.started is False
     assert result.reason == "empty_command"
@@ -127,7 +295,7 @@ def test_start_reports_binary_not_found_instead_of_raising() -> None:
     def missing(*_: object) -> FakeProcess:
         raise FileNotFoundError("[Errno 2] No such file or directory: 'vllm-mlx'")
 
-    supervisor = LocalModelSupervisor(_profile(), process_factory=missing)
+    supervisor = LocalModelSupervisor(_profile(), process_factory=missing, health_getter=_down_health)
     result = supervisor.start()
     assert result.started is False
     assert result.pid == 0
@@ -139,7 +307,7 @@ def test_start_reports_binary_not_found_on_permission_error() -> None:
     def denied(*_: object) -> FakeProcess:
         raise PermissionError("[Errno 13] Permission denied: 'vllm-mlx'")
 
-    result = LocalModelSupervisor(_profile(), process_factory=denied).start()
+    result = LocalModelSupervisor(_profile(), process_factory=denied, health_getter=_down_health).start()
     assert result.started is False
     assert result.reason.startswith("binary_not_found:")
 
@@ -148,21 +316,27 @@ def test_start_reports_binary_not_found_on_exec_format_error() -> None:
     def bad_format(*_: object) -> FakeProcess:
         raise OSError(8, "Exec format error")
 
-    result = LocalModelSupervisor(_profile(), process_factory=bad_format).start()
+    result = LocalModelSupervisor(_profile(), process_factory=bad_format, health_getter=_down_health).start()
     assert result.started is False
     assert result.reason.startswith("binary_not_found:")
 
 
 def test_default_factory_missing_binary_returns_clean_result(tmp_path: Path) -> None:
     missing = tmp_path / "vllm-mlx"
-    result = LocalModelSupervisor(_profile(command=(str(missing), "serve", "demo"))).start()
+    result = LocalModelSupervisor(
+        _profile(command=(str(missing), "serve", "demo")),
+        health_getter=_down_health,
+    ).start()
     assert result.started is False
     assert result.pid == 0
     assert result.reason.startswith("binary_not_found:")
 
 
 def test_default_factory_spawns_real_process() -> None:
-    supervisor = LocalModelSupervisor(_profile(command=(sys.executable, "-c", "import time; time.sleep(30)")))
+    supervisor = LocalModelSupervisor(
+        _profile(command=(sys.executable, "-c", "import time; time.sleep(30)")),
+        health_getter=_down_health,
+    )
     result = supervisor.start()
     try:
         assert result.started is True

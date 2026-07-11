@@ -218,6 +218,19 @@ def test_writable_probes_survive_concurrent_doctors(tmp_path: Path, monkeypatch)
     assert all(not failures for failures in results), results
 
 
+def test_env_var_consistency_reports_producer_consumer_dispatch_paths(tmp_path: Path, monkeypatch):
+    store = tmp_path / "queue"
+    monkeypatch.setenv("CLUXION_QUEUE_STORE_DIR", str(store))
+    monkeypatch.delenv("CLUXION_PREPROCESS_DISPATCH_DIR", raising=False)
+    monkeypatch.delenv("HERMES_CLUXION_DISPATCH_DIR", raising=False)
+
+    status, detail = PROBES["env_var_consistency"](None)
+    assert status == "pass"
+    assert "producer=" in detail
+    assert "consumer=" in detail
+    assert str(store / "dispatch") in detail
+
+
 def test_warn_only_is_ok():
     # construct a result with only warn (no fail)
     from cluxion_agentplugin_preprocessing.doctor.framework import CheckResult, DoctorResult

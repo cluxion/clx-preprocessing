@@ -415,10 +415,177 @@ def test_work_id_unicode_alphanumeric_remains_valid(tmp_path: Path) -> None:
 
 
 from cluxion_runtime.core.types import ResourceSnapshot
-from cluxion_runtime.resources.queue_bridge import resolve_backend
+from cluxion_runtime.resources.queue_bridge import QUEUE_STORE_ENV, default_store_dir, resolve_backend
 
 
 def test_queue_backend_label_matches_resolve_backend():
     item = WorkItem("w-test", "short prompt", surface=AgentSurface.HERMES)
     plan = build_harness_plan(item)
     assert plan.queue_backend == resolve_backend()
+
+
+def test_identical_repersist_preserves_bytes_and_progress(tmp_path: Path, queued_plan: HarnessPlan) -> None:
+    path = persist_dispatch_bundle(queued_plan, dispatch_dir=tmp_path)
+    assert path is not None
+    step_id = str(next_dispatch_step("w-queued", dispatch_dir=tmp_path)["step"]["step_id"])
+    record_dispatch_result("w-queued", step_id, result=f"progress:{step_id}", dispatch_dir=tmp_path)
+    before_bytes = path.read_bytes()
+    before_bundle = load_dispatch_bundle("w-queued", dispatch_dir=tmp_path)
+
+    again = persist_dispatch_bundle(queued_plan, dispatch_dir=tmp_path)
+
+    assert again == path
+    assert path.read_bytes() == before_bytes
+    after = load_dispatch_bundle("w-queued", dispatch_dir=tmp_path)
+    assert after["steps"] == before_bundle["steps"]
+    progressed = next(step for step in after["steps"] if step["step_id"] == step_id)
+    assert progressed["status"] == "succeeded"
+    assert progressed["result"] == f"progress:{step_id}"
+
+
+def test_backend_outage_falls_back_safely_for_existing_identical_bundle(
+    tmp_path: Path, queued_plan: HarnessPlan, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dataclasses import replace
+
+    from cluxion_runtime.resources import queue_bridge
+
+    store = tmp_path / "queue"
+    dispatch = store / "dispatch"
+    plan = replace(queued_plan, queue_backend="native")
+    monkeypatch.delenv(dispatch_store.DISPATCH_DIR_ENV, raising=False)
+    monkeypatch.delenv("HERMES_CLUXION_DISPATCH_DIR", raising=False)
+    monkeypatch.setenv(QUEUE_STORE_ENV, str(store))
+
+    path = persist_dispatch_bundle(plan, dispatch_dir=dispatch)
+    assert path is not None
+    step_id = str(next_dispatch_step("w-queued", dispatch_dir=dispatch)["step"]["step_id"])
+    record_dispatch_result("w-queued", step_id, result="kept", dispatch_dir=dispatch)
+    before = path.read_bytes()
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("native backend unavailable")
+
+    monkeypatch.setattr(queue_bridge, "persist_dispatch_bundle", unavailable)
+    assert persist_dispatch_bundle(plan) == path
+    assert path.read_bytes() == before
+
+
+def test_conflicting_sequence_repersist_fails_without_mutation(tmp_path: Path, queued_plan: HarnessPlan) -> None:
+    path = persist_dispatch_bundle(queued_plan, dispatch_dir=tmp_path)
+    assert path is not None
+    step_id = str(next_dispatch_step("w-queued", dispatch_dir=tmp_path)["step"]["step_id"])
+    record_dispatch_result("w-queued", step_id, result=f"progress:{step_id}", dispatch_dir=tmp_path)
+    before_bytes = path.read_bytes()
+    before_bundle = load_dispatch_bundle("w-queued", dispatch_dir=tmp_path)
+
+    conflict_prompt = "\n".join(
+        f"ALT-{idx}: implement work item and record evidence token {idx}." for idx in range(1500)
+    )
+    assert len(conflict_prompt) > 72_000
+    conflict_plan = build_harness_plan(
+        WorkItem(
+            "w-queued",
+            conflict_prompt,
+            surface=AgentSurface.HERMES,
+            metadata={"clarification_answers": "implement every ALT line in order"},
+        ),
+        snapshot=_SNAPSHOT,
+    )
+    assert conflict_plan.execution.queue_required is True
+
+    with pytest.raises(DispatchStoreError, match="dispatch_bundle_conflict"):
+        persist_dispatch_bundle(conflict_plan, dispatch_dir=tmp_path)
+
+    assert path.read_bytes() == before_bytes
+    assert load_dispatch_bundle("w-queued", dispatch_dir=tmp_path) == before_bundle
+
+
+def test_default_dispatch_dir_follows_queue_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = tmp_path / "custom-queue"
+    monkeypatch.delenv(dispatch_store.DISPATCH_DIR_ENV, raising=False)
+    monkeypatch.delenv("HERMES_CLUXION_DISPATCH_DIR", raising=False)
+    monkeypatch.setenv(QUEUE_STORE_ENV, str(store))
+
+    resolved = dispatch_store.default_dispatch_dir()
+    assert resolved == store / "dispatch"
+    assert resolved == default_store_dir() / "dispatch"
+
+
+def test_default_dispatch_dir_prefers_explicit_dispatch_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    dispatch = tmp_path / "explicit-dispatch"
+    store = tmp_path / "queue-store"
+    monkeypatch.setenv(dispatch_store.DISPATCH_DIR_ENV, str(dispatch))
+    monkeypatch.setenv(QUEUE_STORE_ENV, str(store))
+    assert dispatch_store.default_dispatch_dir() == dispatch
+
+
+@pytest.mark.parametrize(
+    "corrupt_body",
+    [
+        b"not-json{{{",
+        b"[]",
+        b'{"work_id":"w-queued","steps":"nope"}',
+        b'{"work_id":"w-queued","steps":[1,2]}',
+    ],
+)
+def test_corrupt_existing_bundle_is_fail_closed_and_immutable(
+    tmp_path: Path, queued_plan: HarnessPlan, corrupt_body: bytes
+) -> None:
+    path = tmp_path / "w-queued.json"
+    path.write_bytes(corrupt_body)
+    before = path.read_bytes()
+
+    with pytest.raises(DispatchStoreError):
+        persist_dispatch_bundle(queued_plan, dispatch_dir=tmp_path)
+
+    assert path.read_bytes() == before == corrupt_body
+
+
+def test_invalid_utf8_bundle_raises_dispatch_store_error_and_stays_byte_identical(
+    tmp_path: Path, queued_plan: HarnessPlan
+) -> None:
+    """Invalid UTF-8 must surface as DispatchStoreError (RuntimeError) and never mutate bytes."""
+    path = tmp_path / "w-queued.json"
+    corrupt_body = b'{"work_id":"w-queued","steps":[]}\xff'
+    path.write_bytes(corrupt_body)
+    before = path.read_bytes()
+
+    with pytest.raises(DispatchStoreError) as load_exc:
+        load_dispatch_bundle("w-queued", dispatch_dir=tmp_path)
+    assert isinstance(load_exc.value, RuntimeError)
+
+    with pytest.raises(DispatchStoreError) as persist_exc:
+        persist_dispatch_bundle(queued_plan, dispatch_dir=tmp_path)
+    assert isinstance(persist_exc.value, RuntimeError)
+
+    assert path.read_bytes() == before == corrupt_body
+
+
+def test_resolved_producer_dispatch_dir_uses_queue_store_without_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = tmp_path / "queue-store"
+    monkeypatch.delenv(dispatch_store.DISPATCH_DIR_ENV, raising=False)
+    monkeypatch.delenv("HERMES_CLUXION_DISPATCH_DIR", raising=False)
+    monkeypatch.setenv(QUEUE_STORE_ENV, str(store))
+
+    producer = dispatch_store.resolved_producer_dispatch_dir()
+    consumer = dispatch_store.default_dispatch_dir()
+    assert producer == store / "dispatch"
+    assert producer == default_store_dir() / "dispatch"
+    assert producer == consumer
+
+
+def test_resolved_producer_dispatch_dir_uses_shared_resolver_on_explicit_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dispatch = tmp_path / "explicit-dispatch"
+    store = tmp_path / "queue-store"
+    monkeypatch.setenv(dispatch_store.DISPATCH_DIR_ENV, str(dispatch))
+    monkeypatch.setenv(QUEUE_STORE_ENV, str(store))
+
+    producer = dispatch_store.resolved_producer_dispatch_dir()
+    assert producer == dispatch
+    assert producer == dispatch_store.default_dispatch_dir()
+    assert producer != store / "dispatch"

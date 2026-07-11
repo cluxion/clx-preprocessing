@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
+import pytest
+
 from cluxion_runtime.adapters import render_adapter_manifest, work_item_from_adapter_payload
 from cluxion_runtime.cli import main
 from cluxion_runtime.core import AgentSurface, WorkPriority
 
 if TYPE_CHECKING:
-    import pytest
+    pass
 
 
 def test_adapter_payload_builds_work_item_with_metadata() -> None:
@@ -277,7 +279,13 @@ def test_serve_local_missing_binary_emits_json_error_not_traceback(
     tmp_path,
 ) -> None:
     """A missing vllm-mlx binary yields the normal JSON contract and exit 1."""
+    from cluxion_runtime.models import supervisor as supervisor_module
+
+    def endpoint_down(_url: str, _timeout: float) -> tuple[int, str]:
+        raise OSError("connection refused")
+
     monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(supervisor_module, "_default_health_get", endpoint_down)
     code = main(
         [
             "serve-local",
@@ -295,3 +303,61 @@ def test_serve_local_missing_binary_emits_json_error_not_traceback(
     assert payload["started"] is False
     assert payload["pid"] == 0
     assert payload["reason"].startswith("binary_not_found:")
+
+
+def _patch_serve_start(monkeypatch: pytest.MonkeyPatch, reason: str, *, started: bool = False, pid: int = 0):
+    from cluxion_runtime.models.supervisor import SupervisorStartResult
+
+    class _FakeSupervisor:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def start(self) -> SupervisorStartResult:
+            return SupervisorStartResult(started, pid, reason)
+
+    monkeypatch.setattr("cluxion_runtime.models.LocalModelSupervisor", _FakeSupervisor)
+
+
+def test_serve_local_already_running_is_idempotent_success(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_serve_start(monkeypatch, "already_running", pid=4242)
+    code = main(
+        [
+            "serve-local",
+            "--model",
+            "demo",
+            "--port",
+            "23003",
+            "--no-auto-install",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["started"] is False
+    assert payload["reason"] == "already_running"
+    assert payload["pid"] == 4242
+
+
+@pytest.mark.parametrize("reason", ["endpoint_in_use", "process_exited:7", "empty_command"])
+def test_serve_local_non_started_failures_remain_rc1(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str,
+) -> None:
+    _patch_serve_start(monkeypatch, reason)
+    code = main(
+        [
+            "serve-local",
+            "--model",
+            "demo",
+            "--port",
+            "23003",
+            "--no-auto-install",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert payload["started"] is False
+    assert payload["reason"] == reason

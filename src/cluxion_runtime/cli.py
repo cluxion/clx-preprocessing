@@ -21,6 +21,7 @@ from cluxion_runtime.core.dispatch_store import (
 from cluxion_runtime.core.harness import build_harness_plan
 from cluxion_runtime.core.loop_auto import (
     LoopAutoOptions,
+    loop_auto_enabled,
     run_loop_auto,
     should_auto_loop_plan,
     strip_loop_auto_directive,
@@ -116,7 +117,12 @@ def _build_parser(*, json_mode: bool = False) -> argparse.ArgumentParser:
     plan.add_argument("--expected-ram-mb", type=int, default=0)
     plan.add_argument("--context-tokens", type=int, default=0)
     plan.add_argument("--cwd", default="")
-    plan.add_argument("--loop-auto", action="store_true")
+    plan.add_argument(
+        "--loop-auto",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable post-plan auto-loop; omit to honor CLUXION_LOOP_AUTO",
+    )
     plan.add_argument("--json-stdin", action="store_true")
     serve = subparsers.add_parser("serve-local", help="Prepare a vLLM-MLX server endpoint for a local model")
     serve.add_argument("--model", required=True)
@@ -196,20 +202,30 @@ def _run_plan(args: argparse.Namespace) -> int:
     payload = _payload_from_stdin() if args.json_stdin else _payload_from_args(args)
     payload = _apply_loop_auto_directive(payload)
     payload = _apply_plan_numeric_contract(payload)
-    if bool(getattr(args, "loop_auto", False)):
-        payload["loop_auto"] = True
+    # Tri-state CLI: only explicit --loop-auto / --no-loop-auto enter the payload.
+    # When omitted, leave loop_auto absent so CLUXION_LOOP_AUTO remains effective.
+    cli_loop_auto = getattr(args, "loop_auto", None)
+    if cli_loop_auto is not None:
+        payload["loop_auto"] = bool(cli_loop_auto)
     item = work_item_from_adapter_payload(payload, default_surface=surface)
     plan = build_harness_plan(item)
-    persisted = persist_dispatch_bundle(plan)
     output = plan_to_dict(plan)
+    try:
+        persisted = persist_dispatch_bundle(plan)
+    except DispatchStoreError as exc:
+        error = str(exc)
+        output["ok"] = False
+        output["error"] = error
+        output["dispatch_store"] = {"stored": False, "error": error}
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        return 1
     if persisted is not None:
         item_output = output.get("item")
         if isinstance(item_output, dict):
             item_output["original_prompt_stored"] = True
         output["dispatch_store"] = {"stored": True, "path": str(persisted)}
-    loop_auto_flag = payload.get("loop_auto") if isinstance(payload, dict) else None
     loop_ok = True
-    if should_auto_loop_plan(output, loop_auto=bool(loop_auto_flag) if loop_auto_flag is not None else None):
+    if should_auto_loop_plan(output, loop_auto=loop_auto_enabled(payload if isinstance(payload, dict) else None)):
         cwd = str(payload.get("cwd", "")) if isinstance(payload, dict) else ""
         loop_result = run_loop_auto(
             LoopAutoOptions(
@@ -237,9 +253,7 @@ def _run_loop_auto(args: argparse.Namespace) -> int:
             cwd=Path(cwd_raw).expanduser() if cwd_raw else Path.cwd(),
             hermes_bin=str(payload.get("hermes_bin", args.hermes_bin)),
             model=str(payload.get("model", args.model)),
-            timeout_seconds=_positive_float(
-                "timeout_seconds", payload.get("timeout_seconds", args.timeout_seconds)
-            ),
+            timeout_seconds=_positive_float("timeout_seconds", payload.get("timeout_seconds", args.timeout_seconds)),
             max_segment_retries=_non_negative_int(
                 "max_segment_retries", payload.get("max_segment_retries", args.max_segment_retries)
             ),
@@ -454,7 +468,8 @@ def _run_serve_local(args: argparse.Namespace) -> int:
     if not args.dry_run:
         result = LocalModelSupervisor(profile).start()
         payload.update({"started": result.started, "pid": result.pid, "reason": result.reason})
-        exit_code = 0 if result.started else 1
+        # already_running is idempotent success; other non-started reasons stay rc 1.
+        exit_code = 0 if result.started or result.reason == "already_running" else 1
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return exit_code
 
@@ -591,7 +606,7 @@ def _payload_from_stdin() -> dict[str, object]:
 
 
 def _payload_from_args(args: argparse.Namespace) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "surface": str(args.surface),
         "work_id": str(args.work_id),
         "prompt": str(args.prompt),
@@ -600,8 +615,11 @@ def _payload_from_args(args: argparse.Namespace) -> dict[str, object]:
         "expected_ram_mb": _non_negative_int("expected_ram_mb", args.expected_ram_mb),
         "context_tokens": _non_negative_int("context_tokens", args.context_tokens),
         "cwd": str(args.cwd),
-        "loop_auto": bool(args.loop_auto),
     }
+    # Omit loop_auto when CLI left it unspecified (BooleanOptionalAction default None).
+    if getattr(args, "loop_auto", None) is not None:
+        payload["loop_auto"] = bool(args.loop_auto)
+    return payload
 
 
 def _non_negative_int(name: str, value: object, *, parse_exit_code: int = 2) -> int:

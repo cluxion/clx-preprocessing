@@ -198,6 +198,127 @@ def test_dispatch_retryable_failure_requeues_step(backend) -> None:
     assert retaken["step"]["step_id"] == "s1"
 
 
+def test_identical_repersist_preserves_progress_bytes(backend, tmp_path: Path) -> None:
+    work_id = "d-idem"
+    assert queue_bridge.persist_dispatch_bundle(work_id, _two_step_bundle(work_id))["stored"] is True
+    assert queue_bridge.next_dispatch_step(work_id)["step"]["step_id"] == "s1"
+    rec = queue_bridge.record_dispatch_step(work_id, "s1", result="kept")
+    assert rec["recorded"] is True
+
+    bundle_path = tmp_path / "queue" / "dispatch" / f"{work_id}.json"
+    before_bytes = bundle_path.read_bytes()
+    before = json.loads(before_bytes.decode("utf-8"))
+
+    again = queue_bridge.persist_dispatch_bundle(work_id, _two_step_bundle(work_id))
+    assert again["ok"] is True
+    assert again.get("stored") is False or again.get("idempotent") is True
+    assert bundle_path.read_bytes() == before_bytes
+    after = json.loads(bundle_path.read_text(encoding="utf-8"))
+    assert after["steps"] == before["steps"]
+    assert after["steps"][0]["status"] == "succeeded"
+    assert after["steps"][0]["result"] == "kept"
+
+
+def test_conflicting_sequence_repersist_does_not_mutate(backend, tmp_path: Path) -> None:
+    work_id = "d-conflict"
+    assert queue_bridge.persist_dispatch_bundle(work_id, _two_step_bundle(work_id))["stored"] is True
+    assert queue_bridge.next_dispatch_step(work_id)["step"]["step_id"] == "s1"
+    queue_bridge.record_dispatch_step(work_id, "s1", result="kept")
+
+    bundle_path = tmp_path / "queue" / "dispatch" / f"{work_id}.json"
+    before_bytes = bundle_path.read_bytes()
+    before = json.loads(before_bytes.decode("utf-8"))
+
+    conflict = {
+        "work_id": work_id,
+        "steps": [
+            {
+                "step_id": "s1",
+                "segment_id": "g1",
+                "checksum": "CHANGED",
+                "token_estimate": 10,
+                "content": "one",
+                "status": "queued",
+                "result": "",
+                "error": "",
+            },
+            {
+                "step_id": "s2",
+                "segment_id": "g2",
+                "checksum": "c2",
+                "token_estimate": 12,
+                "content": "two",
+                "status": "queued",
+                "result": "",
+                "error": "",
+            },
+        ],
+    }
+    result = queue_bridge.persist_dispatch_bundle(work_id, conflict)
+    assert result.get("stored") is False
+    assert result.get("error") == "dispatch_bundle_conflict" or result.get("ok") is False
+    assert "dispatch_bundle_conflict" in str(result.get("error", result))
+    assert bundle_path.read_bytes() == before_bytes
+    assert json.loads(bundle_path.read_text(encoding="utf-8")) == before
+
+
+@pytest.mark.parametrize(
+    "corrupt_body",
+    [
+        b"not-json{{{",
+        b"[]",
+        b'{"work_id":"d-corrupt","steps":"nope"}',
+        b'{"work_id":"d-corrupt","steps":[1,2]}',
+    ],
+)
+def test_corrupt_existing_bundle_is_fail_closed(backend, tmp_path: Path, corrupt_body: bytes) -> None:
+    work_id = "d-corrupt"
+    bundle_path = tmp_path / "queue" / "dispatch" / f"{work_id}.json"
+    bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    bundle_path.write_bytes(corrupt_body)
+    before = bundle_path.read_bytes()
+
+    with pytest.raises(RuntimeError):
+        queue_bridge.persist_dispatch_bundle(work_id, _two_step_bundle(work_id))
+
+    assert bundle_path.read_bytes() == before == corrupt_body
+
+
+@pytest.mark.skipif(__import__("os").name != "posix", reason="POSIX fail-closed symlink policy")
+def test_persist_existing_dispatch_bundle_symlink_fail_closed(backend, tmp_path: Path) -> None:
+    """Existing bundle path that is a symlink must fail closed; never replace it."""
+    work_id = "d-sym"
+    dispatch_dir = tmp_path / "queue" / "dispatch"
+    dispatch_dir.mkdir(parents=True, exist_ok=True)
+    victim = tmp_path / "outside-victim.json"
+    target_bytes = b'{"secret":"untouched-target-bytes"}'
+    victim.write_bytes(target_bytes)
+    bundle_path = dispatch_dir / f"{work_id}.json"
+    bundle_path.symlink_to(victim)
+
+    with pytest.raises(RuntimeError, match=r"symlink|expected"):
+        queue_bridge.persist_dispatch_bundle(work_id, _two_step_bundle(work_id))
+
+    assert bundle_path.is_symlink()
+    assert victim.read_bytes() == target_bytes
+    assert bundle_path.read_bytes() == target_bytes
+
+
+def test_persist_invalid_utf8_bundle_is_fail_closed(backend, tmp_path: Path) -> None:
+    """Invalid UTF-8 existing dispatch bytes must raise RuntimeError and stay byte-identical."""
+    work_id = "d-utf8"
+    bundle_path = tmp_path / "queue" / "dispatch" / f"{work_id}.json"
+    bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_body = b'{"work_id":"d-utf8","steps":[]}\xff'
+    bundle_path.write_bytes(corrupt_body)
+    before = bundle_path.read_bytes()
+
+    with pytest.raises(RuntimeError):
+        queue_bridge.persist_dispatch_bundle(work_id, _two_step_bundle(work_id))
+
+    assert bundle_path.read_bytes() == before == corrupt_body
+
+
 def test_missing_required_field_raises(backend) -> None:
     with pytest.raises(RuntimeError, match="work_id"):
         queue_bridge.enqueue_work({"prompt": "no id"})

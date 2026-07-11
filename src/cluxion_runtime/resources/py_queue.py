@@ -356,7 +356,10 @@ def _read_bundle(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise RuntimeError(f"dispatch bundle not found: {path}")
     _ensure_file_mode(path, _FILE_MODE, create=False)
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise RuntimeError(f"dispatch bundle is invalid JSON: {path}") from None
     if not isinstance(payload, dict):
         raise RuntimeError(f"dispatch bundle expected object, found {_type_name(payload)}: {path}")
     return payload
@@ -404,13 +407,36 @@ def _remaining(steps: list[dict[str, Any]]) -> int:
     return sum(1 for s in steps if s.get("status") in ("queued", "retry_wait", "running"))
 
 
+def _step_identity_sequence(bundle: dict[str, Any]) -> list[tuple[str, str]]:
+    """Ordered (step_id, checksum) identity; validates steps array/objects."""
+    steps = _steps(bundle)
+    return [(str(step.get("step_id", "")), str(step.get("checksum", ""))) for step in steps]
+
+
 def _persist(store_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
     work_id = _require_str(payload, "work_id")
     if "bundle" not in payload:
         raise RuntimeError("missing bundle")
+    bundle = payload["bundle"]
+    if not isinstance(bundle, dict):
+        raise RuntimeError("bundle must be an object")
     path = _bundle_path(store_dir, work_id)
     with _exclusive_bundle_lock(path):
-        _write_atomic(path, payload["bundle"])
+        # is_symlink uses lstat: reject dangling links too; never replace/follow.
+        if path.is_symlink():
+            raise RuntimeError(f"expected regular file, found symlink: {path}")
+        if path.exists():
+            # Read/JSON/shape failures fail closed — never catch-and-overwrite.
+            existing = _read_bundle(path)
+            if _step_identity_sequence(existing) == _step_identity_sequence(bundle):
+                return _ok({"stored": False, "idempotent": True, "path": str(path)})
+            return {
+                "ok": False,
+                "stored": False,
+                "error": "dispatch_bundle_conflict",
+                "path": str(path),
+            }
+        _write_atomic(path, bundle)
     return _ok({"stored": True, "path": str(path)})
 
 

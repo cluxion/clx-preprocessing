@@ -60,8 +60,8 @@ PLAN_SCHEMA = {
             },
             "loop_auto": {
                 "type": "boolean",
-                "default": True,
-                "description": "After a queued plan is stored, autonomously drain segments via Hermes oneshot calls.",
+                "default": False,
+                "description": "After a queued plan is stored, autonomously drain segments via Hermes oneshot calls. Explicit opt-in only.",
             },
             "loop_auto_dry_run": {
                 "type": "boolean",

@@ -17,15 +17,73 @@ pub fn persist_bundle(store_dir: &Path, payload: &Value) -> Result<Value, QueueE
         .get("bundle")
         .cloned()
         .ok_or_else(|| QueueError::Usage("missing bundle".into()))?;
+    if !bundle.is_object() {
+        return Err(QueueError::Usage("bundle must be an object".into()));
+    }
     let dispatch_dir = dispatch_dir(store_dir)?;
     let path = bundle_path(&dispatch_dir, work_id)?;
     with_dispatch_lock(&dispatch_dir, || {
+        // symlink_metadata/is_symlink detects dangling links path.exists() misses.
+        // Never replace, unlink, or follow an existing final-bundle symlink.
+        if path.is_symlink()
+            || fs::symlink_metadata(&path)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+        {
+            return Err(QueueError::Store(format!(
+                "expected regular file, found symlink: {}",
+                path.display()
+            )));
+        }
+        if path.exists() {
+            // Read/JSON/shape failures fail closed — never fall through to write.
+            let existing = read_bundle(&path)?;
+            let existing_id = step_identity_sequence(&existing)?;
+            let new_id = step_identity_sequence(&bundle)?;
+            if existing_id == new_id {
+                return Ok(ok_payload(json!({
+                    "stored": false,
+                    "idempotent": true,
+                    "path": path.to_string_lossy(),
+                })));
+            }
+            return Ok(json!({
+                "ok": false,
+                "stored": false,
+                "error": "dispatch_bundle_conflict",
+                "path": path.to_string_lossy(),
+            }));
+        }
         write_atomic_json(&path, &bundle)?;
         Ok(ok_payload(json!({
             "stored": true,
             "path": path.to_string_lossy(),
         })))
     })
+}
+
+fn step_identity_sequence(bundle: &Value) -> Result<Vec<(String, String)>, QueueError> {
+    let steps = steps_ref(bundle)?;
+    let mut sequence = Vec::with_capacity(steps.len());
+    for step in steps {
+        if !step.is_object() {
+            return Err(QueueError::Store(format!(
+                "dispatch bundle expected step objects, found {}",
+                value_kind(step)
+            )));
+        }
+        sequence.push((
+            step.get("step_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            step.get("checksum")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        ));
+    }
+    Ok(sequence)
 }
 
 pub fn next_step(store_dir: &Path, payload: &Value) -> Result<Value, QueueError> {
@@ -413,14 +471,23 @@ fn now_secs() -> f64 {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_STORE_SEQ: AtomicU64 = AtomicU64::new(0);
 
     fn temp_store() -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        std::env::temp_dir().join(format!("cluxion-dispatch-{}-{}", std::process::id(), nanos))
+        let seq = TEMP_STORE_SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "cluxion-dispatch-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            seq
+        ))
     }
 
     #[test]
@@ -510,6 +577,125 @@ mod tests {
             parent_mode
         );
         let _ = fs::remove_dir_all(&store);
+    }
+
+    fn two_step_bundle(checksum_s1: &str) -> Value {
+        json!({
+            "work_id": "d1",
+            "steps": [
+                {
+                    "step_id": "s1",
+                    "segment_id": "g1",
+                    "checksum": checksum_s1,
+                    "token_estimate": 1,
+                    "content": "one",
+                    "status": "queued",
+                    "result": "",
+                    "error": "",
+                    "updated_at": 1.0
+                },
+                {
+                    "step_id": "s2",
+                    "segment_id": "g2",
+                    "checksum": "c2",
+                    "token_estimate": 1,
+                    "content": "two",
+                    "status": "queued",
+                    "result": "",
+                    "error": "",
+                    "updated_at": 1.0
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn identical_repersist_is_idempotent_and_preserves_progress() {
+        let store = temp_store();
+        let path = store.join("dispatch").join("d1.json");
+        persist_bundle(
+            &store,
+            &json!({"work_id": "d1", "bundle": two_step_bundle("c1")}),
+        )
+        .expect("first persist");
+        let claimed = next_step(&store, &json!({"work_id": "d1"})).expect("claim");
+        assert_eq!(claimed["step"]["step_id"], "s1");
+        record_step(
+            &store,
+            &json!({"work_id": "d1", "step_id": "s1", "result": "kept"}),
+        )
+        .expect("record");
+        let before = fs::read(&path).expect("read before");
+        let again = persist_bundle(
+            &store,
+            &json!({"work_id": "d1", "bundle": two_step_bundle("c1")}),
+        )
+        .expect("repersist");
+        assert_eq!(again["ok"], true);
+        assert_eq!(again["stored"], false);
+        assert_eq!(again["idempotent"], true);
+        assert_eq!(fs::read(&path).expect("read after"), before);
+        let after: Value = serde_json::from_slice(&before).unwrap();
+        assert_eq!(after["steps"][0]["status"], "succeeded");
+        assert_eq!(after["steps"][0]["result"], "kept");
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn conflicting_sequence_repersist_does_not_mutate() {
+        let store = temp_store();
+        let path = store.join("dispatch").join("d1.json");
+        persist_bundle(
+            &store,
+            &json!({"work_id": "d1", "bundle": two_step_bundle("c1")}),
+        )
+        .expect("first persist");
+        next_step(&store, &json!({"work_id": "d1"})).expect("claim");
+        record_step(
+            &store,
+            &json!({"work_id": "d1", "step_id": "s1", "result": "kept"}),
+        )
+        .expect("record");
+        let before = fs::read(&path).expect("read before");
+        let conflict = persist_bundle(
+            &store,
+            &json!({"work_id": "d1", "bundle": two_step_bundle("CHANGED")}),
+        )
+        .expect("conflict persist returns contract");
+        assert_eq!(conflict["ok"], false);
+        assert_eq!(conflict["stored"], false);
+        assert_eq!(conflict["error"], "dispatch_bundle_conflict");
+        assert_eq!(fs::read(&path).expect("read after"), before);
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn corrupt_existing_bundle_is_fail_closed_and_immutable() {
+        let cases: &[&[u8]] = &[
+            b"not-json{{{",
+            b"[]",
+            br#"{"work_id":"d1","steps":"nope"}"#,
+            br#"{"work_id":"d1","steps":[1,2]}"#,
+        ];
+        for corrupt in cases {
+            let store = temp_store();
+            let path = store.join("dispatch").join("d1.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, corrupt).unwrap();
+            let before = fs::read(&path).unwrap();
+            let err = persist_bundle(
+                &store,
+                &json!({"work_id": "d1", "bundle": two_step_bundle("c1")}),
+            )
+            .expect_err("corrupt existing must fail closed");
+            let msg = err.to_string();
+            assert!(
+                !msg.is_empty(),
+                "backend must surface a failure detail for corrupt existing"
+            );
+            assert_eq!(fs::read(&path).expect("bytes immutable"), before);
+            let _ = fs::remove_dir_all(&store);
+        }
     }
 
     #[cfg(unix)]

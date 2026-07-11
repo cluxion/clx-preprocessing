@@ -59,6 +59,22 @@ def test_loop_auto_enabled_respects_env(monkeypatch: pytest.MonkeyPatch) -> None
     assert loop_auto_enabled({"loop_auto": True}) is True
 
 
+def test_loop_auto_enabled_defaults_false_without_payload_or_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CLUXION_LOOP_AUTO", raising=False)
+    monkeypatch.delenv("CLUXION_LOOP_AUTO_DEFAULT", raising=False)
+    assert loop_auto_enabled() is False
+    assert loop_auto_enabled({}) is False
+
+
+def test_loop_auto_enabled_explicit_true_and_env_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CLUXION_LOOP_AUTO_DEFAULT", raising=False)
+    monkeypatch.setenv("CLUXION_LOOP_AUTO", "1")
+    assert loop_auto_enabled() is True
+    monkeypatch.delenv("CLUXION_LOOP_AUTO", raising=False)
+    assert loop_auto_enabled({"loop_auto": True}) is True
+    assert loop_auto_enabled({"loop_auto": False}) is False
+
+
 def test_should_auto_loop_plan_requires_queue() -> None:
     payload = {"host_execution": {"queue_required": False}}
     assert should_auto_loop_plan(payload) is False
@@ -118,9 +134,7 @@ def test_run_loop_auto_accepts_positive_int_timeout_without_throw(
 ) -> None:
     # Valid int must normalize to float path (no preflight reject; missing bundle is post-preflight)
     monkeypatch.setenv("CLUXION_PREPROCESS_DISPATCH_DIR", str(tmp_path))
-    result = run_loop_auto(
-        LoopAutoOptions(work_id="w-int-timeout", dry_run=True, timeout_seconds=30)
-    )
+    result = run_loop_auto(LoopAutoOptions(work_id="w-int-timeout", dry_run=True, timeout_seconds=30))
     assert result.status != "preflight_failed"
 
 
@@ -204,6 +218,130 @@ def test_plan_cli_loopauto_prefix_does_not_force_short_prompt_queue(
     assert payload["host_execution"]["queue_required"] is False
     assert "loop_auto" not in payload
     assert "/loopAuto" not in str(payload["item"]["prompt"])
+
+
+def _queued_plan_stdin_payload(**extra: object) -> str:
+    prompt = "\n".join(f"REQ-{idx}: implement work item and record evidence token {idx}." for idx in range(1500))
+    body: dict[str, object] = {
+        "prompt": prompt,
+        "work_id": "w-cli-loop-gate",
+        "clarification_answers": "go",
+        "loop_auto_dry_run": True,
+    }
+    body.update(extra)
+    return json.dumps(body)
+
+
+def test_plan_cli_queued_default_does_not_auto_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import sys
+    from io import StringIO
+
+    monkeypatch.setenv("CLUXION_PREPROCESS_DISPATCH_DIR", str(tmp_path))
+    monkeypatch.delenv("CLUXION_LOOP_AUTO", raising=False)
+    monkeypatch.delenv("CLUXION_LOOP_AUTO_DEFAULT", raising=False)
+    monkeypatch.setattr("cluxion_runtime.core.harness.collect_resource_snapshot", lambda: _SNAPSHOT)
+    monkeypatch.setattr(sys, "stdin", StringIO(_queued_plan_stdin_payload()))
+
+    code = main(["plan", "--json-stdin", "--surface", "hermes"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["host_execution"]["queue_required"] is True
+    assert "loop_auto" not in payload or not isinstance(payload.get("loop_auto"), dict)
+
+
+def test_plan_cli_env_opt_in_auto_loops_queued_dry_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import sys
+    from io import StringIO
+
+    monkeypatch.setenv("CLUXION_PREPROCESS_DISPATCH_DIR", str(tmp_path))
+    monkeypatch.delenv("CLUXION_LOOP_AUTO_DEFAULT", raising=False)
+    monkeypatch.setenv("CLUXION_LOOP_AUTO", "1")
+    monkeypatch.setattr("cluxion_runtime.core.harness.collect_resource_snapshot", lambda: _SNAPSHOT)
+    monkeypatch.setattr(sys, "stdin", StringIO(_queued_plan_stdin_payload(work_id="w-cli-env")))
+
+    code = main(["plan", "--json-stdin", "--surface", "hermes"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["host_execution"]["queue_required"] is True
+    assert payload["loop_auto"]["ok"] is True
+    assert payload["loop_auto"]["segments_processed"] >= 1
+
+
+def test_plan_cli_explicit_false_overrides_env_true(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import sys
+    from io import StringIO
+
+    monkeypatch.setenv("CLUXION_PREPROCESS_DISPATCH_DIR", str(tmp_path))
+    monkeypatch.delenv("CLUXION_LOOP_AUTO_DEFAULT", raising=False)
+    monkeypatch.setenv("CLUXION_LOOP_AUTO", "1")
+    monkeypatch.setattr("cluxion_runtime.core.harness.collect_resource_snapshot", lambda: _SNAPSHOT)
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        StringIO(_queued_plan_stdin_payload(work_id="w-cli-override", loop_auto=False)),
+    )
+
+    code = main(["plan", "--json-stdin", "--surface", "hermes"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["host_execution"]["queue_required"] is True
+    assert "loop_auto" not in payload or not isinstance(payload.get("loop_auto"), dict)
+
+
+def test_plan_cli_non_json_args_path_honors_cluxion_loop_auto_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Ordinary non-JSON plan (no --json-stdin, no --loop-auto) must honor CLUXION_LOOP_AUTO=1.
+
+    Injects only clarification_answers + dry_run so the queued path can be exercised
+    without Hermes; does not set loop_auto=true.
+    """
+    import cluxion_runtime.cli as cli
+
+    monkeypatch.setenv("CLUXION_PREPROCESS_DISPATCH_DIR", str(tmp_path))
+    monkeypatch.delenv("CLUXION_LOOP_AUTO_DEFAULT", raising=False)
+    monkeypatch.setenv("CLUXION_LOOP_AUTO", "1")
+    monkeypatch.setattr("cluxion_runtime.core.harness.collect_resource_snapshot", lambda: _SNAPSHOT)
+
+    original_payload_from_args = cli._payload_from_args
+
+    def payload_with_queue_fixtures(args: object) -> dict[str, object]:
+        payload = original_payload_from_args(args)
+        payload["clarification_answers"] = "go"
+        payload["loop_auto_dry_run"] = True
+        return payload
+
+    monkeypatch.setattr(cli, "_payload_from_args", payload_with_queue_fixtures)
+
+    prompt = "\n".join(f"REQ-{idx}: implement work item and record evidence token {idx}." for idx in range(1500))
+    code = main(
+        [
+            "plan",
+            "--surface",
+            "hermes",
+            "--prompt",
+            prompt,
+            "--work-id",
+            "w-cli-args-env",
+            "--cwd",
+            str(tmp_path),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["host_execution"]["queue_required"] is True
+    assert payload["loop_auto"]["ok"] is True
+    assert payload["loop_auto"]["segments_processed"] >= 1
 
 
 def test_run_loop_auto_missing_binary_fails_fast(tmp_path: Path, queued_plan, monkeypatch: pytest.MonkeyPatch) -> None:

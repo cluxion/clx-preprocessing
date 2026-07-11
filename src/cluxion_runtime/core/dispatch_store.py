@@ -27,7 +27,6 @@ if TYPE_CHECKING:
 
 DISPATCH_DIR_ENV = "CLUXION_PREPROCESS_DISPATCH_DIR"
 _LEGACY_DISPATCH_DIR_ENV = "HERMES_CLUXION_DISPATCH_DIR"
-_DEFAULT_BASE_DIR = Path.home() / ".local" / "share" / "cluxion-agentplugin-preprocessing" / "queue" / "dispatch"
 # A step abandoned in 'running' (crashed or killed worker) becomes claimable
 # again after this lease; matches the LoopAutoOptions.timeout_seconds default,
 # so no live worker can legitimately hold a step longer. Mirrored in
@@ -54,12 +53,33 @@ class DispatchStoreError(RuntimeError):
 
 
 def default_dispatch_dir() -> Path:
-    """Return the per-user dispatch store path."""
+    """Return the shared producer/consumer dispatch store path.
+
+    Precedence:
+    CLUXION_PREPROCESS_DISPATCH_DIR > HERMES_CLUXION_DISPATCH_DIR >
+    ``${CLUXION_QUEUE_STORE_DIR}/dispatch`` > built-in default.
+    """
     for env_name in (DISPATCH_DIR_ENV, _LEGACY_DISPATCH_DIR_ENV):
         value = os.environ.get(env_name, "").strip()
         if value:
             return Path(value).expanduser()
-    return _DEFAULT_BASE_DIR
+    from cluxion_runtime.resources.queue_bridge import default_store_dir
+
+    return default_store_dir() / "dispatch"
+
+
+def resolved_producer_dispatch_dir() -> Path:
+    """Return the actual producer write path (not a consumer alias).
+
+    Explicit/legacy ``CLUXION_PREPROCESS_DISPATCH_DIR`` /
+    ``HERMES_CLUXION_DISPATCH_DIR`` overrides use the shared dispatch resolver;
+    otherwise producers write to ``queue_bridge.default_store_dir()/dispatch``.
+    """
+    if _custom_dispatch_dir_configured():
+        return default_dispatch_dir()
+    from cluxion_runtime.resources.queue_bridge import default_store_dir
+
+    return default_store_dir() / "dispatch"
 
 
 def persist_dispatch_bundle(plan: HarnessPlan, *, dispatch_dir: Path | None = None) -> Path | None:
@@ -73,19 +93,34 @@ def persist_dispatch_bundle(plan: HarnessPlan, *, dispatch_dir: Path | None = No
         and dispatch_dir is None
         and not _custom_dispatch_dir_configured()
     ):
-        try:
-            from cluxion_runtime.resources.queue_bridge import default_store_dir
-            from cluxion_runtime.resources.queue_bridge import persist_dispatch_bundle as rust_persist
+        from cluxion_runtime.resources.queue_bridge import default_store_dir
+        from cluxion_runtime.resources.queue_bridge import persist_dispatch_bundle as rust_persist
 
+        producer_path = default_store_dir() / "dispatch" / f"{_validated_work_id(plan.item.work_id)}.json"
+        try:
             result = rust_persist(plan.item.work_id, bundle, store_dir=default_store_dir())
-            if result.get("ok") and result.get("stored"):
-                return Path(str(result.get("path", "")))
         except RuntimeError:
+            # Backend outage falls through to the same locked, fail-closed core
+            # path. Corrupt existing bytes are re-read there and never overwritten.
             pass
+        else:
+            # Contract results (idempotent / conflict / corrupt) must not fall
+            # through to a destructive Python overwrite — only true backend
+            # outages without an existing file fallback.
+            if result.get("error") == "dispatch_bundle_conflict":
+                raise DispatchStoreError("dispatch_bundle_conflict")
+            if result.get("ok"):
+                path = str(result.get("path", ""))
+                if path:
+                    return Path(path)
+            if producer_path.exists():
+                raise DispatchStoreError(str(result.get("error") or "dispatch_persist_failed"))
     _ensure_dir_mode(target_dir, _DIR_MODE)
     path = _bundle_path(plan.item.work_id, target_dir)
     with _exclusive_bundle_lock(path):
-        _atomic_write_json(path, bundle)
+        decision = _persist_under_lock(path, bundle)
+        if decision == "conflict":
+            raise DispatchStoreError("dispatch_bundle_conflict")
     return path
 
 
@@ -224,6 +259,37 @@ def _bundle_from_plan(plan: HarnessPlan) -> dict[str, object]:
         },
         "steps": [_step_from_segment(segment) for segment in plan.preprocessing.segments],
     }
+
+
+def _step_identity_sequence(bundle: dict[str, object]) -> list[tuple[str, str]]:
+    """Ordered (step_id, checksum) identity used for stable work_id conflict checks.
+
+    Validates that ``steps`` is an array of objects — malformed shape fails closed
+    instead of collapsing to an empty sequence.
+    """
+    steps = _steps(bundle)
+    return [(str(step.get("step_id", "")), str(step.get("checksum", ""))) for step in steps]
+
+
+def _persist_under_lock(path: Path, bundle: dict[str, object]) -> str:
+    """Write a new bundle, or decide idempotent/conflict against an existing one.
+
+    Returns ``"written"``, ``"idempotent"``, or ``"conflict"``. Compare only the
+    ordered ``(step_id, checksum)`` sequence; never copy/compare progress fields.
+    When the path already exists, read/JSON/shape failures propagate (fail-closed)
+    and never fall through to write. Symlinks (including dangling) are rejected
+    via ``is_symlink``/lstat — never replace, unlink, or follow them.
+    """
+    # is_symlink uses lstat: detects dangling links that path.exists() would miss.
+    if path.is_symlink():
+        raise DispatchStoreError(f"expected regular file, found symlink: {path}")
+    if path.exists():
+        existing = _load_dispatch_bundle_from_path(path, str(bundle.get("work_id", "")))
+        if _step_identity_sequence(existing) == _step_identity_sequence(bundle):
+            return "idempotent"
+        return "conflict"
+    _atomic_write_json(path, bundle)
+    return "written"
 
 
 def _step_from_segment(segment: QueueSegment) -> dict[str, object]:
@@ -401,8 +467,8 @@ def _load_dispatch_bundle_from_path(path: Path, work_id: str) -> dict[str, objec
     _ensure_file_mode(path, _FILE_MODE, create=False)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise DispatchStoreError(f"dispatch bundle is invalid JSON: {work_id}") from exc
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise DispatchStoreError(f"dispatch bundle is invalid JSON: {work_id}") from None
     if not isinstance(payload, dict):
         raise DispatchStoreError(f"dispatch bundle expected object, found {_type_name(payload)}: {work_id}")
     return payload
@@ -479,4 +545,5 @@ __all__ = [
     "next_dispatch_step",
     "persist_dispatch_bundle",
     "record_dispatch_result",
+    "resolved_producer_dispatch_dir",
 ]

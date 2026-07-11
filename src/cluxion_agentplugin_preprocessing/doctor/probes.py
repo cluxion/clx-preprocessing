@@ -490,6 +490,12 @@ def _version_from_file(path: Path) -> str:
 @_register("env_var_consistency")
 def env_var_consistency(ctx: DoctorContext) -> tuple[str, str]:
     try:
+        from cluxion_runtime.core.dispatch_store import (
+            default_dispatch_dir,
+            resolved_producer_dispatch_dir,
+        )
+        from cluxion_runtime.resources import queue_bridge
+
         known = [
             "CLUXION_QUEUE_STORE_DIR",
             "CLUXION_PREPROCESS_DISPATCH_DIR",
@@ -504,9 +510,15 @@ def env_var_consistency(ctx: DoctorContext) -> tuple[str, str]:
                     os.makedirs(p, exist_ok=True)
                 except Exception:
                     issues.append(f"{var}=invalid_path")
+        producer = resolved_producer_dispatch_dir()
+        consumer = default_dispatch_dir()
+        store = queue_bridge.default_store_dir()
+        detail = f"producer={producer};consumer={consumer};queue_store={store}"
+        if producer != consumer:
+            issues.append(f"dispatch_path_split producer={producer} consumer={consumer}")
         if issues:
-            return "warn", ";".join(issues)
-        return "pass", "defaults or valid"
+            return "warn", f"{'; '.join(issues)};{detail}"
+        return "pass", detail
     except Exception as e:
         return "skip", f"uncertainty: {type(e).__name__}"
 

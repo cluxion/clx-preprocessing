@@ -121,12 +121,18 @@ class SegmentRunner(Protocol):
 
 
 def loop_auto_enabled(payload: Mapping[str, object] | None = None) -> bool:
-    """Return whether auto-loop should run after a queued plan."""
+    """Return whether auto-loop should run after a queued plan.
+
+    Default is off: omitted payload/env does not auto-run. Explicit
+    ``loop_auto`` payload, ``CLUXION_LOOP_AUTO``, or ``CLUXION_LOOP_AUTO_DEFAULT``
+    remain the opt-in paths.
+    """
     if payload is not None and "loop_auto" in payload:
         return bool(payload.get("loop_auto"))
-    default = os.environ.get(LOOP_AUTO_DEFAULT_ENV, "1").strip().lower()
-    if default in {"0", "false", "no", "off"}:
-        return False
+    default = os.environ.get(LOOP_AUTO_DEFAULT_ENV, "0").strip().lower()
+    if default in {"0", "false", "no", "off", ""}:
+        env_flag = os.environ.get(LOOP_AUTO_ENV, "0").strip().lower()
+        return env_flag in {"1", "true", "yes", "on"}
     return os.environ.get(LOOP_AUTO_ENV, "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
