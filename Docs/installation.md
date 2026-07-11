@@ -52,21 +52,21 @@ Hermes 세션에서 `/` 입력 → `/loopauto`, `/cluxion-doctor` 🔌 자동완
 Local path example:
 
 ```bash
-codex plugin marketplace add cluxion-local /path/to/cluxion-Agentplugin-preprocessing
-codex plugin add cluxion-agentplugin-preprocessing@cluxion-local
+codex plugin marketplace add cluxion-local /path/to/clx-preprocessing
+codex plugin add clx-preprocessing@cluxion-local
 ```
 
 Git URL example:
 
 ```bash
-codex plugin marketplace add cluxion https://github.com/cluxion/cluxion-Agentplugin-preprocessing
-codex plugin add cluxion-agentplugin-preprocessing@cluxion
+codex plugin marketplace add cluxion https://github.com/cluxion/clx-preprocessing
+codex plugin add clx-preprocessing@cluxion
 ```
 
 Enablement is stored by Codex as:
 
 ```toml
-[plugins."cluxion-agentplugin-preprocessing@cluxion-local"]
+[plugins."clx-preprocessing@cluxion-local"]
 enabled = true
 ```
 

@@ -2,7 +2,7 @@
 
 ======== 한국어 ========
 
-# cluxion-agentplugin-preprocessing
+# clx-preprocessing
 
 AI 코딩 에이전트(Hermes Agent, Claude Code, Codex)를 위한 전처리 플러그인입니다. 작업이 시작되기
 *전에* 정리를 해 줍니다: 에이전트가 모르는 것은 모른다고 인정하게 하고, 애매한 요청은 행동하기 전에
@@ -83,7 +83,7 @@ Apache-2.0
 
 ============ English ==========
 
-# cluxion-agentplugin-preprocessing
+# clx-preprocessing
 
 A preprocessing plugin for AI coding agents (Hermes Agent, Claude Code, Codex). It tidies
 things up *before* work starts: it makes the agent admit when it doesn't know, asks you to

@@ -1,6 +1,6 @@
 # Documentation
 
-`cluxion-Agentplugin-preprocessing` 공개 문서입니다.
+`clx-preprocessing` 공개 문서입니다.
 
 ## 처음 읽는 분
 

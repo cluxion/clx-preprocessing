@@ -32,8 +32,8 @@ Root plugin artifact:
 Codex uses the same root artifact through a marketplace install:
 
 ```bash
-codex plugin marketplace add cluxion-local /path/to/cluxion-Agentplugin-preprocessing
-codex plugin add cluxion-agentplugin-preprocessing@cluxion-local
+codex plugin marketplace add cluxion-local /path/to/clx-preprocessing
+codex plugin add clx-preprocessing@cluxion-local
 ```
 
 No `[plugins.<name>] command = [...]` schema exists.

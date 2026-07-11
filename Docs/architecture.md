@@ -2,7 +2,7 @@
 
 ## 개요
 
-`cluxion-Agentplugin-preprocessing`은 두 Python 패키지와 선택적 Rust 바이너리로 구성됩니다.
+`clx-preprocessing`은 두 Python 패키지와 선택적 Rust 바이너리로 구성됩니다.
 
 | 구성요소 | 역할 |
 |----------|------|

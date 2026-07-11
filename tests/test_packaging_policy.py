@@ -31,6 +31,12 @@ def test_root_plugin_artifacts_are_version_synced() -> None:
     init_source = Path("src/cluxion_agentplugin_preprocessing/__init__.py").read_text(encoding="utf-8")
     fallback = re.search(r'__version__ = "([^"]+)"', init_source)
 
+    # Discovery/public plugin id (Claude/Codex/plugin.yaml). Distro name stays separate.
+    assert pyproject["project"]["name"] == "cluxion-agentplugin-preprocessing"
+    assert claude["name"] == "clx-preprocessing"
+    assert codex["name"] == "clx-preprocessing"
+    assert root_yaml["name"] == "clx-preprocessing"
+    assert package_yaml["name"] == "clx-preprocessing"
     assert claude["version"] == version
     assert codex["version"] == version
     assert str(root_yaml["version"]) == version
@@ -38,6 +44,12 @@ def test_root_plugin_artifacts_are_version_synced() -> None:
     assert fallback is not None and fallback.group(1) == version
     assert Path("commands/cluxion-plan.md").is_file()
     assert Path("skills/preprocess/SKILL.md").is_file()
+
+    urls = pyproject["project"]["urls"]
+    for key in ("Homepage", "Repository", "Issues"):
+        assert "clx-preprocessing" in urls[key]
+        assert "cluxion-Agentplugin-preprocessing" not in urls[key]
+        assert "cluxion-agentplugin-preprocessing" not in urls[key]
 
 
 def test_invented_codex_command_snippet_removed() -> None:
@@ -49,6 +61,8 @@ def test_marketplace_manifest_is_version_synced() -> None:
     version = pyproject["project"]["version"]
 
     marketplace = json.loads(Path(".claude-plugin/marketplace.json").read_text(encoding="utf-8"))
+    assert marketplace["name"] == "clx-preprocessing"
+    assert marketplace["plugins"][0]["name"] == "clx-preprocessing"
     assert marketplace["plugins"][0]["version"] == version
     assert marketplace["plugins"][0]["source"] == "./"
 

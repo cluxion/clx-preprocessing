@@ -356,7 +356,7 @@
     "fix_steps": [
       "Check binary location: which cluxion-runtime",
       "Check env var: echo $CLUXION_RUNTIME_BIN (if set, verify file exists: file $CLUXION_RUNTIME_BIN)",
-      "Reinstall in development mode: pip install -e /path/to/cluxion-Agentplugin-preprocessing",
+      "Reinstall in development mode: pip install -e /path/to/clx-preprocessing",
       "Verify entry point: pip show cluxion-agentplugin-preprocessing | grep Entry-points",
       "Test directly: python -c 'from cluxion_agentplugin_preprocessing.runner import runtime_available; print(runtime_available())'",
       "Check PATH: echo $PATH | tr ':' '\\n'",
