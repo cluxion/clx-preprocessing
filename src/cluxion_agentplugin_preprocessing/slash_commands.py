@@ -1,4 +1,4 @@
-"""In-session slash commands for Hermes (/loopauto, /cluxion-doctor)."""
+"""In-session slash commands for Hermes (/loopauto, /clx-doctor)."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ Notes:
   - Diagnostics only: add loop_auto_dry_run via cluxion_plan tool
 """
 
-CLUXION_DOCTOR_HELP = "/cluxion-doctor — Run preprocessing plugin health checks (doctor)."
+CLX_DOCTOR_HELP = "/clx-doctor — Run preprocessing plugin health checks (doctor)."
 
 
 def register_slash_commands(ctx: object) -> None:
@@ -38,8 +38,8 @@ def register_slash_commands(ctx: object) -> None:
         args_hint="<prompt>",
     )
     register(
-        "cluxion-doctor",
-        handle_cluxion_doctor,
+        "clx-doctor",
+        handle_clx_doctor,
         description="Run cluxion preprocessing plugin doctor checks",
     )
 
@@ -62,9 +62,9 @@ def handle_loopauto(raw_args: str) -> str:
         return f"loopauto error: {exc}"
 
 
-def handle_cluxion_doctor(raw_args: str) -> str:
+def handle_clx_doctor(raw_args: str) -> str:
     if raw_args.strip().lower() in {"help", "-h", "--help"}:
-        return CLUXION_DOCTOR_HELP
+        return CLX_DOCTOR_HELP
     import importlib.resources
 
     from cluxion_agentplugin_preprocessing import __version__
@@ -81,6 +81,10 @@ def handle_cluxion_doctor(raw_args: str) -> str:
         version=__version__,
     )
     return render_text(result, load_catalog(catalog_path))
+
+
+# Python API compatibility only. The registered slash command remains /clx-doctor.
+handle_cluxion_doctor = handle_clx_doctor
 
 
 def _format_plan_response(raw_json: str) -> str:
@@ -116,6 +120,7 @@ def _format_plan_response(raw_json: str) -> str:
 __all__ = [
     "LOOPAUTO_HELP",
     "handle_cluxion_doctor",
+    "handle_clx_doctor",
     "handle_loopauto",
     "register_slash_commands",
 ]

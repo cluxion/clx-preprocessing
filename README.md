@@ -59,11 +59,11 @@ Hermes 안에서는 `cluxion_doctor` 도구로도 노출됩니다.
 | 슬래시 | 용도 |
 |---|---|
 | `/loopauto <prompt>` | 명시적 plan + 자동 큐 드레인 |
-| `/cluxion-doctor` | doctor (CLI `cluxion-preprocess doctor`와 동일) |
+| `/clx-doctor` | doctor (CLI `cluxion-preprocess doctor`와 동일) |
 
 ```
 /loopauto 4000줄 요구사항을 순서대로 구현하고 각 항목 증거를 남겨줘
-/cluxion-doctor
+/clx-doctor
 ```
 
 `/loopAuto` prompt prefix는 prefix를 제거하고 `loop_auto=true`를 설정합니다. 자동 드레인은
@@ -144,11 +144,11 @@ Type `/` to see plugin commands with a 🔌 badge.
 | Slash | Purpose |
 |---|---|
 | `/loopauto <prompt>` | Explicit plan + autonomous queue drain |
-| `/cluxion-doctor` | Run doctor (same as `cluxion-preprocess doctor`) |
+| `/clx-doctor` | Run doctor (same as `cluxion-preprocess doctor`) |
 
 ```
 /loopauto implement every REQ line and record evidence
-/cluxion-doctor
+/clx-doctor
 ```
 
 The `/loopAuto` prompt prefix is stripped and sets `loop_auto=true`. Autonomous drain runs only when

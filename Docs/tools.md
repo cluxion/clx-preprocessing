@@ -7,7 +7,7 @@
 | Slash | Maps to |
 |---|---|
 | `/loopauto <prompt>` | `cluxion_plan` with explicit `loop_auto=true` |
-| `/cluxion-doctor` | `cluxion_doctor` / `cluxion-preprocess doctor` |
+| `/clx-doctor` | `cluxion_doctor` / `cluxion-preprocess doctor` |
 
 `/` 입력 시 🔌 자동완성. 상세: `cluxion-plugins-guide.md` §2-A.
 

@@ -1,5 +1,5 @@
 name: clx-preprocessing
-version: 0.3.67
+version: 0.3.68
 description: "Universal agent preprocessing plugin: honesty contracts, clarification, Rust work queue, resource-aware harness handoff. Connected AI calls cluxion tools; plugin does not own models."
 author: cluxion
 kind: standalone

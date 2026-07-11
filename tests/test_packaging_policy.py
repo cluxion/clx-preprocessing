@@ -42,7 +42,10 @@ def test_root_plugin_artifacts_are_version_synced() -> None:
     assert str(root_yaml["version"]) == version
     assert str(package_yaml["version"]) == version
     assert fallback is not None and fallback.group(1) == version
-    assert Path("commands/cluxion-plan.md").is_file()
+    assert Path("commands/clx-plan.md").is_file()
+    assert Path("commands/clx-doctor.md").is_file()
+    assert not Path("commands/cluxion-plan.md").exists()
+    assert not Path("commands/cluxion-doctor.md").exists()
     assert Path("skills/preprocess/SKILL.md").is_file()
 
     urls = pyproject["project"]["urls"]

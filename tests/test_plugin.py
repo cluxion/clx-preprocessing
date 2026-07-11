@@ -5,7 +5,7 @@ import sys
 from importlib import util
 from pathlib import Path
 
-from cluxion_agentplugin_preprocessing import plugin
+from cluxion_agentplugin_preprocessing import plugin, slash_commands
 
 
 class FakeContext:
@@ -71,8 +71,19 @@ def test_register_adds_expected_tools() -> None:
     ]
     assert {tool["toolset"] for tool in ctx.tools.values()} == {"cluxion"}
     assert "loopauto" in ctx.commands
-    assert "cluxion-doctor" in ctx.commands
+    assert "clx-doctor" in ctx.commands
+    assert "cluxion-doctor" not in ctx.commands
+    assert "/clx-doctor" in str(ctx.commands["clx-doctor"]["handler"]("help"))
     assert ctx.commands["loopauto"]["args_hint"] == "<prompt>"
+
+
+def test_legacy_doctor_handler_import_is_compatibility_alias() -> None:
+    from cluxion_agentplugin_preprocessing.slash_commands import handle_cluxion_doctor
+
+    assert handle_cluxion_doctor is slash_commands.handle_clx_doctor
+    assert handle_cluxion_doctor("help") == slash_commands.CLX_DOCTOR_HELP
+    assert "/clx-doctor" in handle_cluxion_doctor("help")
+    assert "handle_cluxion_doctor" in slash_commands.__all__
 
 
 def test_handler_returns_json_error_for_missing_model() -> None:
