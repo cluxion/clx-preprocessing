@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import json
-import shutil
 import subprocess
+import sys
 import time
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -14,20 +15,77 @@ import pytest
 from cluxion_runtime.core.dispatch_store import RUNNING_LEASE_SECONDS
 from cluxion_runtime.resources import queue_bridge
 
-_LOCAL_BIN = Path(__file__).resolve().parents[2] / "rust" / "cluxion_queue" / "target" / "release" / "cluxion-queue"
+BACKENDS = ["python", "native", "subprocess"]
 
-BACKENDS = ["python"]
-if importlib.util.find_spec("cluxion_queue_native") is not None:
-    BACKENDS.append("native")
-if _LOCAL_BIN.exists() or shutil.which("cluxion-queue"):
-    BACKENDS.append("subprocess")
+
+@pytest.fixture(scope="session")
+def current_rust_artifacts(tmp_path_factory):
+    """Build and isolate the current native wheel/CLI; never trust ambient installs."""
+    project = Path(__file__).resolve().parents[2]
+    native_project = project / "rust" / "cluxion_queue"
+    build_root = tmp_path_factory.mktemp("current-rust-artifacts")
+    wheel_dir = build_root / "wheel"
+    wheel_dir.mkdir()
+    subprocess.run(
+        [
+            "uv",
+            "build",
+            "--offline",
+            "--wheel",
+            "--out-dir",
+            str(wheel_dir),
+            str(native_project),
+        ],
+        cwd=project,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    wheels = list(wheel_dir.glob("cluxion_queue_native-*.whl"))
+    assert len(wheels) == 1, wheels
+    target = build_root / "site"
+    with zipfile.ZipFile(wheels[0]) as archive:
+        archive.extractall(target)
+
+    patch = pytest.MonkeyPatch()
+    patch.syspath_prepend(str(target))
+    patch.delitem(sys.modules, "cluxion_queue_native.cluxion_queue_native", raising=False)
+    patch.delitem(sys.modules, "cluxion_queue_native", raising=False)
+    importlib.invalidate_caches()
+    native = importlib.import_module("cluxion_queue_native")
+    assert Path(native.__file__).is_relative_to(target)
+
+    subprocess.run(
+        [
+            "cargo",
+            "build",
+            "--offline",
+            "--locked",
+            "--release",
+            "--manifest-path",
+            str(native_project / "Cargo.toml"),
+            "--bin",
+            "cluxion-queue",
+        ],
+        cwd=project,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    binary = native_project / "target" / "release" / "cluxion-queue"
+    assert binary.is_file()
+    yield native, binary
+    patch.undo()
 
 
 @pytest.fixture(params=BACKENDS)
-def backend(request, monkeypatch, tmp_path):
+def backend(request, monkeypatch, tmp_path, current_rust_artifacts):
+    native, binary = current_rust_artifacts
     monkeypatch.setenv(queue_bridge.QUEUE_BACKEND_ENV, request.param)
-    if request.param == "subprocess" and _LOCAL_BIN.exists():
-        monkeypatch.setenv(queue_bridge.QUEUE_BIN_ENV, str(_LOCAL_BIN))
+    if request.param == "native":
+        monkeypatch.setattr(queue_bridge, "_native", native)
+    elif request.param == "subprocess":
+        monkeypatch.setenv(queue_bridge.QUEUE_BIN_ENV, str(binary))
     monkeypatch.setenv(queue_bridge.QUEUE_STORE_ENV, str(tmp_path / "queue"))
     return request.param
 
@@ -65,6 +123,9 @@ def test_duplicate_work_id_preserves_admission_sequence(backend) -> None:
     assert re_a["ok"] is True
     assert re_a["accepted"] is True
     assert re_a["sequence"] == 1, "duplicate work_id must return original admission sequence"
+    assert "stored" not in re_a
+    assert "idempotent" not in re_a
+    assert "requeued" not in re_a
 
     peek = queue_bridge.peek_order()
     assert [row["work_id"] for row in peek["order"]] == ["a", "b"]
@@ -404,6 +465,335 @@ def test_corrupt_existing_bundle_is_fail_closed(backend, tmp_path: Path, corrupt
         queue_bridge.persist_dispatch_bundle(work_id, _two_step_bundle(work_id))
 
     assert bundle_path.read_bytes() == before == corrupt_body
+
+
+# --- Queue work-item owner isolation (metadata reserved keys, no schema migration) ---
+
+
+def _owner_metadata(cwd: str, scope: str, session_id: str = "") -> dict:
+    return {
+        "owner_cwd": cwd,
+        "owner_session_id": session_id,
+        "owner_scope": scope,
+    }
+
+
+def _queue_db_row(tmp_path: Path, work_id: str) -> tuple:
+    import sqlite3
+
+    db = tmp_path / "queue" / "work_queue.sqlite"
+    conn = sqlite3.connect(db)
+    try:
+        return conn.execute(
+            "SELECT prompt, surface, priority, status, metadata_json, sequence, created_at, updated_at "
+            "FROM work_queue WHERE work_id = ?",
+            (work_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def test_queue_cross_owner_is_typed_conflict_and_preserves_row(backend, tmp_path: Path) -> None:
+    work_id = "q-cross"
+    first = queue_bridge.enqueue_work(
+        {
+            "work_id": work_id,
+            "prompt": "owned-a",
+            "metadata": _owner_metadata("/tmp/a", "project:/tmp/a"),
+        }
+    )
+    assert first["ok"] is True
+    assert first["accepted"] is True
+    before = _queue_db_row(tmp_path, work_id)
+
+    conflict = queue_bridge.enqueue_work(
+        {
+            "work_id": work_id,
+            "prompt": "owned-b",
+            "metadata": _owner_metadata("/tmp/b", "project:/tmp/b"),
+        }
+    )
+    assert conflict == {
+        "ok": False,
+        "accepted": False,
+        "error": "queue_owner_conflict",
+        "work_id": work_id,
+    }
+    assert _queue_db_row(tmp_path, work_id) == before
+
+
+def test_queue_exactly_one_side_ownerless_is_conflict(backend, tmp_path: Path) -> None:
+    work_id = "q-one-ownerless"
+    owned = queue_bridge.enqueue_work(
+        {
+            "work_id": work_id,
+            "prompt": "owned",
+            "metadata": _owner_metadata("/tmp/a", "project:/tmp/a"),
+        }
+    )
+    assert owned["ok"] is True
+    before = _queue_db_row(tmp_path, work_id)
+
+    conflict = queue_bridge.enqueue_work({"work_id": work_id, "prompt": "ownerless"})
+    assert conflict["ok"] is False
+    assert conflict["accepted"] is False
+    assert conflict["error"] == "queue_owner_conflict"
+    assert conflict["work_id"] == work_id
+    assert _queue_db_row(tmp_path, work_id) == before
+
+    work_id_b = "q-one-ownerless-b"
+    first = queue_bridge.enqueue_work({"work_id": work_id_b, "prompt": "ownerless-first"})
+    assert first["ok"] is True
+    before_b = _queue_db_row(tmp_path, work_id_b)
+    conflict_b = queue_bridge.enqueue_work(
+        {
+            "work_id": work_id_b,
+            "prompt": "owned-second",
+            "metadata": _owner_metadata("/tmp/a", "project:/tmp/a"),
+        }
+    )
+    assert conflict_b["error"] == "queue_owner_conflict"
+    assert _queue_db_row(tmp_path, work_id_b) == before_b
+
+
+def test_queue_same_owner_exact_and_changed_requeue(backend, tmp_path: Path) -> None:
+    """Same-owner duplicates preserve legacy requeue (running->pending), original response shape."""
+    work_id = "q-same-owner"
+    owner = _owner_metadata("/tmp/a", "project:/tmp/a")
+    payload = {
+        "work_id": work_id,
+        "prompt": "same",
+        "surface": "hermes",
+        "priority": 1,
+        "metadata": owner,
+    }
+    first = queue_bridge.enqueue_work(payload)
+    assert first["ok"] is True
+    assert first["accepted"] is True
+    assert "stored" not in first
+    assert "idempotent" not in first
+    assert "requeued" not in first
+    assert queue_bridge.dequeue_work()["item"]["work_id"] == work_id
+    before = _queue_db_row(tmp_path, work_id)
+    assert before[3] == "running"
+
+    again = queue_bridge.enqueue_work(payload)
+    assert again["ok"] is True
+    assert again["accepted"] is True
+    assert again["sequence"] == first["sequence"]
+    assert "stored" not in again
+    assert "idempotent" not in again
+    assert "requeued" not in again
+    after_exact = _queue_db_row(tmp_path, work_id)
+    assert after_exact[3] == "pending"
+    assert after_exact[5] == before[5]
+    assert after_exact[6] == before[6]
+
+    changed = queue_bridge.enqueue_work(
+        {"work_id": work_id, "prompt": "v2", "priority": 2, "metadata": owner}
+    )
+    assert changed["ok"] is True
+    assert changed["accepted"] is True
+    assert changed["sequence"] == 1
+    assert "stored" not in changed
+    after = _queue_db_row(tmp_path, work_id)
+    assert after[0] == "v2"
+    assert after[2] == 2
+    assert after[3] == "pending"
+    assert after[5] == before[5]
+    assert after[6] == before[6]
+
+
+def test_queue_both_ownerless_legacy_requeue(backend, tmp_path: Path) -> None:
+    """Ownerless↔ownerless is not a conflict: exact and changed both requeue."""
+    work_id = "q-ownerless"
+    payload = {"work_id": work_id, "prompt": "same-ownerless", "priority": 2}
+    first = queue_bridge.enqueue_work(payload)
+    assert first["ok"] is True
+    assert queue_bridge.dequeue_work()["ready"] is True
+    before = _queue_db_row(tmp_path, work_id)
+    assert before[3] == "running"
+
+    again = queue_bridge.enqueue_work(payload)
+    assert again["ok"] is True
+    assert again["accepted"] is True
+    assert again["sequence"] == first["sequence"]
+    assert "stored" not in again
+    assert "idempotent" not in again
+    after_exact = _queue_db_row(tmp_path, work_id)
+    assert after_exact[3] == "pending"
+    assert after_exact[5] == before[5]
+
+    changed = queue_bridge.enqueue_work({"work_id": work_id, "prompt": "v2"})
+    assert changed["ok"] is True
+    assert changed["accepted"] is True
+    assert changed["sequence"] == first["sequence"]
+    after = _queue_db_row(tmp_path, work_id)
+    assert after[0] == "v2"
+    assert after[3] == "pending"
+    assert after[5] == before[5]
+    assert after[6] == before[6]
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"owner_cwd": "/tmp/a"},  # partial
+        {"owner_cwd": "/tmp/a", "owner_session_id": ""},  # partial
+        {"owner_cwd": "/tmp/a", "owner_scope": "project:/tmp/a"},  # missing session_id key
+        {"owner_cwd": "", "owner_session_id": "", "owner_scope": "project:/tmp/a"},  # empty cwd
+        {"owner_cwd": "/tmp/a", "owner_session_id": "", "owner_scope": ""},  # empty scope
+        {"owner_cwd": 1, "owner_session_id": "", "owner_scope": "project:/tmp/a"},  # type
+        {"owner_cwd": "/tmp/a", "owner_session_id": None, "owner_scope": "project:/tmp/a"},
+    ],
+)
+def test_queue_partial_or_malformed_owner_is_invalid(backend, tmp_path: Path, metadata: dict) -> None:
+    work_id = "q-invalid-owner"
+    result = queue_bridge.enqueue_work({"work_id": work_id, "prompt": "x", "metadata": metadata})
+    assert result.get("ok") is False
+    assert result.get("accepted") is False
+    assert result.get("error") == "invalid_queue_owner"
+    assert result.get("work_id") == work_id
+    db = tmp_path / "queue" / "work_queue.sqlite"
+    if db.exists():
+        assert _queue_db_row(tmp_path, work_id) is None
+
+
+def test_queue_invalid_owner_on_existing_does_not_mutate(backend, tmp_path: Path) -> None:
+    work_id = "q-invalid-existing"
+    first = queue_bridge.enqueue_work(
+        {
+            "work_id": work_id,
+            "prompt": "kept",
+            "metadata": _owner_metadata("/tmp/a", "project:/tmp/a"),
+        }
+    )
+    assert first["ok"] is True
+    before = _queue_db_row(tmp_path, work_id)
+
+    bad = queue_bridge.enqueue_work(
+        {
+            "work_id": work_id,
+            "prompt": "mutate?",
+            "metadata": {"owner_cwd": "/tmp/a", "owner_scope": "project:/tmp/a"},
+        }
+    )
+    assert bad.get("error") == "invalid_queue_owner"
+    assert bad.get("accepted") is False
+    assert _queue_db_row(tmp_path, work_id) == before
+
+
+@pytest.mark.parametrize(
+    "seed_metadata_json",
+    [
+        "not-json{{{",
+        "[1, 2, 3]",
+        '{"owner_cwd":"/tmp/a"}',  # object with partial/invalid owner keys
+    ],
+)
+def test_queue_existing_invalid_metadata_json_is_typed_invalid_unchanged(
+    backend, tmp_path: Path, seed_metadata_json: str
+) -> None:
+    """Decode failure or non-object/invalid-object existing rows stay unchanged."""
+    import sqlite3
+
+    work_id = "q-corrupt-meta"
+    seeded = queue_bridge.enqueue_work({"work_id": work_id, "prompt": "kept", "priority": 2})
+    assert seeded["ok"] is True
+    db = tmp_path / "queue" / "work_queue.sqlite"
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "UPDATE work_queue SET metadata_json = ? WHERE work_id = ?",
+            (seed_metadata_json, work_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    before_row = _queue_db_row(tmp_path, work_id)
+    before_bytes = db.read_bytes()
+    assert before_row is not None
+    assert before_row[4] == seed_metadata_json
+
+    result = queue_bridge.enqueue_work(
+        {
+            "work_id": work_id,
+            "prompt": "mutate?",
+            "metadata": _owner_metadata("/tmp/a", "project:/tmp/a"),
+        }
+    )
+    assert result == {
+        "ok": False,
+        "accepted": False,
+        "error": "invalid_queue_owner",
+        "work_id": work_id,
+    }
+    assert _queue_db_row(tmp_path, work_id) == before_row
+    assert db.read_bytes() == before_bytes
+
+
+def test_queue_metadata_none_is_ownerless_null_serialization(backend, tmp_path: Path) -> None:
+    """Explicit metadata=None is valid ownerless; store JSON null (not {})."""
+    work_id = "q-meta-null"
+    result = queue_bridge.enqueue_work({"work_id": work_id, "prompt": "null-meta", "metadata": None})
+    assert result["ok"] is True
+    assert result["accepted"] is True
+
+    row = _queue_db_row(tmp_path, work_id)
+    assert row is not None
+    assert row[4] == "null"
+    assert json.loads(row[4]) is None
+
+    item = queue_bridge.dequeue_work()
+    assert item["ok"] is True
+    assert item["ready"] is True
+    assert item["item"]["work_id"] == work_id
+    assert item["item"]["metadata"] is None
+
+
+def test_native_reopens_after_stdlib_sqlite_reader_without_orphan_wal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, current_rust_artifacts
+) -> None:
+    """A stdlib reader close must not detach later native writes into an orphan WAL."""
+    import sqlite3
+
+    native, _binary = current_rust_artifacts
+    monkeypatch.setattr(queue_bridge, "_native", native)
+    monkeypatch.setenv(queue_bridge.QUEUE_BACKEND_ENV, "native")
+    monkeypatch.setenv(queue_bridge.QUEUE_STORE_ENV, str(tmp_path / "queue"))
+    monkeypatch.setattr(
+        queue_bridge.py_queue,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("forced native test fell back to Python"),
+    )
+    assert queue_bridge.resolve_backend() == "native"
+
+    db = tmp_path / "queue" / "work_queue.sqlite"
+    for index in range(32):
+        work_id = f"cache-regression-{index}"
+        assert queue_bridge.enqueue_work({"work_id": work_id, "prompt": "v1"})["ok"] is True
+        assert queue_bridge.dequeue_work()["item"]["work_id"] == work_id
+
+        reader = sqlite3.connect(db)
+        try:
+            assert reader.execute(
+                "SELECT prompt, status FROM work_queue WHERE work_id = ?", (work_id,)
+            ).fetchone() == ("v1", "running")
+        finally:
+            reader.close()
+
+        requeued = queue_bridge.enqueue_work({"work_id": work_id, "prompt": "v2"})
+        assert requeued["ok"] is True
+        assert requeued["sequence"] == index + 1
+
+        fresh = sqlite3.connect(db)
+        try:
+            assert fresh.execute(
+                "SELECT prompt, status, sequence FROM work_queue WHERE work_id = ?", (work_id,)
+            ).fetchone() == ("v2", "pending", index + 1)
+        finally:
+            fresh.close()
+        assert queue_bridge.dequeue_work()["item"]["work_id"] == work_id
 
 
 @pytest.mark.skipif(__import__("os").name != "posix", reason="POSIX fail-closed symlink policy")

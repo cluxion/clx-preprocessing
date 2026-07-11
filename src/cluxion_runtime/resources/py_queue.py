@@ -234,12 +234,69 @@ def _require_str(payload: dict[str, Any], key: str) -> str:
     return value
 
 
+_QUEUE_OWNER_KEYS = ("owner_cwd", "owner_session_id", "owner_scope")
+
+
+def _queue_owner_from_metadata(metadata: Any) -> dict[str, str] | None:
+    """Canonical queue owner: all three reserved keys or ownerless; else invalid.
+
+    None is ownerless (JSON null). Non-dict values are invalid — never coerce to {}.
+    """
+    if metadata is None:
+        return None
+    if not isinstance(metadata, dict):
+        raise ValueError("invalid_queue_owner")
+    present = [key for key in _QUEUE_OWNER_KEYS if key in metadata]
+    if not present:
+        return None
+    if any(key not in metadata for key in _QUEUE_OWNER_KEYS):
+        raise ValueError("invalid_queue_owner")
+    cwd, session_id, scope = (
+        metadata["owner_cwd"],
+        metadata["owner_session_id"],
+        metadata["owner_scope"],
+    )
+    if not isinstance(cwd, str) or not cwd:
+        raise ValueError("invalid_queue_owner")
+    if not isinstance(session_id, str):
+        raise ValueError("invalid_queue_owner")
+    if not isinstance(scope, str) or not scope:
+        raise ValueError("invalid_queue_owner")
+    return {"cwd": cwd, "session_id": session_id, "scope": scope}
+
+
+def _queue_owners_conflict(
+    existing: dict[str, str] | None, new: dict[str, str] | None
+) -> bool:
+    if existing is None and new is None:
+        return False
+    if existing is None or new is None:
+        return True
+    return existing != new
+
+
+def _invalid_queue_owner(work_id: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "accepted": False,
+        "error": "invalid_queue_owner",
+        "work_id": work_id,
+    }
+
+
 def _enqueue(store_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
     work_id = _require_str(payload, "work_id")
     prompt = _require_str(payload, "prompt")
     surface = payload.get("surface") or "api"
     priority = payload.get("priority", 2)
-    metadata_json = json.dumps(payload.get("metadata", {}), ensure_ascii=False)
+    # Missing key defaults to {}; explicit None is JSON null (ownerless), not {}.
+    metadata = payload.get("metadata", {})
+    try:
+        new_owner = _queue_owner_from_metadata(metadata)
+    except ValueError:
+        return _invalid_queue_owner(work_id)
+    # json.dumps(None) => "null" — matches Rust serde_json null serialization.
+    metadata_json = json.dumps(metadata, ensure_ascii=False)
     now = time.time()
     # Retry absorbs transient "database is locked" (a burst must not lose
     # enqueues) and unique-sequence collisions (recompute MAX and try again),
@@ -251,7 +308,32 @@ def _enqueue(store_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             with _open_db(store_dir) as conn:
                 _begin_immediate(conn)
-                sequence = conn.execute("SELECT COALESCE(MAX(sequence), 0) + 1 FROM work_queue").fetchone()[0]
+                row = conn.execute(
+                    "SELECT metadata_json FROM work_queue WHERE work_id = ?",
+                    (work_id,),
+                ).fetchone()
+                if row is not None:
+                    # Decode failure or non-object must not downgrade to {}.
+                    try:
+                        existing_meta = json.loads(row[0])
+                    except (json.JSONDecodeError, TypeError):
+                        return _invalid_queue_owner(work_id)
+                    try:
+                        existing_owner = _queue_owner_from_metadata(existing_meta)
+                    except ValueError:
+                        return _invalid_queue_owner(work_id)
+                    if _queue_owners_conflict(existing_owner, new_owner):
+                        return {
+                            "ok": False,
+                            "accepted": False,
+                            "error": "queue_owner_conflict",
+                            "work_id": work_id,
+                        }
+                # Equal owners (including both ownerless): legacy requeue path.
+                # Intentional: resets running->pending even for identical payload.
+                sequence = conn.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM work_queue"
+                ).fetchone()[0]
                 conn.execute(
                     """INSERT INTO work_queue (work_id, prompt, surface, priority, status, metadata_json, sequence, created_at, updated_at)
                        VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)

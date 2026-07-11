@@ -1,7 +1,5 @@
-use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -11,11 +9,6 @@ use rusqlite::{params, Connection, ErrorCode};
 use serde_json::{json, Value};
 
 use crate::types::{ok_payload, require_str, QueueError};
-
-// In-process connection cache: opening + schema-init per op dominates latency
-// when this crate runs as an extension module. Keyed by store_dir; WAL keeps
-// cross-process access safe.
-static CONN_CACHE: OnceLock<Mutex<HashMap<PathBuf, Connection>>> = OnceLock::new();
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 // Absorbs instant SQLITE_BUSY_SNAPSHOT rejections and unique-sequence
@@ -33,16 +26,11 @@ fn with_db<T>(
     store_dir: &Path,
     op: impl FnOnce(&Connection) -> Result<T, QueueError>,
 ) -> Result<T, QueueError> {
-    let cache = CONN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = cache
-        .lock()
-        .map_err(|_| QueueError::Store("connection cache poisoned".into()))?;
-    if !guard.contains_key(store_dir) {
-        let conn = open_db(store_dir)?;
-        guard.insert(store_dir.to_path_buf(), conn);
-    }
-    let conn = guard.get(store_dir).expect("connection just inserted");
-    op(conn)
+    // A long-lived bundled-SQLite WAL connection can retain an orphaned view
+    // after another runtime opens and closes the same DB. Per-command
+    // connections keep native, subprocess, and Python state coherent.
+    let conn = open_db(store_dir)?;
+    op(&conn)
 }
 
 /// Tighten the application queue store leaf to 0700 (not parents above it).
@@ -239,6 +227,60 @@ fn ensure_unique_sequence_index(conn: &Connection) {
     let _ = conn.execute_batch(UNIQUE_SEQUENCE_INDEX);
 }
 
+const QUEUE_OWNER_KEYS: [&str; 3] = ["owner_cwd", "owner_session_id", "owner_scope"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueueOwner {
+    cwd: String,
+    session_id: String,
+    scope: String,
+}
+
+fn queue_owner_from_metadata(metadata: &Value) -> Result<Option<QueueOwner>, ()> {
+    let obj = match metadata {
+        Value::Null => return Ok(None),
+        Value::Object(map) => map,
+        _ => return Err(()),
+    };
+    let present = QUEUE_OWNER_KEYS.iter().any(|key| obj.contains_key(*key));
+    if !present {
+        return Ok(None);
+    }
+    if !QUEUE_OWNER_KEYS.iter().all(|key| obj.contains_key(*key)) {
+        return Err(());
+    }
+    let cwd = match obj.get("owner_cwd") {
+        Some(Value::String(s)) if !s.is_empty() => s.clone(),
+        _ => return Err(()),
+    };
+    let session_id = match obj.get("owner_session_id") {
+        Some(Value::String(s)) => s.clone(),
+        _ => return Err(()),
+    };
+    let scope = match obj.get("owner_scope") {
+        Some(Value::String(s)) if !s.is_empty() => s.clone(),
+        _ => return Err(()),
+    };
+    Ok(Some(QueueOwner {
+        cwd,
+        session_id,
+        scope,
+    }))
+}
+
+fn queue_owners_conflict(existing: &Option<QueueOwner>, new: &Option<QueueOwner>) -> bool {
+    match (existing, new) {
+        (None, None) => false,
+        (None, Some(_)) | (Some(_), None) => true,
+        (Some(a), Some(b)) => a != b,
+    }
+}
+
+enum EnqueueOutcome {
+    Sequence(i64),
+    Contract(Value),
+}
+
 pub fn enqueue(store_dir: &Path, payload: &Value) -> Result<Value, QueueError> {
     let work_id = require_str(payload, "work_id")?;
     let prompt = require_str(payload, "prompt")?;
@@ -247,15 +289,26 @@ pub fn enqueue(store_dir: &Path, payload: &Value) -> Result<Value, QueueError> {
         .and_then(Value::as_str)
         .unwrap_or("api");
     let priority = payload.get("priority").and_then(Value::as_i64).unwrap_or(2);
-    let metadata_json = payload
+    let metadata = payload
         .get("metadata")
-        .map(|value| serde_json::to_string(value).unwrap_or_else(|_| "{}".into()))
-        .unwrap_or_else(|| "{}".into());
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let new_owner = match queue_owner_from_metadata(&metadata) {
+        Ok(owner) => owner,
+        Err(()) => {
+            return Ok(json!({
+                "ok": false,
+                "accepted": false,
+                "error": "invalid_queue_owner",
+                "work_id": work_id,
+            }));
+        }
+    };
+    let metadata_json = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".into());
     let now = now_secs();
     with_db(store_dir, |conn| {
         // BEGIN IMMEDIATE so the MAX(sequence) read and the INSERT are atomic
-        // across processes (matches py_queue._enqueue); the CONN_CACHE mutex
-        // only serializes within this process. The retry loop absorbs
+        // across processes (matches py_queue._enqueue). The retry loop absorbs
         // transient SQLITE_BUSY (a burst must not lose enqueues) and
         // unique-sequence collisions (recompute MAX and try again).
         let mut last_err = None;
@@ -270,9 +323,10 @@ pub fn enqueue(store_dir: &Path, payload: &Value) -> Result<Value, QueueError> {
                 surface,
                 priority,
                 &metadata_json,
+                &new_owner,
                 now,
             ) {
-                Ok(sequence) => {
+                Ok(EnqueueOutcome::Sequence(sequence)) => {
                     return Ok(ok_payload(json!({
                         "accepted": true,
                         "work_id": work_id,
@@ -280,6 +334,7 @@ pub fn enqueue(store_dir: &Path, payload: &Value) -> Result<Value, QueueError> {
                         "reason": "queued",
                     })))
                 }
+                Ok(EnqueueOutcome::Contract(value)) => return Ok(value),
                 Err(err) if is_transient(&err) => last_err = Some(err),
                 Err(err) => return Err(QueueError::Sqlite(err)),
             }
@@ -290,6 +345,7 @@ pub fn enqueue(store_dir: &Path, payload: &Value) -> Result<Value, QueueError> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn enqueue_txn(
     conn: &Connection,
     work_id: &str,
@@ -297,44 +353,89 @@ fn enqueue_txn(
     surface: &str,
     priority: i64,
     metadata_json: &str,
+    new_owner: &Option<QueueOwner>,
     now: f64,
-) -> Result<i64, rusqlite::Error> {
+) -> Result<EnqueueOutcome, rusqlite::Error> {
     conn.execute_batch("BEGIN IMMEDIATE;")?;
-    let inserted = conn
-        .query_row(
+    let outcome = (|| {
+        match conn.query_row(
+            "SELECT metadata_json FROM work_queue WHERE work_id = ?1",
+            params![work_id],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(existing_meta_json) => {
+                // Decode failure or non-object must not downgrade to {}.
+                let existing_meta: Value = match serde_json::from_str(&existing_meta_json) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return Ok(EnqueueOutcome::Contract(json!({
+                            "ok": false,
+                            "accepted": false,
+                            "error": "invalid_queue_owner",
+                            "work_id": work_id,
+                        })));
+                    }
+                };
+                let existing_owner = match queue_owner_from_metadata(&existing_meta) {
+                    Ok(owner) => owner,
+                    Err(()) => {
+                        return Ok(EnqueueOutcome::Contract(json!({
+                            "ok": false,
+                            "accepted": false,
+                            "error": "invalid_queue_owner",
+                            "work_id": work_id,
+                        })));
+                    }
+                };
+                if queue_owners_conflict(&existing_owner, new_owner) {
+                    return Ok(EnqueueOutcome::Contract(json!({
+                        "ok": false,
+                        "accepted": false,
+                        "error": "queue_owner_conflict",
+                        "work_id": work_id,
+                    })));
+                }
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(err) => return Err(err),
+        }
+        // Equal owners (including both ownerless): legacy requeue path.
+        // Intentional: resets running->pending even for identical payload.
+        let sequence = conn.query_row(
             "SELECT COALESCE(MAX(sequence), 0) + 1 FROM work_queue",
             [],
             |row| row.get::<_, i64>(0),
-        )
-        .and_then(|sequence| {
-            conn.execute(
-                "INSERT INTO work_queue (work_id, prompt, surface, priority, status, metadata_json, sequence, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?7)
-                 ON CONFLICT(work_id) DO UPDATE SET
-                     prompt=excluded.prompt,
-                     surface=excluded.surface,
-                     priority=excluded.priority,
-                     metadata_json=excluded.metadata_json,
-                     status='pending',
-                     updated_at=excluded.updated_at",
-                params![work_id, prompt, surface, priority, metadata_json, sequence, now],
-            )?;
-            // ON CONFLICT preserves sequence/created_at; return the stored
-            // admission identity rather than the provisional MAX+1 candidate.
-            conn.query_row(
-                "SELECT sequence FROM work_queue WHERE work_id = ?1",
-                params![work_id],
-                |row| row.get::<_, i64>(0),
-            )
-        })
-        .and_then(|sequence| {
+        )?;
+        conn.execute(
+            "INSERT INTO work_queue (work_id, prompt, surface, priority, status, metadata_json, sequence, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?7)
+             ON CONFLICT(work_id) DO UPDATE SET
+                 prompt=excluded.prompt,
+                 surface=excluded.surface,
+                 priority=excluded.priority,
+                 metadata_json=excluded.metadata_json,
+                 status='pending',
+                 updated_at=excluded.updated_at",
+            params![work_id, prompt, surface, priority, metadata_json, sequence, now],
+        )?;
+        // ON CONFLICT preserves sequence/created_at; return the stored
+        // admission identity rather than the provisional MAX+1 candidate.
+        let sequence = conn.query_row(
+            "SELECT sequence FROM work_queue WHERE work_id = ?1",
+            params![work_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(EnqueueOutcome::Sequence(sequence))
+    })();
+    match &outcome {
+        Ok(EnqueueOutcome::Sequence(_)) => {
             conn.execute_batch("COMMIT;")?;
-            Ok(sequence)
-        });
-    if inserted.is_err() {
-        let _ = conn.execute_batch("ROLLBACK;");
+        }
+        Ok(EnqueueOutcome::Contract(_)) | Err(_) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+        }
     }
-    inserted
+    outcome
 }
 
 fn is_transient(err: &rusqlite::Error) -> bool {
@@ -539,10 +640,15 @@ mod tests {
         assert_eq!(b1["sequence"], 2);
 
         let a2 = enqueue(&store, &json!({"work_id": "a", "prompt": "re-a"})).expect("re-enqueue a");
+        assert_eq!(a2["ok"], true);
+        assert_eq!(a2["accepted"], true);
         assert_eq!(
             a2["sequence"], 1,
             "duplicate work_id must return original admission sequence, not MAX+1"
         );
+        assert!(a2.get("stored").is_none());
+        assert!(a2.get("idempotent").is_none());
+        assert!(a2.get("requeued").is_none());
 
         let peek = peek(&store, &json!({"limit": 16})).expect("peek");
         let order = peek["order"].as_array().expect("order array");
@@ -557,6 +663,260 @@ mod tests {
         let d2 = dequeue(&store, &json!({})).expect("dequeue 2");
         assert_eq!(d2["item"]["work_id"], "b");
 
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    fn owner_meta(cwd: &str, scope: &str) -> Value {
+        json!({
+            "owner_cwd": cwd,
+            "owner_session_id": "",
+            "owner_scope": scope,
+        })
+    }
+
+    fn row_snapshot(
+        store: &Path,
+        work_id: &str,
+    ) -> (String, String, i64, String, String, i64, f64, f64) {
+        with_db(store, |conn| {
+            conn.query_row(
+                "SELECT prompt, surface, priority, status, metadata_json, sequence, created_at, updated_at
+                 FROM work_queue WHERE work_id = ?1",
+                params![work_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .map_err(QueueError::Sqlite)
+        })
+        .expect("row snapshot")
+    }
+
+    #[test]
+    fn queue_cross_owner_is_typed_conflict() {
+        let store = std::env::temp_dir().join(format!(
+            "cluxion-queue-owner-cross-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&store);
+        enqueue(
+            &store,
+            &json!({"work_id": "q1", "prompt": "a", "metadata": owner_meta("/tmp/a", "project:/tmp/a")}),
+        )
+        .expect("first");
+        let before = row_snapshot(&store, "q1");
+        let conflict = enqueue(
+            &store,
+            &json!({"work_id": "q1", "prompt": "b", "metadata": owner_meta("/tmp/b", "project:/tmp/b")}),
+        )
+        .expect("conflict contract");
+        assert_eq!(conflict["ok"], false);
+        assert_eq!(conflict["accepted"], false);
+        assert_eq!(conflict["error"], "queue_owner_conflict");
+        assert_eq!(conflict["work_id"], "q1");
+        assert_eq!(row_snapshot(&store, "q1"), before);
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn queue_one_ownerless_both_directions_is_conflict() {
+        let store = std::env::temp_dir().join(format!(
+            "cluxion-queue-owner-one-side-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&store);
+
+        enqueue(
+            &store,
+            &json!({"work_id": "owned", "prompt": "a", "metadata": owner_meta("/tmp/a", "project:/tmp/a")}),
+        )
+        .expect("owned first");
+        let before = row_snapshot(&store, "owned");
+        let conflict = enqueue(&store, &json!({"work_id": "owned", "prompt": "ownerless"}))
+            .expect("ownerless second");
+        assert_eq!(conflict["error"], "queue_owner_conflict");
+        assert_eq!(row_snapshot(&store, "owned"), before);
+
+        enqueue(&store, &json!({"work_id": "bare", "prompt": "v1"})).expect("ownerless first");
+        let before_b = row_snapshot(&store, "bare");
+        let conflict_b = enqueue(
+            &store,
+            &json!({"work_id": "bare", "prompt": "v2", "metadata": owner_meta("/tmp/a", "project:/tmp/a")}),
+        )
+        .expect("owned second");
+        assert_eq!(conflict_b["error"], "queue_owner_conflict");
+        assert_eq!(row_snapshot(&store, "bare"), before_b);
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn queue_same_owner_legacy_requeue_resets_running() {
+        let store = std::env::temp_dir().join(format!(
+            "cluxion-queue-owner-requeue-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&store);
+        let payload = json!({
+            "work_id": "q-same",
+            "prompt": "same",
+            "surface": "hermes",
+            "priority": 1,
+            "metadata": owner_meta("/tmp/a", "project:/tmp/a"),
+        });
+        let first = enqueue(&store, &payload).expect("first");
+        dequeue(&store, &json!({})).expect("claim");
+        let before = row_snapshot(&store, "q-same");
+        assert_eq!(before.3, "running");
+        let again = enqueue(&store, &payload).expect("again");
+        assert_eq!(again["ok"], true);
+        assert_eq!(again["accepted"], true);
+        assert_eq!(again["sequence"], first["sequence"]);
+        assert!(again.get("stored").is_none());
+        assert!(again.get("idempotent").is_none());
+        assert!(again.get("requeued").is_none());
+        let after = row_snapshot(&store, "q-same");
+        assert_eq!(after.3, "pending");
+        assert_eq!(after.5, before.5);
+        assert_eq!(after.6, before.6);
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn queue_both_ownerless_legacy_requeue() {
+        let store = std::env::temp_dir().join(format!(
+            "cluxion-queue-ownerless-requeue-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&store);
+        enqueue(&store, &json!({"work_id": "ol", "prompt": "v1"})).expect("first");
+        let before = row_snapshot(&store, "ol");
+        let again = enqueue(&store, &json!({"work_id": "ol", "prompt": "v2"})).expect("requeue");
+        assert_eq!(again["ok"], true);
+        assert_eq!(again["accepted"], true);
+        assert_eq!(again["sequence"], before.5);
+        let after = row_snapshot(&store, "ol");
+        assert_eq!(after.0, "v2");
+        assert_eq!(after.3, "pending");
+        assert_eq!(after.5, before.5);
+        assert_eq!(after.6, before.6);
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn queue_partial_owner_is_invalid_no_mutation() {
+        let store = std::env::temp_dir().join(format!(
+            "cluxion-queue-owner-invalid-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&store);
+        let result = enqueue(
+            &store,
+            &json!({
+                "work_id": "bad",
+                "prompt": "x",
+                "metadata": {"owner_cwd": "/tmp/a", "owner_scope": "project:/tmp/a"},
+            }),
+        )
+        .expect("invalid contract");
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["accepted"], false);
+        assert_eq!(result["error"], "invalid_queue_owner");
+        assert_eq!(result["work_id"], "bad");
+
+        enqueue(
+            &store,
+            &json!({"work_id": "keep", "prompt": "kept", "metadata": owner_meta("/tmp/a", "project:/tmp/a")}),
+        )
+        .expect("seed");
+        let before = row_snapshot(&store, "keep");
+        let bad = enqueue(
+            &store,
+            &json!({
+                "work_id": "keep",
+                "prompt": "mutate?",
+                "metadata": {"owner_cwd": "/tmp/a", "owner_scope": "project:/tmp/a"},
+            }),
+        )
+        .expect("malformed on existing");
+        assert_eq!(bad["error"], "invalid_queue_owner");
+        assert_eq!(row_snapshot(&store, "keep"), before);
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn queue_existing_invalid_metadata_json_is_typed_invalid() {
+        let store = std::env::temp_dir().join(format!(
+            "cluxion-queue-owner-corrupt-meta-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&store);
+        for seed in ["not-json{{{", "[1,2,3]", r#"{"owner_cwd":"/tmp/a"}"#] {
+            let work_id = format!("corrupt-{}", seed.len());
+            enqueue(&store, &json!({"work_id": work_id, "prompt": "kept"})).expect("seed");
+            with_db(&store, |conn| {
+                conn.execute(
+                    "UPDATE work_queue SET metadata_json = ?1 WHERE work_id = ?2",
+                    params![seed, work_id],
+                )
+                .map_err(QueueError::Sqlite)?;
+                Ok(())
+            })
+            .expect("seed corrupt metadata");
+            let before = row_snapshot(&store, &work_id);
+            assert_eq!(before.4, seed);
+            let result = enqueue(
+                &store,
+                &json!({
+                    "work_id": work_id,
+                    "prompt": "mutate?",
+                    "metadata": owner_meta("/tmp/a", "project:/tmp/a"),
+                }),
+            )
+            .expect("contract");
+            assert_eq!(result["ok"], false);
+            assert_eq!(result["accepted"], false);
+            assert_eq!(result["error"], "invalid_queue_owner");
+            assert_eq!(result["work_id"], work_id);
+            assert_eq!(row_snapshot(&store, &work_id), before);
+        }
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn queue_metadata_null_is_ownerless_null_serialization() {
+        let store = std::env::temp_dir().join(format!(
+            "cluxion-queue-meta-null-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&store);
+        let result = enqueue(
+            &store,
+            &json!({"work_id": "null-meta", "prompt": "x", "metadata": Value::Null}),
+        )
+        .expect("enqueue null metadata");
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["accepted"], true);
+        let row = row_snapshot(&store, "null-meta");
+        assert_eq!(row.4, "null");
+        let deq = dequeue(&store, &json!({})).expect("dequeue");
+        assert_eq!(deq["ready"], true);
+        assert!(deq["item"]["metadata"].is_null());
         let _ = std::fs::remove_dir_all(&store);
     }
 }

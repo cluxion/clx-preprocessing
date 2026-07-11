@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cluxion-agentplugin-preprocessing"
-version = "0.3.66"
+version = "0.3.67"
 description = "Universal agent plugin for Cluxion preprocessing, honesty contracts, clarification, Rust work queue, and resource-aware harness handoff."
 readme = "README.md"
 requires-python = ">=3.11"
