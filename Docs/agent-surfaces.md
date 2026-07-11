@@ -17,7 +17,7 @@ stdin JSON 최소 필드: `{ "prompt": "..." }`
 - PyPI entry point: `cluxion-agentplugin-preprocessing`
 - `cluxion-preprocess enable`로 config 활성화
 - toolset 이름: `cluxion`
-- Tools (10): `cluxion_plan`, `cluxion_clarify`, `cluxion_bootstrap`, `cluxion_serve_local`, `cluxion_hermes_config`, `cluxion_queue_next`, `cluxion_queue_record`, `cluxion_queue_brief`, `cluxion_context_compress`, `cluxion_guard`
+- Tools (17): `cluxion_plan`, `cluxion_clarify`, `cluxion_bootstrap`, `cluxion_serve_local`, `cluxion_hermes_config`, `cluxion_queue_next`, `cluxion_queue_record`, `cluxion_queue_brief`, `cluxion_loop_auto`, `cluxion_context_compress`, `cluxion_guard`, `cluxion_web_search`, `cluxion_browser_open`, `cluxion_browser_extract`, `cluxion_browser_click`, `cluxion_browser_type`, `cluxion_doctor`
 
 ## Claude Code
 

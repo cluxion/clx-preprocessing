@@ -53,6 +53,10 @@ PLAN_SCHEMA = {
             "expected_ram_mb": {"type": "integer", "minimum": 0, "default": 0},
             "context_tokens": {"type": "integer", "minimum": 0, "default": 0},
             "cwd": {"type": "string", "default": ""},
+            "metadata": {
+                "type": "object",
+                "description": "Optional free-form metadata merged into the work item (e.g. locale).",
+            },
             "clarification_answers": {
                 "type": "string",
                 "default": "",
@@ -341,7 +345,7 @@ GUARD_SCHEMA = {
         "RAM/swap/CPU/zombie sample plus daemon state; pass owned_roots PIDs to "
         "also scan process ownership (fail-closed: only lineage reaching a "
         "registered root is owned, everything else is reported as external). "
-        "action=start/stop controls the 200ms Rust polling daemon. "
+        "action=start/stop controls the 1s Rust polling daemon. "
         "action=enforce escalates against runaway OWNED processes only - "
         "dry-run unless apply=true, never signals external processes, the "
         "roots themselves, this process, or the guard daemon. "
@@ -364,8 +368,8 @@ GUARD_SCHEMA = {
                 "description": "Root PIDs this agent owns; used for the ownership scan and required for enforce.",
             },
             "cpu_sample_ms": {"type": "integer", "minimum": 0, "default": 100},
-            "interval_ms": {"type": "integer", "minimum": 100, "default": 200},
-            "window": {"type": "integer", "minimum": 1, "default": 25},
+            "interval_ms": {"type": "integer", "minimum": 100, "default": 1000},
+            "window": {"type": "integer", "minimum": 1, "default": 10},
             "cpu_threshold": {
                 "type": "number",
                 "default": 90.0,
@@ -404,7 +408,7 @@ GUARD_SCHEMA = {
             "min_samples": {
                 "type": "integer",
                 "minimum": 1,
-                "default": 25,
+                "default": 10,
                 "description": "auto-enforce: minimum window samples required before any judgement.",
             },
         },

@@ -14,9 +14,9 @@ cluxion-preprocess enable    # Hermes
 
 - Hermes: `cluxion_*` 도구 (plugin enable 후)
 - Hermes 슬래시 (0.3.23+): `/loopauto`, `/cluxion-doctor` — `/` 자동완성
-- Claude: `adapters/claude/skills/preprocess/SKILL.md`
-- Codex: `adapters/codex/config-snippet.toml`
-- 공통: `cluxion-runtime plan --surface <hermes|claude|codex|grok_build>`
+- Claude: `skills/preprocess/SKILL.md`, `commands/cluxion-plan.md` (`--surface claude`)
+- Codex: `skills/preprocess/SKILL.md`, `commands/cluxion-plan.md` (`--surface codex`)
+- 공통: `cluxion-runtime plan --surface <hermes|claude|codex|grok_build>` (host를 명시; 자동 감지 없음)
 
 ## Rust 큐 (선택)
 

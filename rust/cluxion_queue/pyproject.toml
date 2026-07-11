@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "cluxion-queue-native"
-version = "0.3.62"
+version = "0.3.63"
 description = "In-process Rust queue engine for cluxion-agentplugin-preprocessing"
 requires-python = ">=3.11"
 license = "Apache-2.0"

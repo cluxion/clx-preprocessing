@@ -4,9 +4,18 @@ argument-hint: "<prompt>"
 disable-model-invocation: true
 ---
 
-Run:
+Choose the current host surface explicitly (no runtime autodetection):
+
+- Claude Code: `--surface claude`
+- Codex: `--surface codex`
+
+Run exactly one matching command:
 
 ```bash
+# Claude Code
+cluxion-runtime plan --surface claude --json-stdin
+
+# Codex
 cluxion-runtime plan --surface codex --json-stdin
 ```
 

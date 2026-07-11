@@ -29,7 +29,7 @@ cargo build --release --manifest-path rust/cluxion_queue/Cargo.toml
 
 ## Python 역할
 
-- Hermes `register()` 및 10-tool schema (`cluxion` toolset)
+- Hermes `register()` 및 17-tool schema (`cluxion` toolset)
 - `cluxion-runtime plan` CLI
 - clarification, intent, answer_policy (결정론적 — AI 호출 없음)
 - Rust 미설치 시 Python file-based dispatch fallback

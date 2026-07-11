@@ -11,7 +11,29 @@
 
 `/` 입력 시 🔌 자동완성. 상세: `cluxion-plugins-guide.md` §2-A.
 
-## Plugin tools (`cluxion` toolset, 16 tools)
+## Plugin tools (`cluxion` toolset, 17 tools)
+
+Registered tools (exhaustive):
+
+| # | Tool | 용도 |
+|---|------|------|
+| 1 | `cluxion_plan` | 전처리·방향·큐·리소스 plan |
+| 2 | `cluxion_clarify` | 명확화 전용 |
+| 3 | `cluxion_bootstrap` | 로컬 runtime 의존성 설치 |
+| 4 | `cluxion_serve_local` | vLLM-MLX 로컬 endpoint 준비 |
+| 5 | `cluxion_hermes_config` | Hermes custom provider config 렌더 |
+| 6 | `cluxion_queue_next` | 다음 segment payload |
+| 7 | `cluxion_queue_record` | segment 처리 결과 기록 |
+| 8 | `cluxion_queue_brief` | 최종 synthesis용 briefing |
+| 9 | `cluxion_loop_auto` | 큐 자동 드레인 |
+| 10 | `cluxion_context_compress` | 대화 컨텍스트 압축 |
+| 11 | `cluxion_guard` | 실시간 리소스 guard |
+| 12 | `cluxion_web_search` | 로그인된 Chrome으로 웹 검색 |
+| 13 | `cluxion_browser_open` | Chrome에서 URL 열기 |
+| 14 | `cluxion_browser_extract` | 현재 페이지 텍스트 추출 |
+| 15 | `cluxion_browser_click` | 페이지 요소 클릭 |
+| 16 | `cluxion_browser_type` | 입력 필드에 타이핑 |
+| 17 | `cluxion_doctor` | 결정론적 헬스 체크 |
 
 ### `cluxion_plan`
 
@@ -73,7 +95,7 @@ context 사용률이 trigger ratio(기본 70%)를 넘으면 target ratio(기본 
 실시간 리소스 guard. `action=status`는 RAM/swap/CPU/zombie 샘플과 daemon 상태 반환;
 `owned_roots`로 프로세스 ownership scan (fail-closed). `owned_roots`/`protect`는 **루트 PID 정수 리스트**다 (파일 경로 아님). `action=start`/`stop`은 1s polling daemon (process scan every 5s) 제어.
 
-Guard runtime state precedence: explicit tool `store_dir` > `CLUXION_GUARD_STORE_DIR` > plugin home `~/.local/share/cluxion-agentplugin-preprocessing/queue`. `CLUXION_QUEUE_STORE_DIR` is for queue data only and does not move `guard_state.json`/`guard_heartbeat`.
+Guard runtime state precedence: `CLUXION_GUARD_STORE_DIR` > plugin home default `~/.local/share/cluxion-agentplugin-preprocessing/queue`. `CLUXION_QUEUE_STORE_DIR` is for queue data only and does not move `guard_state.json`/`guard_heartbeat`.
 `action=enforce`는 등록된 owned 프로세스만 대상 (기본 dry-run, `apply=true`로 실제 signal).
 `action=auto-enforce`는 daemon rolling window의 sustained pressure에서만 enforce (daemon 없음/ stale 시 fail-closed).
 
@@ -82,6 +104,29 @@ Daemon 시작: `cluxion-queue guard-daemon` 바이너리가 없으면
 
 입력: `action` (`status`|`start`|`stop`|`enforce`|`auto-enforce`), `owned_roots`, `interval_ms`, `window`,
 `cpu_threshold`, `rss_threshold_mb`, `grace_seconds`, `apply`, `protect`, `sustained_cpu`, `ram_floor_mb`, `min_samples`
+
+### `cluxion_web_search`
+
+사용자 본인의 Chrome 세션(로그인·쿠키)으로 웹 검색.
+
+입력: `query` (필수), `engine`, `max_links`, `max_chars`
+
+### Browser tools
+
+| Tool | 설명 |
+|------|------|
+| `cluxion_browser_open` | URL 열기 |
+| `cluxion_browser_extract` | 현재 페이지 텍스트 추출 |
+| `cluxion_browser_click` | CSS selector 클릭 |
+| `cluxion_browser_type` | 입력 필드에 텍스트 입력 |
+
+`[browser]` extra + Playwright Chromium 필요.
+
+### `cluxion_doctor`
+
+임베디드 결정론적 헬스 체크 (`cluxion-preprocess doctor`와 동일 경로).
+
+입력: `verbose` (optional)
 
 ## `host_execution.strategy`
 

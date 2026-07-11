@@ -141,6 +141,13 @@ def test_plan_schema_loop_auto_defaults_false() -> None:
     assert prop["default"] is False
 
 
+def test_plan_schema_metadata_is_object() -> None:
+    from cluxion_agentplugin_preprocessing.schemas import PLAN_SCHEMA
+
+    prop = PLAN_SCHEMA["parameters"]["properties"]["metadata"]
+    assert prop["type"] == "object"
+
+
 def test_loop_auto_schema_timeout_seconds_has_exclusive_minimum_zero() -> None:
     from cluxion_agentplugin_preprocessing.schemas import LOOP_AUTO_SCHEMA
 

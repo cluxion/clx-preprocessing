@@ -25,12 +25,21 @@
 - 명확화·segment 큐·resource admission
 - **추가 LLM 호출 없음**
 
-## 등록 도구 (Hermes `cluxion` toolset)
+## 등록 도구 (Hermes `cluxion` toolset, 17 tools)
 
 | Tool | 용도 |
 |------|------|
 | `cluxion_plan` | 전처리·방향·큐·리소스 plan |
 | `cluxion_clarify` | 명확화 질문 |
+| `cluxion_bootstrap` | 로컬 runtime 의존성 설치 |
+| `cluxion_serve_local` | vLLM-MLX 로컬 endpoint 준비 |
+| `cluxion_hermes_config` | Hermes custom provider config |
 | `cluxion_queue_next` / `record` / `brief` | segment 큐 |
+| `cluxion_loop_auto` | 큐 자동 드레인 |
+| `cluxion_context_compress` | 컨텍스트 압축 |
+| `cluxion_guard` | 실시간 리소스 guard |
+| `cluxion_web_search` | 로그인 Chrome 웹 검색 |
+| `cluxion_browser_open` / `extract` / `click` / `type` | 브라우저 조작 |
+| `cluxion_doctor` | 결정론적 헬스 체크 |
 
 모델·provider 변경은 host agent 책임입니다. 전처리 플러그인은 실행 **전** 계약만 제공합니다.

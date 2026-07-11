@@ -619,6 +619,18 @@ def test_guard_schema_cpu_sample_ms_minimum_is_zero() -> None:
     assert prop["type"] == "integer"
 
 
+def test_guard_schema_effective_defaults_match_bridge_constants() -> None:
+    from cluxion_agentplugin_preprocessing.schemas import GUARD_SCHEMA
+    from cluxion_runtime.resources import guard_bridge
+
+    props = GUARD_SCHEMA["parameters"]["properties"]
+    assert props["interval_ms"]["default"] == guard_bridge.DEFAULT_INTERVAL_MS == 1000
+    assert props["window"]["default"] == guard_bridge.DEFAULT_WINDOW == 10
+    assert props["min_samples"]["default"] == guard_bridge.DEFAULT_WINDOW == 10
+    assert "1s" in GUARD_SCHEMA["description"]
+    assert "200ms" not in GUARD_SCHEMA["description"]
+
+
 def test_cpu_sample_ms_python_rust_parity_zero(monkeypatch) -> None:
     if importlib.util.find_spec("cluxion_queue_native") is None:
         pytest.skip("native module not built")
