@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import signal
 from unittest.mock import MagicMock
 
 import pytest
@@ -276,3 +277,200 @@ def test_live_search_smoke() -> None:
     assert result.get("browser_mode")
     assert result.get("url")
     assert result.get("title")
+
+
+# --- Cycle 108: SIGTERM prior chaining + session RLock ---
+
+
+def test_sigterm_handler_calls_callable_prior_after_close(monkeypatch: pytest.MonkeyPatch) -> None:
+    closed: list[str] = []
+    prior_calls: list[tuple[int, object]] = []
+
+    def prior(signum: int, frame: object) -> None:
+        prior_calls.append((signum, frame))
+
+    monkeypatch.setattr(browser_bridge, "_previous_sigterm_handler", prior)
+    monkeypatch.setattr(browser_bridge, "_close_session", lambda: closed.append("closed"))
+
+    browser_bridge._handle_sigterm(signal.SIGTERM, None)
+
+    assert closed == ["closed"]
+    assert prior_calls == [(signal.SIGTERM, None)]
+
+
+def test_sigterm_handler_sig_dfl_raises_system_exit_143(monkeypatch: pytest.MonkeyPatch) -> None:
+    closed: list[str] = []
+    monkeypatch.setattr(browser_bridge, "_previous_sigterm_handler", signal.SIG_DFL)
+    monkeypatch.setattr(browser_bridge, "_close_session", lambda: closed.append("closed"))
+
+    with pytest.raises(SystemExit) as excinfo:
+        browser_bridge._handle_sigterm(signal.SIGTERM, None)
+
+    assert closed == ["closed"]
+    assert excinfo.value.code == 143
+
+
+def test_sigterm_handler_sig_ign_returns_after_close(monkeypatch: pytest.MonkeyPatch) -> None:
+    closed: list[str] = []
+    monkeypatch.setattr(browser_bridge, "_previous_sigterm_handler", signal.SIG_IGN)
+    monkeypatch.setattr(browser_bridge, "_close_session", lambda: closed.append("closed"))
+
+    assert browser_bridge._handle_sigterm(signal.SIGTERM, None) is None
+    assert closed == ["closed"]
+
+
+def test_concurrent_cold_ensure_single_playwright(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two-thread cold ensure creates exactly one Playwright start."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    starts: list[int] = []
+
+    class _Chromium:
+        def connect_over_cdp(self, _endpoint: str):
+            raise RuntimeError("cdp down")
+
+        def launch_persistent_context(self, **_kwargs):
+            return MagicMock()
+
+    def fake_sync_playwright():
+        class _Factory:
+            def start(self):
+                starts.append(1)
+                time.sleep(0.08)  # widen the race window without dual-entry barriers
+                pw = MagicMock()
+                pw.chromium = _Chromium()
+                return pw
+
+        return _Factory()
+
+    browser_bridge._close_session()
+    monkeypatch.setattr(browser_bridge, "_import_playwright", lambda: fake_sync_playwright)
+    monkeypatch.setenv("CLUXION_BROWSER_CDP", "")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(browser_bridge._ensure_session) for _ in range(2)]
+        results = [f.result(timeout=5) for f in futures]
+
+    assert len(starts) == 1, f"expected one Playwright start, got {len(starts)}"
+    assert all(r.get("ok") is True for r in results)
+    browser_bridge._close_session()
+
+
+def test_close_vs_init_serializes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """close-vs-init race: RLock serializes so close cannot tear mid-create."""
+    import threading
+    import time
+
+    events: list[str] = []
+    events_lock = threading.Lock()
+
+    def note(label: str) -> None:
+        with events_lock:
+            events.append(label)
+
+    class _Chromium:
+        def connect_over_cdp(self, _endpoint: str):
+            raise RuntimeError("cdp down")
+
+        def launch_persistent_context(self, **_kwargs):
+            return MagicMock()
+
+    def fake_sync_playwright():
+        class _Factory:
+            def start(self):
+                note("start")
+                time.sleep(0.12)
+                pw = MagicMock()
+                pw.chromium = _Chromium()
+                note("created")
+                return pw
+
+        return _Factory()
+
+    browser_bridge._close_session()
+    monkeypatch.setattr(browser_bridge, "_import_playwright", lambda: fake_sync_playwright)
+    monkeypatch.setenv("CLUXION_BROWSER_CDP", "")
+
+    errors: list[BaseException] = []
+
+    def ensure_worker() -> None:
+        try:
+            browser_bridge._ensure_session()
+            note("ensure_done")
+        except BaseException as exc:
+            errors.append(exc)
+
+    def close_worker() -> None:
+        time.sleep(0.03)  # let ensure enter create when racing
+        browser_bridge._close_session()
+        note("close_done")
+
+    t1 = threading.Thread(target=ensure_worker)
+    t2 = threading.Thread(target=close_worker)
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+    assert not errors, errors
+    assert "start" in events and "created" in events and "close_done" in events
+    start_i = events.index("start")
+    created_i = events.index("created")
+    close_i = events.index("close_done")
+    assert not (start_i < close_i < created_i), f"close interleaved mid-init: {events}"
+    browser_bridge._close_session()
+
+
+def test_sigterm_reinstall_preserves_original_handler(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A module reload/reinstall must unwrap our old handler instead of chaining to itself."""
+    original_calls: list[int] = []
+    installed: list[object] = []
+
+    def original(signum: int, _frame: object) -> None:
+        original_calls.append(signum)
+
+    def old_cluxion_handler(_signum: int, _frame: object) -> None:
+        raise AssertionError("old handler must be unwrapped, not chained")
+
+    old_cluxion_handler._cluxion_browser_sigterm = True
+    old_cluxion_handler._cluxion_previous_sigterm = original
+    monkeypatch.setattr(browser_bridge.signal, "getsignal", lambda _sig: old_cluxion_handler)
+    monkeypatch.setattr(browser_bridge.signal, "signal", lambda _sig, handler: installed.append(handler))
+    monkeypatch.setattr(browser_bridge, "_close_session", lambda: None)
+
+    browser_bridge._install_sigterm_handler()
+    installed[-1](signal.SIGTERM, None)
+
+    assert original_calls == [signal.SIGTERM]
+    assert browser_bridge._previous_sigterm_handler is original
+
+
+def test_with_page_serializes_callback_against_close(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A close in another thread cannot invalidate the shared page during a callback."""
+    import threading
+    import time
+
+    entered = threading.Event()
+    release = threading.Event()
+    close_done = threading.Event()
+    page = MagicMock()
+    monkeypatch.setattr(browser_bridge, "_import_playwright", lambda: object())
+    monkeypatch.setattr(browser_bridge, "_get_page", lambda: (page, "test"))
+    monkeypatch.setattr(browser_bridge, "_close_session_unlocked", close_done.set)
+
+    def callback(_page, _mode):
+        entered.set()
+        assert release.wait(timeout=2)
+        assert not close_done.is_set()
+        return {"ok": True}
+
+    worker = threading.Thread(target=browser_bridge._with_page, args=(callback,))
+    closer = threading.Thread(target=lambda: (entered.wait(timeout=2), browser_bridge._close_session()))
+    worker.start()
+    closer.start()
+    assert entered.wait(timeout=2)
+    time.sleep(0.05)
+    assert not close_done.is_set()
+    release.set()
+    worker.join(timeout=2); closer.join(timeout=2)
+    assert close_done.is_set()

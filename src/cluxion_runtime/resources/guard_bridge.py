@@ -16,15 +16,28 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import stat
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import psutil
 
 from cluxion_runtime.resources import queue_bridge
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    _fcntl = None
+try:
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover - POSIX platforms
+    _msvcrt = None
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -45,6 +58,10 @@ DEFAULT_SUSTAINED_CPU = 85.0
 DEFAULT_RAM_FLOOR_MB = 1024
 _CPU_WINDOW_SECONDS = 0.1
 _U64_MAX = (1 << 64) - 1
+_LIFECYCLE_LOCK_NAME = ".guard_lifecycle.lock"
+_LOCK_FILE_MODE = 0o600
+_SPAWN_TERM_WAIT_SEC = 3.0
+_IN_PROCESS_LIFECYCLE_LOCK = threading.RLock()
 
 
 def _int_or_default(value: object, default: int) -> int:
@@ -345,39 +362,127 @@ def start_daemon(
     unwritable = _preflight_store_writable(base)
     if unwritable is not None:
         return unwritable
-    existing = daemon_status(store_dir=base)
-    if existing["running"]:
-        return {"ok": True, "started": False, "reason": "already_running", **existing}
-    binary = queue_bridge._queue_binary()
-    if Path(binary).exists() or _which(binary):
-        host = "binary"
-        cmd = [binary, "guard-daemon", str(base), str(int(interval_ms)), str(int(window))]
-    else:
-        # Universal fallback: guard_daemon_host selects native vs pure-Python at runtime.
-        host = "python"
-        cmd = [
-            sys.executable,
-            "-m",
-            "cluxion_runtime.guard_daemon_host",
-            str(base),
-            str(int(interval_ms)),
-            str(int(window)),
-        ]
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    (base / PID_FILE_NAME).write_text(str(process.pid), encoding="utf-8")
-    touch_heartbeat(base)
-    return {
-        "ok": True,
-        "started": True,
-        "pid": process.pid,
-        "interval_ms": int(interval_ms),
-        "host": host,
-    }
+    with _lifecycle_lock(base):
+        existing = daemon_status(store_dir=base)
+        if existing["running"]:
+            return {"ok": True, "started": False, "reason": "already_running", **existing}
+        binary = queue_bridge._queue_binary()
+        if Path(binary).exists() or _which(binary):
+            host = "binary"
+            cmd = [binary, "guard-daemon", str(base), str(int(interval_ms)), str(int(window))]
+        else:
+            # Universal fallback: guard_daemon_host selects native vs pure-Python at runtime.
+            host = "python"
+            cmd = [
+                sys.executable,
+                "-m",
+                "cluxion_runtime.guard_daemon_host",
+                str(base),
+                str(int(interval_ms)),
+                str(int(window)),
+            ]
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            (base / PID_FILE_NAME).write_text(str(process.pid), encoding="utf-8")
+            touch_heartbeat(base)
+        except Exception:
+            _rollback_spawned_child(process, base)
+            raise
+        return {
+            "ok": True,
+            "started": True,
+            "pid": process.pid,
+            "interval_ms": int(interval_ms),
+            "host": host,
+        }
+
+
+def _lifecycle_lock_open_flags() -> int:
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    return flags
+
+
+@contextmanager
+def _lifecycle_lock(base: Path) -> Iterator[None]:
+    """Per-store advisory lock covering start check/spawn/publish and stop.
+
+    Mirrors py_queue/dispatch_store fcntl discipline; FD is CLOEXEC.
+    """
+    base.mkdir(parents=True, exist_ok=True)
+    if _fcntl is None and _msvcrt is None:
+        with _IN_PROCESS_LIFECYCLE_LOCK:
+            yield
+        return
+    lock_path = base / _LIFECYCLE_LOCK_NAME
+    if lock_path.is_symlink():
+        raise OSError(f"expected regular file, found symlink: {lock_path}")
+    if lock_path.exists() and not stat.S_ISREG(lock_path.lstat().st_mode):
+        raise OSError(f"expected regular file, found non-regular: {lock_path}")
+    try:
+        fd = os.open(lock_path, _lifecycle_lock_open_flags(), _LOCK_FILE_MODE)
+    except OSError as exc:
+        raise OSError(f"failed to open lifecycle lock {lock_path}: {exc}") from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError(f"expected regular file, found non-regular: {lock_path}")
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, _LOCK_FILE_MODE)
+        os.set_inheritable(fd, False)
+        if hasattr(_fcntl, "F_SETFD") and hasattr(_fcntl, "FD_CLOEXEC"):
+            _fcntl.fcntl(fd, _fcntl.F_SETFD, _fcntl.FD_CLOEXEC)
+    except Exception:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "r+b") as lock_file:
+        if _fcntl is not None:
+            _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
+        else:
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+            lock_file.seek(0)
+            _msvcrt.locking(lock_file.fileno(), _msvcrt.LK_LOCK, 1)
+        try:
+            yield
+        finally:
+            if _fcntl is not None:
+                _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_UN)
+            else:
+                lock_file.seek(0)
+                _msvcrt.locking(lock_file.fileno(), _msvcrt.LK_UNLCK, 1)
+
+
+def _rollback_spawned_child(process: subprocess.Popen[Any], base: Path) -> None:
+    """Terminate the exact spawned child after publication failure; drop our pidfile only."""
+    child_pid = int(process.pid)
+    try:
+        process.terminate()
+        try:
+            process.wait(timeout=_SPAWN_TERM_WAIT_SEC)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                process.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=_SPAWN_TERM_WAIT_SEC)
+    except (ProcessLookupError, OSError):
+        pass
+    pid_path = base / PID_FILE_NAME
+    try:
+        if pid_path.read_text(encoding="utf-8").strip() == str(child_pid):
+            pid_path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _preflight_store_writable(base: Path) -> dict[str, Any] | None:
@@ -385,6 +490,12 @@ def _preflight_store_writable(base: Path) -> dict[str, Any] | None:
         base.mkdir(parents=True, exist_ok=True)
         if base.stat().st_mode & 0o222 == 0:
             return _guard_store_unwritable(base, "directory has no write bits")
+        lock_path = base / _LIFECYCLE_LOCK_NAME
+        if lock_path.is_symlink() or (lock_path.exists() and not stat.S_ISREG(lock_path.lstat().st_mode)):
+            return _guard_store_unwritable(base, f"invalid lifecycle lock: {lock_path}")
+        if lock_path.exists():
+            lock_probe = os.open(lock_path, os.O_RDWR)
+            os.close(lock_probe)
         probe = base / f".{PID_FILE_NAME}.write-test-{os.getpid()}"
         probe.write_text("", encoding="utf-8")
         probe.unlink(missing_ok=True)
@@ -407,32 +518,36 @@ def stop_daemon(*, store_dir: Path | str | None = None) -> dict[str, Any]:
     signalled only after its identity is verified as our guard daemon."""
     base = _store_base(store_dir)
     pid_path = base / PID_FILE_NAME
-    try:
-        pid = int(pid_path.read_text(encoding="utf-8").strip())
-    except (FileNotFoundError, ValueError):
+    lifecycle_path = base / _LIFECYCLE_LOCK_NAME
+    if not pid_path.exists() and not lifecycle_path.exists():
         return {"ok": True, "stopped": False, "reason": "no_pidfile"}
-    verified = _is_our_daemon(pid)
-    if verified is None:
-        pid_path.unlink(missing_ok=True)
-        return {"ok": False, "stopped": False, "reason": "identity_mismatch", "pid": pid}
-    try:
-        # Revalidate the same process identity immediately before SIGTERM.
-        recheck = _is_our_daemon(pid)
-        if recheck is None or not _same_process(verified, recheck):
+    with _lifecycle_lock(base):
+        try:
+            pid = int(pid_path.read_text(encoding="utf-8").strip())
+        except (FileNotFoundError, ValueError):
+            return {"ok": True, "stopped": False, "reason": "no_pidfile"}
+        verified = _is_our_daemon(pid)
+        if verified is None:
             pid_path.unlink(missing_ok=True)
             return {"ok": False, "stopped": False, "reason": "identity_mismatch", "pid": pid}
-        verified.terminate()
-        verified.wait(timeout=3)
-    except psutil.NoSuchProcess:
-        pass
-    except psutil.TimeoutExpired:
-        # Revalidate again before SIGKILL so a recycled PID is never killed.
-        recheck = _is_our_daemon(pid)
-        if recheck is not None and _same_process(verified, recheck):
-            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-                verified.kill()
-    pid_path.unlink(missing_ok=True)
-    return {"ok": True, "stopped": True, "pid": pid}
+        try:
+            # Revalidate the same process identity immediately before SIGTERM.
+            recheck = _is_our_daemon(pid)
+            if recheck is None or not _same_process(verified, recheck):
+                pid_path.unlink(missing_ok=True)
+                return {"ok": False, "stopped": False, "reason": "identity_mismatch", "pid": pid}
+            verified.terminate()
+            verified.wait(timeout=3)
+        except psutil.NoSuchProcess:
+            pass
+        except psutil.TimeoutExpired:
+            # Revalidate again before SIGKILL so a recycled PID is never killed.
+            recheck = _is_our_daemon(pid)
+            if recheck is not None and _same_process(verified, recheck):
+                with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                    verified.kill()
+        pid_path.unlink(missing_ok=True)
+        return {"ok": True, "stopped": True, "pid": pid}
 
 
 def daemon_status(*, store_dir: Path | str | None = None) -> dict[str, Any]:

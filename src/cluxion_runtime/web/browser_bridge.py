@@ -11,6 +11,7 @@ import atexit
 import contextlib
 import os
 import signal
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -47,6 +48,8 @@ _session: dict[str, Any] = {
     "mode": None,
     "page": None,
 }
+_session_lock = threading.RLock()
+_previous_sigterm_handler: Any = None
 
 
 def search(
@@ -243,87 +246,89 @@ def _import_playwright() -> Any | None:
 
 
 def _ensure_session() -> dict[str, Any]:
-    if _session["mode"] is not None:
-        return {"ok": True, "browser_mode": _session["mode"]}
+    with _session_lock:
+        if _session["mode"] is not None:
+            return {"ok": True, "browser_mode": _session["mode"]}
 
-    sync_playwright = _import_playwright()
-    if sync_playwright is None:
-        return _playwright_not_installed()
-
-    try:
-        playwright = sync_playwright().start()
-        _session["playwright"] = playwright
-
-        cdp_endpoint = os.environ.get("CLUXION_BROWSER_CDP", "http://127.0.0.1:9222").strip()
-        if cdp_endpoint:
-            try:
-                browser = playwright.chromium.connect_over_cdp(cdp_endpoint)
-                _session["browser"] = browser
-                _session["mode"] = "cdp"
-                return {"ok": True, "browser_mode": "cdp"}
-            except Exception:
-                pass
-
-        profile_dir = Path.home() / ".cluxion" / "browser-profile"
-        profile_dir.mkdir(parents=True, exist_ok=True)
+        sync_playwright = _import_playwright()
+        if sync_playwright is None:
+            return _playwright_not_installed()
 
         try:
-            context = playwright.chromium.launch_persistent_context(
-                user_data_dir=str(profile_dir),
-                channel="chrome",
-                headless=False,
-            )
-            _session["context"] = context
-            _session["mode"] = "chrome-profile"
-            return {"ok": True, "browser_mode": "chrome-profile"}
-        except Exception:
+            playwright = sync_playwright().start()
+            _session["playwright"] = playwright
+
+            cdp_endpoint = os.environ.get("CLUXION_BROWSER_CDP", "http://127.0.0.1:9222").strip()
+            if cdp_endpoint:
+                try:
+                    browser = playwright.chromium.connect_over_cdp(cdp_endpoint)
+                    _session["browser"] = browser
+                    _session["mode"] = "cdp"
+                    return {"ok": True, "browser_mode": "cdp"}
+                except Exception:
+                    pass
+
+            profile_dir = Path.home() / ".cluxion" / "browser-profile"
+            profile_dir.mkdir(parents=True, exist_ok=True)
+
             try:
                 context = playwright.chromium.launch_persistent_context(
                     user_data_dir=str(profile_dir),
-                    headless=True,
+                    channel="chrome",
+                    headless=False,
                 )
                 _session["context"] = context
-                _session["mode"] = "chromium-headless"
-                return {"ok": True, "browser_mode": "chromium-headless"}
+                _session["mode"] = "chrome-profile"
+                return {"ok": True, "browser_mode": "chrome-profile"}
             except Exception:
-                _close_session()
-                return _browser_unreachable()
-    except Exception:
-        _close_session()
-        return _browser_unreachable()
+                try:
+                    context = playwright.chromium.launch_persistent_context(
+                        user_data_dir=str(profile_dir),
+                        headless=True,
+                    )
+                    _session["context"] = context
+                    _session["mode"] = "chromium-headless"
+                    return {"ok": True, "browser_mode": "chromium-headless"}
+                except Exception:
+                    _close_session_unlocked()
+                    return _browser_unreachable()
+        except Exception:
+            _close_session_unlocked()
+            return _browser_unreachable()
 
 
 def _get_page() -> tuple[Any | None, str | None]:
-    session = _ensure_session()
-    if not session.get("ok"):
-        return None, None
+    with _session_lock:
+        session = _ensure_session()
+        if not session.get("ok"):
+            return None, None
 
-    mode = str(session["browser_mode"])
-    try:
-        page = _session.get("page")
-        if page is not None and not page.is_closed():
-            return page, mode
+        mode = str(session["browser_mode"])
+        try:
+            page = _session.get("page")
+            if page is not None and not page.is_closed():
+                return page, mode
 
-        browser = _session.get("browser")
-        if browser is not None:
-            contexts = browser.contexts
-            if contexts:
-                page = contexts[0].new_page()
+            browser = _session.get("browser")
+            if browser is not None:
+                contexts = browser.contexts
+                if contexts:
+                    page = contexts[0].new_page()
+                    _session["page"] = page
+                    return page, mode
+                return None, mode
+
+            context = _session.get("context")
+            if context is not None:
+                page = context.new_page()
                 _session["page"] = page
                 return page, mode
-            return None, mode
+        except Exception:
+            # Cached session whose browser/CDP link died: reset so the next call reconnects.
+            _close_session_unlocked()
+            return None, None
 
-        context = _session.get("context")
-        if context is not None:
-            page = context.new_page()
-            _session["page"] = page
-            return page, mode
-    except Exception:
-        # Cached session whose browser/CDP link died: reset so the next call reconnects.
-        _close_session()
-        return None, None
-
-    return None, mode
+        return None, mode
 
 
 def _with_page(callback: Any) -> dict[str, Any]:
@@ -331,22 +336,23 @@ def _with_page(callback: Any) -> dict[str, Any]:
     if sync_playwright is None:
         return _playwright_not_installed()
 
-    page, mode = _get_page()
-    if page is None or mode is None:
-        session = _ensure_session()
-        if not session.get("ok"):
-            return session
-        return _browser_unreachable(session.get("browser_mode"))
+    with _session_lock:
+        page, mode = _get_page()
+        if page is None or mode is None:
+            session = _ensure_session()
+            if not session.get("ok"):
+                return session
+            return _browser_unreachable(session.get("browser_mode"))
 
-    try:
-        result = callback(page, mode)
-        if isinstance(result, dict):
-            if result.get("ok") and "browser_mode" not in result:
-                result["browser_mode"] = mode
-            return result
-        return _browser_unreachable(mode)
-    except Exception:
-        return _browser_unreachable(mode)
+        try:
+            result = callback(page, mode)
+            if isinstance(result, dict):
+                if result.get("ok") and "browser_mode" not in result:
+                    result["browser_mode"] = mode
+                return result
+            return _browser_unreachable(mode)
+        except Exception:
+            return _browser_unreachable(mode)
 
 
 def _navigate_and_extract(
@@ -391,7 +397,7 @@ def _extract_page(page: Any, *, max_chars: int, max_links: int, engine: str | No
     )
 
 
-def _close_session() -> None:
+def _close_session_unlocked() -> None:
     context = _session.get("context")
     browser = _session.get("browser")
     playwright = _session.get("playwright")
@@ -419,15 +425,40 @@ def _close_session() -> None:
     _session["mode"] = None
 
 
-def _handle_sigterm(signum: int, _frame: object) -> None:
-    # SIGKILL is uncatchable; SIGTERM cleanup is best-effort before exit.
+def _close_session() -> None:
+    with _session_lock:
+        _close_session_unlocked()
+
+
+def _handle_sigterm(signum: int, frame: object) -> None:
+    # Close first, then honor the prior handler: IGN returns, DFL exits 143,
+    # callable prior is invoked. No unload/registry abstraction.
     _close_session()
+    prior = _previous_sigterm_handler
+    if prior is signal.SIG_IGN:
+        return
+    if callable(prior):
+        prior(signum, frame)
+        return
+    # SIG_DFL (or any non-callable residual): terminate like default SIGTERM.
     raise SystemExit(128 + signum)
+
+
+def _install_sigterm_handler() -> None:
+    """Install once while preserving the original host handler across module reloads."""
+    global _previous_sigterm_handler
+    current = signal.getsignal(signal.SIGTERM)
+    if getattr(current, "_cluxion_browser_sigterm", False):
+        current = getattr(current, "_cluxion_previous_sigterm", signal.SIG_DFL)
+    _previous_sigterm_handler = current
+    _handle_sigterm._cluxion_browser_sigterm = True
+    _handle_sigterm._cluxion_previous_sigterm = current
+    signal.signal(signal.SIGTERM, _handle_sigterm)
 
 
 atexit.register(_close_session)
 with contextlib.suppress(AttributeError, OSError, ValueError):
-    signal.signal(signal.SIGTERM, _handle_sigterm)
+    _install_sigterm_handler()
 
 
 __all__ = [

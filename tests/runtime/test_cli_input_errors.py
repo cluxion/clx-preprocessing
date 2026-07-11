@@ -148,6 +148,25 @@ def test_guard_start_readonly_store_returns_structured_error(tmp_path, capsys, m
     assert payload["hint"]
 
 
+def test_guard_start_readonly_lifecycle_lock_returns_structured_error(tmp_path, capsys, monkeypatch) -> None:
+    store = tmp_path / "guard"
+    store.mkdir()
+    lock_path = store / guard_bridge._LIFECYCLE_LOCK_NAME
+    lock_path.write_text("", encoding="utf-8")
+    lock_path.chmod(0o400)
+    monkeypatch.setenv(guard_bridge.GUARD_STORE_ENV, str(store))
+    monkeypatch.setattr(guard_bridge.subprocess, "Popen", lambda *_args, **_kwargs: pytest.fail("daemon spawned"))
+    try:
+        code, payload, stderr = _run(["guard", "--json-stdin"], json.dumps({"action": "start"}), capsys, monkeypatch)
+    finally:
+        lock_path.chmod(0o600)
+
+    assert code == 1
+    assert payload["ok"] is False
+    assert payload["error"] == "guard_store_unwritable"
+    assert stderr == ""
+
+
 def test_queue_next_bounds_long_fields() -> None:
     from cluxion_runtime.cli import _bounded_step_payload
 

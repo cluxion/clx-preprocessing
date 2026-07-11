@@ -643,3 +643,180 @@ def test_cpu_sample_ms_python_rust_parity_zero(monkeypatch) -> None:
     assert native["ok"] is True and py["ok"] is True
     assert set(native) >= _SAMPLE_KEYS
     assert set(py) >= _SAMPLE_KEYS
+
+
+# --- Cycle 108: daemon lifecycle lock + spawn publication rollback ---
+
+
+def _force_python_daemon_host(monkeypatch) -> None:
+    monkeypatch.setenv(queue_bridge.QUEUE_BIN_ENV, "/nonexistent/cluxion-queue")
+    monkeypatch.setattr(guard_bridge, "_which", lambda _binary: False)
+    monkeypatch.setattr(guard_bridge, "_native_guard_available", lambda: False)
+    monkeypatch.setattr(queue_bridge, "_native", None)
+
+
+def test_concurrent_cold_starts_single_popen(tmp_path: Path, monkeypatch) -> None:
+    """Cold concurrent start_daemon: exactly one Popen; peer reports already_running."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    _force_python_daemon_host(monkeypatch)
+    popen_calls: list[int] = []
+    lock = threading.Lock()
+
+    class _FakeChild:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+        def terminate(self) -> None:
+            return None
+
+        def kill(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return 0
+
+    def fake_popen(*_args, **_kwargs):
+        with lock:
+            pid = 50_000 + len(popen_calls)
+            popen_calls.append(pid)
+        return _FakeChild(pid)
+
+    def fake_is_our(pid: int):
+        return type("P", (), {"pid": pid, "create_time": lambda self: 1.0})()
+
+    monkeypatch.setattr(guard_bridge.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(guard_bridge, "_is_our_daemon", fake_is_our)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(guard_bridge.start_daemon, store_dir=tmp_path) for _ in range(2)]
+        results = [f.result(timeout=5) for f in futures]
+
+    assert len(popen_calls) == 1, f"expected one Popen, got {popen_calls}"
+    started = [r for r in results if r.get("started") is True]
+    already = [r for r in results if r.get("reason") == "already_running"]
+    assert len(started) == 1
+    assert len(already) == 1
+    assert all(r.get("ok") is True for r in results)
+
+
+def test_windows_lifecycle_lock_uses_msvcrt_byte_lock(tmp_path: Path, monkeypatch) -> None:
+    """The published Windows wheel retains cross-process lifecycle serialization."""
+    calls: list[tuple[int, int]] = []
+
+    class _FakeMsvcrt:
+        LK_LOCK = 1
+        LK_UNLCK = 2
+
+        @staticmethod
+        def locking(_fd: int, mode: int, size: int) -> None:
+            calls.append((mode, size))
+
+    monkeypatch.setattr(guard_bridge, "_fcntl", None)
+    monkeypatch.setattr(guard_bridge, "_msvcrt", _FakeMsvcrt)
+    with guard_bridge._lifecycle_lock(tmp_path):
+        assert (tmp_path / guard_bridge._LIFECYCLE_LOCK_NAME).read_bytes() == b"\0"
+
+    assert calls == [(_FakeMsvcrt.LK_LOCK, 1), (_FakeMsvcrt.LK_UNLCK, 1)]
+
+
+def test_stop_missing_store_has_no_mutation(tmp_path: Path) -> None:
+    """A no-op stop must not create the store or lifecycle lock."""
+    missing = tmp_path / "missing"
+    result = guard_bridge.stop_daemon(store_dir=missing)
+    assert result == {"ok": True, "stopped": False, "reason": "no_pidfile"}
+    assert not missing.exists()
+
+    existing = tmp_path / "existing-empty"
+    existing.mkdir()
+    result = guard_bridge.stop_daemon(store_dir=existing)
+    assert result == {"ok": True, "stopped": False, "reason": "no_pidfile"}
+    assert list(existing.iterdir()) == []
+
+
+def test_pidfile_publication_failure_terminates_child(tmp_path: Path, monkeypatch) -> None:
+    """Pidfile write failure after Popen: terminate child, bounded wait; re-raise OSError."""
+    _force_python_daemon_host(monkeypatch)
+    child = type(
+        "Child",
+        (),
+        {
+            "pid": 61_001,
+            "terminate_calls": 0,
+            "kill_calls": 0,
+            "wait_timeouts": [],
+        },
+    )()
+
+    def terminate() -> None:
+        child.terminate_calls += 1
+
+    def kill() -> None:
+        child.kill_calls += 1
+
+    def wait(timeout: float | None = None) -> int:
+        child.wait_timeouts.append(timeout)
+        return 0
+
+    child.terminate = terminate  # type: ignore[attr-defined]
+    child.kill = kill  # type: ignore[attr-defined]
+    child.wait = wait  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(guard_bridge.subprocess, "Popen", lambda *_a, **_k: child)
+
+    real_write_text = Path.write_text
+
+    def failing_write_text(self: Path, data: object, *args: object, **kwargs: object):
+        if self.name == guard_bridge.PID_FILE_NAME:
+            raise OSError("pidfile publication failed")
+        return real_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", failing_write_text)
+
+    with pytest.raises(OSError, match="pidfile publication failed"):
+        guard_bridge.start_daemon(store_dir=tmp_path)
+
+    assert child.terminate_calls == 1
+    assert child.wait_timeouts  # bounded wait attempted
+    assert child.kill_calls == 0  # terminate reaped; no kill needed
+
+
+def test_heartbeat_publication_failure_kills_term_ignore_child(tmp_path: Path, monkeypatch) -> None:
+    """Heartbeat failure after pidfile: TERM-ignore child gets kill+wait; pidfile removed iff child PID."""
+    _force_python_daemon_host(monkeypatch)
+    child_pid = 61_002
+    state = {"killed": False, "terminate_calls": 0, "kill_calls": 0, "waits": 0}
+
+    class _TermIgnoreChild:
+        pid = child_pid
+
+        def terminate(self) -> None:
+            state["terminate_calls"] += 1
+
+        def kill(self) -> None:
+            state["kill_calls"] += 1
+            state["killed"] = True
+
+        def wait(self, timeout: float | None = None) -> int:
+            state["waits"] += 1
+            if state["killed"]:
+                return 0
+            raise subprocess.TimeoutExpired(cmd="fake-daemon", timeout=timeout or 0)
+
+    monkeypatch.setattr(guard_bridge.subprocess, "Popen", lambda *_a, **_k: _TermIgnoreChild())
+
+    def boom_heartbeat(store_dir=None) -> None:
+        del store_dir
+        raise OSError("heartbeat publication failed")
+
+    monkeypatch.setattr(guard_bridge, "touch_heartbeat", boom_heartbeat)
+
+    with pytest.raises(OSError, match="heartbeat publication failed"):
+        guard_bridge.start_daemon(store_dir=tmp_path)
+
+    assert state["terminate_calls"] == 1
+    assert state["kill_calls"] == 1
+    assert state["waits"] >= 2
+    assert not (tmp_path / guard_bridge.PID_FILE_NAME).exists()
