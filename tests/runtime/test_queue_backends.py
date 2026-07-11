@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import subprocess
 import sys
 import time
@@ -24,6 +25,9 @@ def current_rust_artifacts(tmp_path_factory):
     project = Path(__file__).resolve().parents[2]
     native_project = project / "rust" / "cluxion_queue"
     build_root = tmp_path_factory.mktemp("current-rust-artifacts")
+    cargo_target = build_root / "cargo-target"
+    build_env = os.environ.copy()
+    build_env["CARGO_TARGET_DIR"] = str(cargo_target)
     wheel_dir = build_root / "wheel"
     wheel_dir.mkdir()
     subprocess.run(
@@ -37,6 +41,7 @@ def current_rust_artifacts(tmp_path_factory):
             str(native_project),
         ],
         cwd=project,
+        env=build_env,
         check=True,
         capture_output=True,
         text=True,
@@ -68,12 +73,14 @@ def current_rust_artifacts(tmp_path_factory):
             "cluxion-queue",
         ],
         cwd=project,
+        env=build_env,
         check=True,
         capture_output=True,
         text=True,
     )
-    binary = native_project / "target" / "release" / "cluxion-queue"
+    binary = cargo_target / "release" / "cluxion-queue"
     assert binary.is_file()
+    assert binary.is_relative_to(build_root)
     yield native, binary
     patch.undo()
 
