@@ -9,3 +9,5 @@ dist/
 *.egg-info/
 rust/**/target/
 dist-merged/
+.codex-briefs/
+.grok-briefs/

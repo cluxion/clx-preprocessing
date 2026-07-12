@@ -9,7 +9,7 @@
 | `/loopauto <prompt>` | `cluxion_plan` with explicit `loop_auto=true` |
 | `/clx-doctor` | `cluxion_doctor` / `cluxion-preprocess doctor` |
 
-`/` 입력 시 🔌 자동완성. 상세: `cluxion-plugins-guide.md` §2-A.
+`/` 입력 시 🔌 자동완성됩니다.
 
 ## Plugin tools (`cluxion` toolset, 17 tools)
 

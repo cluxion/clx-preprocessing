@@ -38,8 +38,6 @@ Hermes 세션에서 `/` 입력 → `/loopauto`, `/clx-doctor` 🔌 자동완성.
 /clx-doctor
 ```
 
-전체 5종 플러그인 슬래시 표: `cluxion-plugins-guide.md` §2-A.
-
 ## 연결된 AI 연동
 
 - Hermes: `cluxion_*` 도구 자동 등록

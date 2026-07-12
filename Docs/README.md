@@ -39,7 +39,6 @@ cluxion-preprocess enable   # Hermes
 | [design.md](design.md) | 정직함, 명확화, 성능 |
 | [installation.md](installation.md) | 설치, Hermes 활성화, 슬래시, Rust 큐 |
 | [tools.md](tools.md) | 도구·슬래시·loopAuto·queued workflow |
-| 통합 가이드 | MacBot `Docs/cluxion-plugins-guide.md` §2-A (5종 슬래시 전체) |
 | [tools.md](tools.md) | 도구, preprocessing mode, queue |
 | [agent-surfaces.md](agent-surfaces.md) | Hermes / Claude / Codex / Grok |
 | [rust-architecture.md](rust-architecture.md) | Rust 메인 · Python adapter |
