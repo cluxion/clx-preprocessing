@@ -25,7 +25,7 @@ Root plugin artifact:
 
 - `.claude-plugin/plugin.json`
 - `commands/`
-- `skills/preprocess/SKILL.md`
+- `skills/clx-preprocess/SKILL.md`
 
 ## Codex
 

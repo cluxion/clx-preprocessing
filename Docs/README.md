@@ -21,7 +21,7 @@
 4. `answer_policy.required_checks`를 지키며 응답
 5. (선택) `cluxion_queue_brief` 결과를 ForgetForge에 저장: `forgetforge import-brief --source preprocessing`
 
-Skill: [`skills/preprocess/SKILL.md`](../skills/preprocess/SKILL.md)
+Skill: [`skills/clx-preprocess/SKILL.md`](../skills/clx-preprocess/SKILL.md)
 
 ### 사람(개발자)이 할 일
 

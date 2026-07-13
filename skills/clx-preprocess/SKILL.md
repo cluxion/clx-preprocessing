@@ -1,5 +1,5 @@
 ---
-name: preprocess
+name: clx-preprocess
 description: Use Cluxion preprocessing before agent work that needs clarification, queueing, loop_auto, doctor checks, or surface-specific JSON contracts.
 ---
 

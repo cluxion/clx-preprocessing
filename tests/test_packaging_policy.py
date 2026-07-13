@@ -46,7 +46,10 @@ def test_root_plugin_artifacts_are_version_synced() -> None:
     assert Path("commands/clx-doctor.md").is_file()
     assert not Path("commands/cluxion-plan.md").exists()
     assert not Path("commands/cluxion-doctor.md").exists()
-    assert Path("skills/preprocess/SKILL.md").is_file()
+    skill = Path("skills/clx-preprocess/SKILL.md")
+    assert skill.is_file()
+    assert yaml.safe_load(skill.read_text(encoding="utf-8").split("---", 2)[1])["name"] == "clx-preprocess"
+    assert not Path("skills/preprocess").exists()
 
     urls = pyproject["project"]["urls"]
     for key in ("Homepage", "Repository", "Issues"):
